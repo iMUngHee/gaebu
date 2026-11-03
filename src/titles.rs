@@ -52,8 +52,22 @@ pub enum Seat {
 /// First title from the seat's pool not already used in the team; when the
 /// pool is exhausted, the base title with a numeric suffix (`연2`).
 pub fn pick(seat: Seat, taken: &[&str]) -> String {
-    let _ = (seat, taken);
-    todo!("nawi: titles")
+    let pool = match seat {
+        Seat::Commander => COMMANDER,
+        Seat::Head => HEAD,
+        Seat::Staff => STAFF,
+    };
+    if let Some(title) = pool.iter().find(|title| !taken.contains(title)) {
+        return (*title).into();
+    }
+    let base = pool[pool.len() - 1];
+    for suffix in 2_u64.. {
+        let title = format!("{base}{suffix}");
+        if !taken.contains(&title.as_str()) {
+            return title;
+        }
+    }
+    unreachable!("the title pool cannot exhaust all u64 suffixes")
 }
 
 /// Default bu name from its head's title: 좌장군 → 좌장군부, 승상 → 승상부.
