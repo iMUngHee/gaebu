@@ -408,10 +408,11 @@ pub fn bu_cancel(
     if b.team != a.team || !(b.head == a.id || authz::is_below(st, &a.id, &b.head)) {
         return refuse(Reason::NoGrant, "not a subordinate bu");
     }
+    let bus = bu_descendants(st, bu);
     let scopes: Vec<_> = st
         .duties
         .values()
-        .filter(|d| d.bu == bu)
+        .filter(|d| bus.contains(&d.bu) && duty_open(d.status))
         .flat_map(|d| d.scope.iter().cloned())
         .collect();
     authz::require(st, &a.id, Verb::Cancel, &scopes)?;
@@ -1276,7 +1277,7 @@ fn ttl(ms: Option<Ms>) -> Result<Ms> {
     }
     Ok(ms.min(8 * 60 * 60 * 1000))
 }
-fn cancel_bu(st: &mut State, now: Ms, bu: &str) {
+fn bu_descendants(st: &State, bu: &str) -> std::collections::BTreeSet<String> {
     let mut bus = std::collections::BTreeSet::from([bu.to_owned()]);
     loop {
         let n = bus.len();
@@ -1289,6 +1290,10 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) {
             break;
         }
     }
+    bus
+}
+fn cancel_bu(st: &mut State, now: Ms, bu: &str) {
+    let bus = bu_descendants(st, bu);
     for b in st.bus.values_mut().filter(|b| bus.contains(&b.id)) {
         b.status = BuStatus::Cancelled;
     }
