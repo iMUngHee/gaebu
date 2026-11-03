@@ -408,7 +408,11 @@ pub fn run_with(args: impl IntoIterator<Item = OsString>, pager: &dyn Pager) -> 
     let args: Vec<OsString> = args.into_iter().collect();
     // A hook must never fail its host, even when it is registered wrongly:
     // exit 2 from a prompt hook can block the prompt.
-    let is_hook = args.get(1).is_some_and(|a| a == "hook");
+    let is_hook = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "hook");
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
@@ -476,9 +480,8 @@ fn member_op(
 ) -> Result<()> {
     let caller = mutating_caller(pager)?;
     // Observe vacancies first so a gone session's seat and leases are freed.
-    if let Err(e) = identity::refresh_bindings(store, pager) {
-        eprintln!("gaebu: binding refresh skipped: {e}");
-    }
+    // A state change must not proceed on bindings it could not refresh.
+    identity::refresh_bindings(store, pager)?;
     let now = now_ms();
     let out = store.transact(store::CLI_DEADLINE, |st| {
         ops::expire_leases(st, now);
@@ -546,35 +549,59 @@ pub const GLOBAL_MARKERS: &str = "_global";
 /// Deliver pending notices through pager and drop the delivered ones.
 /// Failures stay queued for the next call.
 pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
-    // Claim a batch under the lock so concurrent CLI/MCP calls never send the
-    // same notice twice, send outside the lock, then requeue what failed.
+    // Claim a batch under the lock (so concurrent CLI/MCP calls do not send
+    // the same notice), send outside the lock, then drop what was delivered.
+    // A notice leaves the outbox only after pager accepted it: a crash after
+    // the claim leaves a stale claim that the next flush retries, so delivery
+    // is at least once rather than at most once.
+    let now = now_ms();
     let Ok(batch) = store.transact(store::CLI_DEADLINE, |st| {
-        let n = st.outbox.len().min(MAX_NOTICES_PER_FLUSH);
-        Ok(st.outbox.drain(..n).collect::<Vec<_>>())
+        let mut batch = Vec::new();
+        for n in st.outbox.iter_mut() {
+            if batch.len() >= MAX_NOTICES_PER_FLUSH {
+                break;
+            }
+            let stale = n
+                .claimed_at
+                .is_none_or(|t| now.saturating_sub(t) >= crate::model::NOTICE_CLAIM_MS);
+            if stale {
+                n.claimed_at = Some(now);
+                batch.push(n.clone());
+            }
+        }
+        Ok(batch)
     }) else {
         return;
     };
     if batch.is_empty() {
         return;
     }
+    let mut delivered = Vec::new();
     let mut failed = Vec::new();
-    for n in batch {
-        if let Err(e) = pager.send(&n.to_session, &n.body) {
-            eprintln!("gaebu: notice {} not delivered: {e}", n.id);
-            failed.push(n);
+    for n in &batch {
+        match pager.send(&n.to_session, &n.body) {
+            Ok(()) => delivered.push(n.id.clone()),
+            Err(e) => {
+                eprintln!("gaebu: notice {} not delivered: {e}", n.id);
+                failed.push(n.id.clone());
+            }
         }
     }
-    if failed.is_empty() {
-        return;
-    }
-    let _ = store.transact(store::CLI_DEADLINE, |st| {
+    let result = store.transact(store::CLI_DEADLINE, |st| {
         let now = now_ms();
-        for mut n in failed {
-            n.attempts += 1;
-            if n.attempts < MAX_NOTICE_ATTEMPTS {
-                st.outbox.push(n);
-                continue;
+        st.outbox.retain(|n| !delivered.contains(&n.id));
+        let mut given_up = Vec::new();
+        for n in st.outbox.iter_mut() {
+            if failed.contains(&n.id) {
+                n.claimed_at = None;
+                n.attempts += 1;
+                if n.attempts >= MAX_NOTICE_ATTEMPTS {
+                    given_up.push(n.clone());
+                }
             }
+        }
+        st.outbox.retain(|n| !given_up.iter().any(|g| g.id == n.id));
+        for n in given_up {
             // Give up, but leave a trace in the team record.
             if let Some(team) = st.members.get(&n.to_member).map(|m| m.team.clone()) {
                 let id = st.mint("r");
@@ -594,6 +621,11 @@ pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
         }
         Ok(())
     });
+    if let Err(e) = result {
+        // Delivered notices may be sent again by a later flush (their claim
+        // goes stale); failed ones stay claimed until then. Nothing is lost.
+        eprintln!("gaebu: outbox bookkeeping deferred: {e}");
+    }
 }
 
 /// Notices sent per call, so a backlog never stalls a command for long.

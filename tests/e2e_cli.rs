@@ -308,3 +308,44 @@ fn dev_seed_refused_on_default_home() {
     assert_eq!(code, 1);
     assert_eq!(before, after, "the default store must not be written");
 }
+
+#[test]
+fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[]);
+    let now = gaebu::model::now_ms();
+    store
+        .transact(gaebu::store::CLI_DEADLINE, |st| {
+            for (id, claimed) in [("n-fresh", Some(now)), ("n-stale", Some(now - 120_000))] {
+                st.outbox.push(gaebu::model::Notice {
+                    id: id.into(),
+                    to_member: "m-x".into(),
+                    to_session: format!("s-{id}"),
+                    body: "b".into(),
+                    created_at: now,
+                    attempts: 0,
+                    claimed_at: claimed,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    gaebu::cli::flush_outbox(&store, &pager);
+    let sent: Vec<String> = pager
+        .sent
+        .borrow()
+        .iter()
+        .map(|(to, _)| to.clone())
+        .collect();
+    // A live claim (another flush is sending it) is left alone; a stale one
+    // (its sender died before confirming) is sent again.
+    assert_eq!(sent, vec!["s-n-stale".to_string()]);
+    let left: Vec<String> = store
+        .read()
+        .unwrap()
+        .outbox
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(left, vec!["n-fresh".to_string()]);
+}
