@@ -261,3 +261,71 @@ fn rename_retry_then_store_write_failed() {
     drop(held);
     assert_eq!(fs::read(home.0.join("state.json")).unwrap(), before);
 }
+
+#[test]
+fn unrecorded_marker_blocks_older_evidence() {
+    let home = Home::new();
+    let store = home.store();
+    let log = store.session("marker-test");
+    log.append(
+        10,
+        EventKind::UserPrompt,
+        Some("old".into()),
+        Some("old prompt".into()),
+        None,
+    )
+    .unwrap();
+    log.mark_unrecorded(20).unwrap();
+    assert!(log.unrecorded_after(10).unwrap());
+    assert!(log.unrecorded_after(20).unwrap());
+    assert!(!log.unrecorded_after(21).unwrap());
+    log.append(15, EventKind::Stop, None, None, None).unwrap();
+    assert!(log.unrecorded_after(10).unwrap());
+    log.append(
+        30,
+        EventKind::UserPrompt,
+        Some("new".into()),
+        Some("new prompt".into()),
+        None,
+    )
+    .unwrap();
+    assert!(!log.unrecorded_after(10).unwrap());
+}
+
+#[test]
+#[ignore = "child process helper"]
+fn writer_child() {
+    let Some(path) = std::env::var_os("GAEBU_TEST_WRITER_HOME") else {
+        return;
+    };
+    let store = Store::open(PathBuf::from(path)).unwrap();
+    for _ in 0..25 {
+        store
+            .transact(Duration::from_secs(5), |s| {
+                s.next_id += 1;
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn multiprocess_writers_serialize() {
+    let home = Home::new();
+    let mut children = Vec::new();
+    for _ in 0..4 {
+        children.push(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "writer_child", "--ignored"])
+                .env("GAEBU_TEST_WRITER_HOME", &home.0)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let statuses: Vec<_> = children.iter_mut().map(|c| c.wait().unwrap()).collect();
+    assert!(statuses.iter().all(|s| s.success()));
+    let state = home.store().read().unwrap();
+    assert_eq!(state.next_id, 101);
+    assert_eq!(state.rev, 100);
+}
