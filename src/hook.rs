@@ -111,6 +111,9 @@ fn run_budget(
         let now = model::now_ms();
         let session = store.session(&input.session_id);
         if budget.saturating_sub(started.elapsed()) < store::SESSION_LOCK_DEADLINE {
+            if let Err(e) = session.mark_unrecorded(now) {
+                eprintln!("gaebu: hook missed-event marker: {e}");
+            }
             return Err(Error::new(Reason::Busy, "hook budget exhausted"));
         }
         let entry = match event.as_str() {
@@ -136,6 +139,9 @@ fn run_budget(
         if let Some((kind, hash, text, excluded)) = entry
             && let Err(e) = session.append(now, kind, hash, text, excluded)
         {
+            if let Err(marker_error) = session.mark_unrecorded(now) {
+                eprintln!("gaebu: hook missed-event marker: {marker_error}");
+            }
             eprintln!("gaebu: hook event not recorded: {e}");
         }
         let mut sighting = session.sighting()?;
