@@ -90,27 +90,42 @@ impl Store {
     /// Run `f` on the state under the exclusive lock and commit on `Ok`
     /// (bumping `rev`). Refuses with `busy` after `deadline`, `store_corrupt`
     /// when `state.json` does not parse, `store_write_failed` on replace failure.
+    /// `deadline` is the total budget, shared by lock wait and both replacements.
+    /// Synchronous filesystem calls and `f` cannot be interrupted; expiry is
+    /// checked between stages and immediately before publishing the state.
     pub fn transact<T>(
         &self,
         deadline: Duration,
         f: impl FnOnce(&mut State) -> Result<T>,
     ) -> Result<T> {
-        let _lock = lock(&self.home, "state.lock", deadline)?;
+        let deadline = Instant::now()
+            .checked_add(deadline)
+            .ok_or_else(|| Error::new(Reason::InvalidArgument, "deadline overflow"))?;
+        let _lock = lock(
+            &self.home,
+            "state.lock",
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        ensure_budget(deadline)?;
         clean_tmp(&self.home)?;
+        ensure_budget(deadline)?;
         let path = self.home.join("state.json");
         let mut state = read_state(&path)?.unwrap_or_default();
+        ensure_budget(deadline)?;
         crate::ops::expire_leases(&mut state, crate::model::now_ms());
         let result = f(&mut state)?;
+        ensure_budget(deadline)?;
         state.rev = state
             .rev
             .checked_add(1)
             .ok_or_else(|| Error::new(Reason::StoreWriteFailed, "revision overflow"))?;
         let bytes = serde_json::to_vec(&state).map_err(write_error)?;
+        ensure_budget(deadline)?;
         if path.exists() {
             let prev = fs::read(&path).map_err(write_error)?;
-            replace(&self.home.join("state.prev.json"), &prev)?;
+            replace_until(&self.home.join("state.prev.json"), &prev, deadline)?;
         }
-        replace(&path, &bytes)?;
+        replace_until(&path, &bytes, deadline)?;
         Ok(result)
     }
 
@@ -189,6 +204,8 @@ pub struct Sighting {
     pub last_seen: Option<Ms>,
     pub last_card_hash: Option<String>,
     pub mod_heartbeat: Option<Ms>,
+    pub pending_checked_at: Option<Ms>,
+    pub pending_checked_rev: Option<u64>,
 }
 
 pub struct SessionLog {
@@ -400,6 +417,22 @@ fn lock(dir: &Path, name: &str, deadline: Duration) -> Result<File> {
 
 static TMP_ID: AtomicU64 = AtomicU64::new(0);
 fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    replace_until(path, bytes, Instant::now() + Duration::from_secs(1))
+}
+
+fn ensure_budget(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        Err(Error::new(
+            Reason::StoreWriteFailed,
+            "transaction deadline exceeded before state publication",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
+    ensure_budget(deadline)?;
     let tmp = path.with_file_name(format!(
         "{}.tmp-{}-{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -413,17 +446,21 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
             .open(&tmp)
             .map_err(write_error)?;
         file.write_all(bytes).map_err(write_error)?;
+        ensure_budget(deadline)?;
         file.sync_all().map_err(write_error)?;
         drop(file);
-        let start = Instant::now();
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(1));
         loop {
+            ensure_budget(deadline)?;
             match fs::rename(&tmp, path) {
                 Ok(()) => return Ok(()),
                 Err(e)
-                    if e.kind() == io::ErrorKind::PermissionDenied
-                        && start.elapsed() < Duration::from_secs(1) =>
+                    if e.kind() == io::ErrorKind::PermissionDenied && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(50))
+                    std::thread::sleep(
+                        Duration::from_millis(50)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
                 }
                 Err(e) => return Err(write_error(e)),
             }

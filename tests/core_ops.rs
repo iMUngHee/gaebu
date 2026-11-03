@@ -704,3 +704,103 @@ fn bu_cancel_checks_descendant_duty_scopes() {
         Reason::OutOfScope
     );
 }
+
+#[test]
+fn notice_not_sent_to_actor() {
+    let (mut s, a, _, _) = setup();
+    s.outbox.clear();
+    ops::root_assign(&mut s, 30, &ev(30), &["new-staff".into()], "root").unwrap();
+    assert!(
+        s.outbox.is_empty(),
+        "pending target needs no notice; root actor must not receive one"
+    );
+    let id = ops::confirm_binding(&mut s, 31, "new-staff-session", Tool::Codex, "new-staff")
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.outbox.len(), 1);
+    assert_eq!(s.outbox[0].to_member, a.member);
+    assert_ne!(s.outbox[0].to_member, id);
+    s.outbox.clear();
+    let id = ops::root_assign(&mut s, 32, &ev(32), &["same-session".into()], "root")
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.members.get_mut(&id).unwrap().binding.session_id = Some(a.session_id.clone());
+    ops::title_set(&mut s, 33, &a, &id, "참군").unwrap();
+    assert!(
+        s.outbox.is_empty(),
+        "same actor session must be excluded too"
+    );
+    ops::member_rebind(&mut s, 34, &a, "child", "new-child").unwrap();
+    assert!(
+        s.outbox.iter().all(|n| n.to_session != a.session_id),
+        "rebind must not notify its actual actor"
+    );
+}
+
+#[test]
+fn notice_body_names_team_and_actor() {
+    let (mut s, a, b, _) = setup();
+    s.outbox.clear();
+    let duty = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(s.outbox.len(), 1);
+    let body = &s.outbox[0].body;
+    assert!(body.starts_with("[gaebu test] 승상 root:"), "{body}");
+    assert!(body.contains(&duty), "{body}");
+    assert!(body.contains("deliver"), "{body}");
+    assert!(body.contains("gaebu me"), "{body}");
+}
+
+#[test]
+fn cancel_notices_name_actual_actor_once_per_recipient() {
+    let (mut s, a, b, c) = setup();
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
+    s.outbox.clear();
+    ops::bu_cancel(&mut s, 13, &a, &bu, "pause").unwrap();
+    assert_eq!(s.outbox.len(), 2);
+    assert!(
+        s.outbox
+            .iter()
+            .all(|n| n.to_member != a.member && n.body.starts_with("[gaebu test] 승상 root:"))
+    );
+    let recipients: std::collections::BTreeSet<_> =
+        s.outbox.iter().map(|n| n.to_member.clone()).collect();
+    assert_eq!(recipients.len(), 2);
+}
+
+#[test]
+fn root_key_distinguishes_new_prompt_same_text() {
+    let (mut s, _, _, _) = setup();
+    let mut first = ev(30);
+    first.sha256 = "identical-text".into();
+    ops::root_assign(&mut s, 30, &first, &["target".into()], "root").unwrap();
+    ops::root_dismiss(&mut s, 40, &ev(40), "target").unwrap();
+    let mut later = ev(50);
+    later.sha256 = first.sha256.clone();
+    ops::root_assign(&mut s, 50, &later, &["target".into()], "root").unwrap();
+    assert_eq!(
+        s.members
+            .values()
+            .filter(|m| m.binding.alias == "target" && m.status == MemberStatus::Active)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn same_prompt_retry_idempotent() {
+    let mut s = State::default();
+    let e = ev(1);
+    let first = ops::root_appoint(&mut s, 1, &e, "root", None, "p", None).unwrap();
+    let after = s.clone();
+    let retry = ops::root_appoint(&mut s, 2, &e, "root", None, "p", None).unwrap();
+    assert_eq!(s, after);
+    assert_eq!(first.ids, retry.ids);
+}
