@@ -248,3 +248,12 @@ fn dismissed_member_has_no_card() {
     st.members.get_mut("m-3").unwrap().status = MemberStatus::Dismissed;
     assert!(card::build(&st, "m-3", 1_000, None).is_none());
 }
+
+#[test]
+fn card_quiet_at_exactly_two_hours() {
+    let st = fixture();
+    let c = card::build(&st, "m-3", card::QUIET_AFTER_MS, Some(0)).unwrap();
+    assert_eq!(c.binding, "quiet");
+    let c = card::build(&st, "m-3", card::QUIET_AFTER_MS - 1, Some(0)).unwrap();
+    assert_eq!(c.binding, "bound");
+}

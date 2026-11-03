@@ -497,26 +497,47 @@ fn root_op(
     let caller = mutating_caller(pager)?;
     let now = now_ms();
     let log = store.session(&caller.session_id);
-    let ev = evidence::current_turn_evidence(
-        &caller.session_id,
-        &log.events()?,
-        &log.composers()?,
-        quote,
-        now,
-    )?;
-    // A prompt the hook could not record may have arrived after the quoted
-    // one; then the quoted prompt is no longer the current turn.
-    if log.unrecorded_after(ev.at)? {
-        return Err(Error::new(
-            Reason::NoUserEvidence,
-            "a later prompt could not be recorded; restate the instruction",
-        ));
-    }
-    let out = store.transact(store::CLI_DEADLINE, |st| f(st, now, &ev))?;
+    let global = store.session(GLOBAL_MARKERS);
+    // Checked twice: once to fail fast, and again under the state lock so a
+    // Stop, peer prompt or missed prompt recorded meanwhile still wins.
+    let verify = || -> Result<crate::model::Evidence> {
+        let ev = evidence::current_turn_evidence(
+            &caller.session_id,
+            &log.events()?,
+            &log.composers()?,
+            quote,
+            now_ms(),
+        )?;
+        // A prompt the hook could not record (in this session, or in a hook
+        // that could not even tell which session it was) may have arrived
+        // after the quoted one; then the quoted prompt is not the current turn.
+        if log.unrecorded_after(ev.at)? || global.unrecorded_after(ev.at)? {
+            return Err(Error::new(
+                Reason::NoUserEvidence,
+                "a later prompt could not be recorded; restate the instruction",
+            ));
+        }
+        Ok(ev)
+    };
+    let first = verify()?;
+    let out = store.transact(store::CLI_DEADLINE, |st| {
+        let ev = verify()?;
+        if ev.sha256 != first.sha256 || ev.prompt_seq != first.prompt_seq {
+            return Err(Error::new(
+                Reason::NoUserEvidence,
+                "the current prompt changed while waiting; restate the instruction",
+            ));
+        }
+        f(st, now, &ev)
+    })?;
     print_outcome(json, &out);
     flush_outbox(store, pager);
     Ok(())
 }
+
+/// Session-log name for markers left by hooks that could not identify their
+/// session; they invalidate pending evidence everywhere.
+pub const GLOBAL_MARKERS: &str = "_global";
 
 /// Deliver pending notices through pager and drop the delivered ones.
 /// Failures stay queued for the next call.

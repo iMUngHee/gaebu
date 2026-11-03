@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_LINES: usize = 12;
 
-/// How long a bound session may go unseen before the card calls it quiet.
+/// A bound session unseen by the hook for this long (or longer) is quiet.
 pub const QUIET_AFTER_MS: Ms = 2 * 60 * 60 * 1000;
 
 /// JSON form of `gaebu me --json`; `docs/model.md` fixes these fields.
@@ -79,7 +79,7 @@ fn binding_word(st: &State, m: &Member, now: Ms, last_seen: Option<Ms>) -> Strin
         BindingState::Pending => "pending".into(),
         BindingState::Vacant => "vacant".into(),
         BindingState::Bound => match last_seen {
-            Some(t) if now.saturating_sub(t) > QUIET_AFTER_MS => "quiet".into(),
+            Some(t) if now.saturating_sub(t) >= QUIET_AFTER_MS => "quiet".into(),
             _ => "bound".into(),
         },
     }
