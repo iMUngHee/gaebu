@@ -234,22 +234,24 @@ fn run_budget(
             {
                 return Ok(None);
             }
-            if remaining() < session_write_budget {
-                return Err(Error::new(
-                    Reason::Busy,
-                    "pending binding confirmation exceeded hook budget",
-                ));
-            }
-            // Cache attempts as well as successes, so an unavailable pager
-            // cannot add its full timeout to every unrelated user prompt.
-            session.update_sighting(|s| {
-                s.pending_checked_at = Some(now);
-                s.pending_checked_rev = Some(st.rev);
-            })?;
-            if remaining() < Duration::from_millis(1_500) + store::HOOK_DEADLINE {
+            // Only start a check that can finish: pager, the throttle stamp
+            // and the confirming transaction must all fit. A skipped check is
+            // not stamped, so it is tried again on the next prompt.
+            if remaining()
+                < Duration::from_millis(1_500) + session_write_budget + store::HOOK_DEADLINE
+            {
                 return Ok(None);
             }
-            let who = pager.whoami(Some(&input.session_id))?;
+            let asked = pager.whoami(Some(&input.session_id));
+            // Cache real attempts, failed or not, so an unavailable pager
+            // cannot add its full timeout to every unrelated user prompt.
+            if remaining() >= session_write_budget {
+                let _ = session.update_sighting(|s| {
+                    s.pending_checked_at = Some(now);
+                    s.pending_checked_rev = Some(st.rev);
+                });
+            }
+            let who = asked?;
             if who.session_id != input.session_id {
                 return Err(Error::new(
                     Reason::UnresolvedCaller,
@@ -395,24 +397,21 @@ mod tests {
             &mut output,
             &store,
             &pager,
-            || {
-                // Advance the budget at the observable store write boundary;
-                // this avoids depending on scheduler or filesystem timings.
-                if store
-                    .session("budget")
-                    .sighting()
-                    .unwrap()
-                    .pending_checked_rev
-                    .is_some()
-                {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(4)
-                }
-            },
+            // Too little left for pager + stamp + transaction: the check is
+            // not started, and not stamped, so the next prompt tries again.
+            || Duration::from_secs(3),
         );
         assert_eq!(pager.0.get(), 0);
         assert!(output.is_empty());
+        assert!(
+            store
+                .session("budget")
+                .sighting()
+                .unwrap()
+                .pending_checked_rev
+                .is_none(),
+            "a skipped check must not start the five-minute throttle"
+        );
         store
             .session("budget")
             .update_sighting(|s| {
