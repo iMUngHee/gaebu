@@ -36,7 +36,12 @@ impl Caller {
 
 /// Resolve the CLI caller through pager.
 pub fn from_pager(p: &dyn Pager) -> Result<Caller> {
-    let who = p.whoami(None)?;
+    let who = p.whoami(None).map_err(|e| {
+        Error::new(
+            Reason::UnresolvedCaller,
+            format!("pager identity unavailable: {e}"),
+        )
+    })?;
     let (source, tool) = match who.via.as_str() {
         "host" => (Source::PagerHost, Some(Tool::Claude)),
         "native" => (Source::PagerNative, Some(Tool::Codex)),
@@ -55,7 +60,12 @@ pub fn for_mcp(p: &dyn Pager, store: &Store, thread_id: Option<&str>) -> Result<
         if id.is_empty() {
             return Err(Error::new(Reason::UnresolvedCaller, "empty MCP thread id"));
         }
-        let sighting = store.session(id).sighting()?;
+        let sighting = store.session(id).sighting().map_err(|e| {
+            Error::new(
+                Reason::UnresolvedCaller,
+                format!("MCP thread sighting unavailable: {e}"),
+            )
+        })?;
         if sighting.tool != Some(Tool::Codex)
             || !sighting
                 .last_seen
