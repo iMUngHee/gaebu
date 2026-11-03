@@ -214,6 +214,62 @@ fn hook_open_stdin_does_not_exceed_budget() {
 }
 
 #[test]
+fn hook_slow_stdin_marks_unrecorded() {
+    use std::io::Write;
+    for (raw, marker_session) in [
+        (br#"{"session_id":"fixture-claude","hook_event_name":"UserPromptSubmit","prompt":"new user request"}"#.as_slice(),"fixture-claude"),
+        (b"{\"session_id\":".as_slice(),"_global"),
+    ] {
+        let f=Fixture::new(); f.seed(Tool::Claude);
+        let session=f.store.session("fixture-claude");
+        session.append(1,EventKind::UserPrompt,Some("old".into()),Some("old instruction".into()),None).unwrap();
+        let mut child=std::process::Command::new(env!("CARGO_BIN_EXE_gaebu"))
+            .args(["hook","claude"]).env("GAEBU_HOME",&f.path)
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let mut pipe=child.stdin.take().unwrap();
+        pipe.write_all(raw).unwrap(); pipe.flush().unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(f.store.session(marker_session).unrecorded_after(1).unwrap(),"no marker for {marker_session}");
+        assert_eq!(session.events().unwrap().len(),1);
+        drop(pipe);
+    }
+}
+
+#[test]
+fn hook_oversized_or_bad_json_marks_global() {
+    for raw in [
+        vec![b'x'; 1_048_577],
+        b"{broken".to_vec(),
+        br#"{"session_id":""}"#.to_vec(),
+        br#"{"session_id":"first","session_id":"second"}"#.to_vec(),
+    ] {
+        let f = Fixture::new();
+        assert!(
+            f.run(Tool::Claude, &raw, &FakePager(HostStatus::Unknown))
+                .is_empty()
+        );
+        assert!(f.store.session("_global").unrecorded_after(0).unwrap());
+    }
+}
+
+#[test]
+fn hook_malformed_payload_with_session_marks_session() {
+    let f = Fixture::new();
+    let raw =
+        br#"{"session_id":"fixture-claude","hook_event_name":"UserPromptSubmit","prompt":42}"#;
+    assert!(
+        f.run(Tool::Claude, raw, &FakePager(HostStatus::Unknown))
+            .is_empty()
+    );
+    assert!(
+        f.store
+            .session("fixture-claude")
+            .unrecorded_after(0)
+            .unwrap()
+    );
+}
+
+#[test]
 fn hook_stop_is_silent_and_records_turn_end() {
     let f = Fixture::new();
     f.seed(Tool::Claude);
