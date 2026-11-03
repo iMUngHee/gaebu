@@ -30,8 +30,10 @@ fn member(id: &str, bu: &str, sup: Option<&str>, title: &str, alias: &str) -> Me
 
 /// 승상 gapu commands 좌장군 nuzu, who heads 좌장군부 with 속관 주부 bepo.
 fn fixture() -> State {
-    let mut st = State::default();
-    st.rev = 7;
+    let mut st = State {
+        rev: 7,
+        ..Default::default()
+    };
     st.teams.insert(
         "t-1".into(),
         Team {
