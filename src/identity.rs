@@ -106,3 +106,55 @@ pub fn actor(st: &State, caller: &Caller) -> Result<Actor> {
     crate::authz::check_actor(st, &actor)?;
     Ok(actor)
 }
+
+/// Observe live bindings on CLI/MCP paths. Unavailable or unknown pager
+/// observations leave the binding intact; hook paths never call this.
+pub fn refresh_bindings(store: &Store, pager: &dyn Pager) -> Result<Vec<String>> {
+    let st = store.read()?;
+    let mut observations = Vec::new();
+    for member in st.members.values().filter(|m| {
+        m.status == MemberStatus::Active && m.binding.state == crate::model::BindingState::Bound
+    }) {
+        let Some(session) = member.binding.session_id.as_deref() else {
+            continue;
+        };
+        let status = pager
+            .host_status(&member.binding.alias)
+            .unwrap_or(crate::pager::HostStatus::Unknown);
+        let reason = if status == crate::pager::HostStatus::Gone {
+            Some("pager_gone")
+        } else if status == crate::pager::HostStatus::Unknown {
+            None
+        } else {
+            match pager.whoami(Some(session)) {
+                Ok(who)
+                    if who.session_id == session
+                        && who.alias.as_deref() != Some(&member.binding.alias) =>
+                {
+                    Some("alias_moved")
+                }
+                _ => None,
+            }
+        };
+        if let Some(reason) = reason {
+            observations.push((member.id.clone(), member.binding.clone(), reason));
+        }
+    }
+    if observations.is_empty() {
+        return Ok(Vec::new());
+    }
+    store.transact(crate::store::CLI_DEADLINE, |st| {
+        let mut changed = Vec::new();
+        for (id, binding, reason) in observations {
+            if st
+                .members
+                .get(&id)
+                .is_some_and(|m| m.status == MemberStatus::Active && m.binding == binding)
+            {
+                crate::ops::mark_vacant(st, now_ms(), &id, reason)?;
+                changed.push(id);
+            }
+        }
+        Ok(changed)
+    })
+}
