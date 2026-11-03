@@ -397,6 +397,14 @@ impl From<KindArg> for RecordKind {
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let pager = CliPager {
+        timeout: Duration::from_secs(3),
+    };
+    run_with(args, &pager)
+}
+
+/// `run` with an injected pager (tests use a fake).
+pub fn run_with(args: impl IntoIterator<Item = OsString>, pager: &dyn Pager) -> i32 {
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
@@ -405,10 +413,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
         }
     };
     let json = cli.json;
-    let pager = CliPager {
-        timeout: Duration::from_secs(3),
-    };
-    match dispatch(cli.cmd, json, &pager) {
+    match dispatch(cli.cmd, json, pager) {
         Ok(()) => 0,
         Err(e) => {
             if json {
@@ -466,6 +471,10 @@ fn member_op(
     f: impl FnOnce(&mut State, u64, &Actor) -> Result<Outcome>,
 ) -> Result<()> {
     let caller = mutating_caller(pager)?;
+    // Observe vacancies first so a gone session's seat and leases are freed.
+    if let Err(e) = identity::refresh_bindings(store, pager) {
+        eprintln!("gaebu: binding refresh skipped: {e}");
+    }
     let now = now_ms();
     let out = store.transact(store::CLI_DEADLINE, |st| {
         ops::expire_leases(st, now);
@@ -495,6 +504,14 @@ fn root_op(
         quote,
         now,
     )?;
+    // A prompt the hook could not record may have arrived after the quoted
+    // one; then the quoted prompt is no longer the current turn.
+    if log.unrecorded_after(ev.at)? {
+        return Err(Error::new(
+            Reason::NoUserEvidence,
+            "a later prompt could not be recorded; restate the instruction",
+        ));
+    }
     let out = store.transact(store::CLI_DEADLINE, |st| f(st, now, &ev))?;
     print_outcome(json, &out);
     flush_outbox(store, pager);
@@ -824,6 +841,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
         }
         Cmd::Board { since } => {
             let store = open_store()?;
+            if let Err(e) = identity::refresh_bindings(&store, pager) {
+                eprintln!("gaebu: binding refresh skipped: {e}");
+            }
             let st = store.read()?;
             if let Some(s) = since
                 && st.rev <= s
