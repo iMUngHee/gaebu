@@ -26,6 +26,15 @@ least six Unicode scalar values. Prompt hashing trims outer whitespace and
 converts CRLF to LF. Prompt text is bounded, so a quote outside the retained
 prefix cannot be checked.
 
+The most recent 50 user-prompt texts per session, each at most 4 KB, are retained
+under `~/.gaebu/sessions/`. These records can contain private instructions and
+project information; treat that directory as local session data.
+
+`~/.gaebu/capture.on` enables developer capture of raw hook stdin from every
+session into `~/.gaebu/capture/`. Capture may include private prompt and host
+metadata. Remove `capture.on` after collecting the needed fixtures and redact
+personal content and session identifiers before publishing them.
+
 For a mod-active Claude prompt, a matching composer record is required. Heartbeat
 activity is evaluated at prompt time and expires after one hour. Hook-only
 prompts still invalidate an older prompt even when they cannot supply evidence.
@@ -53,6 +62,10 @@ host messaging socket content, or use terminal send-keys to imitate typed input.
 The CLI and MCP do not prevent those actions. A digest detects matching text; it
 does not establish who typed it. Host metadata and composer provenance support
 accident prevention under the cooperative assumption.
+
+The deployed `Bash(gaebu*)` permission also lets an agent invoke the composer
+recording command directly. Deliberately doing so is local forgery outside this
+threat model; the permission is not proof of a human composer event.
 
 Filtering recognizes a finite set of observed or explicitly documented wrapper
 markers. New delivery formats can be classified as user prompts until captured
