@@ -455,7 +455,9 @@ fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
             match fs::rename(&tmp, path) {
                 Ok(()) => return Ok(()),
                 Err(e)
-                    if e.kind() == io::ErrorKind::PermissionDenied && Instant::now() < deadline =>
+                    if (e.kind() == io::ErrorKind::PermissionDenied
+                        || cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+                        && Instant::now() < deadline =>
                 {
                     std::thread::sleep(
                         Duration::from_millis(50)
