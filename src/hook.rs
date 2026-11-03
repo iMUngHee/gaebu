@@ -234,12 +234,10 @@ fn run_budget(
             {
                 return Ok(None);
             }
-            // Only start a check that can finish: pager, the throttle stamp
-            // and the confirming transaction must all fit. A skipped check is
-            // not stamped, so it is tried again on the next prompt.
-            if remaining()
-                < Duration::from_millis(1_500) + session_write_budget + store::HOOK_DEADLINE
-            {
+            // Only start a check that can finish: pager and the confirming
+            // transaction must fit. A skipped check is not stamped, so it is
+            // tried again on the next prompt; the stamp itself is best-effort.
+            if remaining() < Duration::from_millis(1_500) + store::HOOK_DEADLINE {
                 return Ok(None);
             }
             let asked = pager.whoami(Some(&input.session_id));
@@ -399,7 +397,7 @@ mod tests {
             &pager,
             // Too little left for pager + stamp + transaction: the check is
             // not started, and not stamped, so the next prompt tries again.
-            || Duration::from_secs(3),
+            || Duration::from_secs(2),
         );
         assert_eq!(pager.0.get(), 0);
         assert!(output.is_empty());
