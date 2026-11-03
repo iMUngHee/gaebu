@@ -606,3 +606,101 @@ fn empty_delegation_has_no_effective_authority() {
     s.grants.get_mut(&id).unwrap().verbs.clear();
     assert!(authz::effective_grants(&s, &b.member).is_empty());
 }
+
+#[test]
+fn session_lookup_prefers_current_binding_after_dismissal() {
+    let (mut s, a, mut b, _) = setup();
+    let mut old = s.members.remove(&b.member).unwrap();
+    old.id = "m-0".into();
+    b.member = old.id.clone();
+    s.members.insert(old.id.clone(), old);
+    ops::root_dismiss(&mut s, 30, &ev(30), "child").unwrap();
+    let bu = s.members[&a.member].bu.clone();
+    let id = ops::member_add(&mut s, 31, &a, &bu, "replacement", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::confirm_binding(&mut s, 32, "child-session", Tool::Codex, "replacement").unwrap();
+    assert_eq!(
+        authz::member_for_session(&s, "child-session").unwrap().id,
+        id
+    );
+    assert_eq!(
+        authz::check_actor(&s, &b).unwrap_err().reason,
+        Reason::NotMember
+    );
+}
+
+#[test]
+fn root_grant_does_not_cross_team_membership() {
+    let (mut s, a, _, _) = setup();
+    s.members.get_mut(&a.member).unwrap().team = "other-team".into();
+    assert!(authz::effective_grants(&s, &a.member).is_empty());
+}
+
+#[test]
+fn lease_cannot_borrow_another_members_accepted_duty() {
+    let (mut s, a, b, c) = setup();
+    accept(&mut s, &a, &b);
+    assert_eq!(
+        ops::lease_acquire(&mut s, 22, &c, "src/a", LeaseMode::Exclusive, None, "work")
+            .unwrap_err()
+            .reason,
+        Reason::OutOfScope
+    );
+    ops::duty_issue(&mut s, 23, &a, &c.member, spec()).unwrap();
+    assert_eq!(
+        ops::lease_acquire(&mut s, 24, &c, "src/a", LeaseMode::Exclusive, None, "work")
+            .unwrap_err()
+            .reason,
+        Reason::OutOfScope
+    );
+}
+
+#[test]
+fn lease_cannot_reuse_duty_from_cancelled_bu_after_move() {
+    let (mut s, a, b, c) = setup();
+    let root = s.members[&a.member].bu.clone();
+    let child = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &child).unwrap();
+    accept(&mut s, &a, &c);
+    ops::member_move(&mut s, 22, &a, &c.member, &root).unwrap();
+    ops::bu_cancel(&mut s, 23, &a, &child, "stop").unwrap();
+    assert_eq!(
+        ops::lease_acquire(&mut s, 24, &c, "src/a", LeaseMode::Exclusive, None, "work")
+            .unwrap_err()
+            .reason,
+        Reason::OutOfScope
+    );
+}
+
+#[test]
+fn bu_cancel_checks_descendant_duty_scopes() {
+    let (mut s, a, b, c) = setup();
+    let bu = ops::bu_open(
+        &mut s,
+        11,
+        &a,
+        &b.member,
+        None,
+        &[Verb::Open, Verb::Cancel],
+        &scope(),
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
+    ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &scope()).unwrap();
+    let mut wide = spec();
+    wide.scope = vec!["docs/**".into()];
+    ops::duty_issue(&mut s, 14, &a, &c.member, wide).unwrap();
+    assert_eq!(
+        ops::bu_cancel(&mut s, 15, &b, &bu, "stop")
+            .unwrap_err()
+            .reason,
+        Reason::OutOfScope
+    );
+}
