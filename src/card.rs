@@ -109,10 +109,10 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
     }
     chain.push("대협".into());
     chain.reverse();
-    if let Some(first) = chain.get_mut(1) {
-        if team.commander == chain_commander(st, m) {
-            *first = format!("가절월을 받은 {first}");
-        }
+    if team.commander == chain_commander(st, m)
+        && let Some(first) = chain.get_mut(1)
+    {
+        *first = format!("가절월을 받은 {first}");
     }
 
     let superior = m
