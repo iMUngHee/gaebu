@@ -1,0 +1,15 @@
+{
+  "session_id": "captured-claude-session",
+  "transcript_path": "C:\redacted\transcript.jsonl",
+  "cwd": "C:\redacted",
+  "prompt_id": "59b941ab-96ef-49d0-a035-75fd51037de8",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "high"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "OK",
+  "background_tasks": [],
+  "session_crons": []
+}
