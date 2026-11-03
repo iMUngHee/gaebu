@@ -320,8 +320,14 @@ pub fn lease_force_release(
 
 /// Drop expired leases (called at the start of every transaction).
 pub fn expire_leases(st: &mut State, now: Ms) {
-    let _ = (st, now);
-    todo!("nuzu: ops")
+    st.leases.retain(|_, lease| {
+        lease.expires_at > now
+            && st.members.get(&lease.holder).is_some_and(|m| {
+                m.binding.state == crate::model::BindingState::Bound
+                    && m.binding.session_id.as_deref() == Some(&lease.holder_session)
+                    && m.status == crate::model::MemberStatus::Active
+            })
+    });
 }
 
 // ----- escalations and records -----
