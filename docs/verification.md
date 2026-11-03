@@ -84,8 +84,8 @@ checked the listed notifications through Pager's public `export` interface.
 The board absence check covers its complete output, not one selected member:
 
 ```powershell
-$env:GAEBU_HOME='C:\Users\unghee\AppData\Local\Temp\gaebu-live'
-$board=& 'C:\Users\unghee\.local\bin\gaebu.exe' board
+$env:GAEBU_HOME="$env:TEMP\gaebu-live"
+$board=& "$HOME\.local\bin\gaebu.exe" board
 $boardExit=$LASTEXITCODE
 "board_exit=$boardExit"
 "d21_matches=$(@($board | Select-String 'd-21').Count)"
