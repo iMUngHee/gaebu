@@ -204,6 +204,8 @@ pub struct Sighting {
     pub last_seen: Option<Ms>,
     pub last_card_hash: Option<String>,
     pub mod_heartbeat: Option<Ms>,
+    pub pending_checked_at: Option<Ms>,
+    pub pending_checked_rev: Option<u64>,
 }
 
 pub struct SessionLog {
