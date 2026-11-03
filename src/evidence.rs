@@ -49,10 +49,15 @@ pub fn sha256_hex(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-/// Whether the Claude mod was active at `at` given its heartbeats (1 h expiry).
+/// Treat a heartbeat from one hour before through ten seconds after the prompt
+/// as active, including both boundaries. Hook and mod callbacks can arrive in
+/// either order. Evidence checks read the logs again at the root operation's
+/// current `now`, so an already-arrived late heartbeat prevents hook fallback.
 pub fn mod_active_at(events: &[SessionEvent], at: Ms) -> bool {
     events.iter().any(|event| {
-        event.kind == EventKind::ModHeartbeat && event.at <= at && at - event.at < 3_600_000
+        event.kind == EventKind::ModHeartbeat
+            && event.at >= at.saturating_sub(3_600_000)
+            && event.at <= at.saturating_add(10_000)
     })
 }
 

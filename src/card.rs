@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_LINES: usize = 12;
 
-/// How long a bound session may go unseen before the card calls it quiet.
+/// A bound session unseen by the hook for this long (or longer) is quiet.
 pub const QUIET_AFTER_MS: Ms = 2 * 60 * 60 * 1000;
 
 /// JSON form of `gaebu me --json`; `docs/model.md` fixes these fields.
@@ -79,7 +79,7 @@ fn binding_word(st: &State, m: &Member, now: Ms, last_seen: Option<Ms>) -> Strin
         BindingState::Pending => "pending".into(),
         BindingState::Vacant => "vacant".into(),
         BindingState::Bound => match last_seen {
-            Some(t) if now.saturating_sub(t) > QUIET_AFTER_MS => "quiet".into(),
+            Some(t) if now.saturating_sub(t) >= QUIET_AFTER_MS => "quiet".into(),
             _ => "bound".into(),
         },
     }
@@ -175,10 +175,9 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
         .leases
         .values()
         .filter(|l| l.holder == m.id && l.expires_at > now)
-        .map(|l| {
-            let mins = (l.expires_at - now) / 60_000;
-            format!("{} {:?} {}m", l.key, l.mode, mins).to_lowercase()
-        })
+        // No countdown here: the card hash must not change every minute.
+        // `gaebu board` shows expiry.
+        .map(|l| format!("{} {:?}", l.key, l.mode).to_lowercase())
         .collect();
 
     let escalations: Vec<String> = st
@@ -270,55 +269,64 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 fn render_body(c: &Card) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!(
-        "[개부] {} · {} · binding {}",
-        c.chain.last().cloned().unwrap_or_default(),
-        c.team,
-        c.binding
-    ));
-    lines.push(format!("지휘: {}", clip(&c.chain.join(" → "), 160)));
+    // Lines that must survive truncation come first in `keep`; the rest fill
+    // the remaining room in priority order. One line is left for the footer.
+    let mut keep: Vec<String> = vec![
+        format!(
+            "[개부] {} · {} · binding {}",
+            c.chain.last().cloned().unwrap_or_default(),
+            c.team,
+            c.binding
+        ),
+        format!("지휘: {}", clip(&c.chain.join(" → "), 160)),
+    ];
+    if !c.cancels.is_empty() {
+        keep.push(format!("취소: {}", clip(&c.cancels.join(", "), 120)));
+    }
+    if !c.escalations.is_empty() {
+        keep.push(format!(
+            "escalation: {}",
+            clip(&c.escalations.join(" / "), 140)
+        ));
+    }
+    let mut extra: Vec<String> = Vec::new();
     if c.duties.is_empty() {
-        lines.push("소임: 없음 (상관의 발령을 기다리거나 escalate)".into());
+        extra.push("소임: 없음 (상관의 발령을 기다리거나 escalate)".into());
     }
     for d in c.duties.iter().take(3) {
-        lines.push(format!(
+        extra.push(format!(
             "소임 {} [{}]: {} | 범위 {}",
             d.id,
             d.status,
             clip(&d.outcome, 80),
             clip(&d.scope.join(","), 60)
         ));
-        lines.push(format!(
+        extra.push(format!(
             "  완료: {} | 결정권: {}",
             clip(&d.done_criteria, 60),
             clip(&d.decision_rights, 60)
         ));
     }
     if c.duties.len() > 3 {
-        lines.push(format!("  … 소임 {}건 더 (gaebu me)", c.duties.len() - 3));
-    }
-    if !c.peers.is_empty() {
-        lines.push(format!("관련: {}", clip(&c.peers.join(", "), 160)));
+        extra.push(format!("  … 소임 {}건 더 (gaebu me)", c.duties.len() - 3));
     }
     if !c.leases.is_empty() {
-        lines.push(format!("점유: {}", clip(&c.leases.join(", "), 120)));
+        extra.push(format!("점유: {}", clip(&c.leases.join(", "), 120)));
     }
-    if !c.escalations.is_empty() {
-        lines.push(format!(
-            "escalation: {}",
-            clip(&c.escalations.join(" / "), 140)
-        ));
-    }
-    if !c.cancels.is_empty() {
-        lines.push(format!("취소: {}", clip(&c.cancels.join(", "), 120)));
+    if !c.peers.is_empty() {
+        extra.push(format!("관련: {}", clip(&c.peers.join(", "), 160)));
     }
     for n in &c.norms {
-        lines.push(format!("규범: {n}"));
+        extra.push(format!("규범: {n}"));
     }
-    if lines.len() > MAX_LINES - 1 {
-        lines.truncate(MAX_LINES - 2);
+    let room = MAX_LINES - 1;
+    let free = room.saturating_sub(keep.len());
+    let mut lines = keep;
+    if extra.len() > free {
+        lines.extend(extra.into_iter().take(free.saturating_sub(1)));
         lines.push("… (gaebu me로 전체 보기)".into());
+    } else {
+        lines.extend(extra);
     }
     lines.join("\n")
 }
