@@ -909,3 +909,23 @@ fn cancelled_notice_has_fallback_for_empty_reason() {
     ops::bu_cancel(&mut s, 14, &a, &bu, "  ").unwrap();
     assert!(s.outbox.iter().any(|n| n.body.contains("사유 없음")));
 }
+
+#[test]
+fn superior_closes_only_clean_subordinate_bu() {
+    let (mut s, a, b, _) = setup();
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    let duty = ops::duty_issue(&mut s, 12, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(
+        ops::bu_close(&mut s, 13, &a, &bu).unwrap_err().reason,
+        Reason::Conflict
+    );
+    ops::duty_respond(&mut s, 14, &b, &duty, Some(1), false, Some("handoff")).unwrap();
+    ops::bu_close(&mut s, 15, &a, &bu).unwrap();
+    assert_eq!(s.bus[&bu].status, BuStatus::Closed);
+}
