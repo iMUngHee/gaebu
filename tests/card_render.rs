@@ -284,3 +284,11 @@ fn card_hash_stable_while_a_lease_counts_down() {
     let b = card::build(&st, "m-3", 10 * 60_000, Some(10 * 60_000)).unwrap();
     assert_eq!(a.hash, b.hash);
 }
+
+#[test]
+fn card_header_names_the_bu() {
+    let st = fixture();
+    let c = card::build(&st, "m-2", 1_000, Some(1_000)).unwrap();
+    let first = card::render(&c).lines().next().unwrap().to_string();
+    assert!(first.contains("좌장군부"), "{first}");
+}
