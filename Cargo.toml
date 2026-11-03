@@ -1,0 +1,24 @@
+[package]
+name = "gaebu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Command tree, duties, leases and position cards for independent coding-agent sessions"
+license = "MIT"
+repository = "https://github.com/iMUngHee/gaebu"
+readme = "README.md"
+keywords = ["agents", "claude-code", "codex", "coordination"]
+categories = ["command-line-utilities", "development-tools"]
+
+# Pure Rust only. The development host links with the GNU toolchain's
+# self-contained linker, which cannot build C code or raw-dylib import
+# libraries, so anything pulling windows-sys >= 0.60, windows-link or
+# getrandom breaks the local build. Check `cargo tree` before adding a crate.
+[dependencies]
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+strip = true
