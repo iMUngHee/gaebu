@@ -157,7 +157,7 @@ pub fn root_assign(
             now,
             &commander.id,
             &[id.clone(), commander.id.clone()],
-            "member assigned; confirmation pending",
+            &format!("member {id} ({alias}) assigned; confirmation pending"),
         );
         ids.push(id);
     }
@@ -191,12 +191,19 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
         d.updated_at = now;
     }
     root_done(st, now, key, &m.team);
+    let author = authz::member_for_session(st, &ev.session_id)
+        .filter(|actor| actor.team == m.team)
+        .map(|actor| actor.id.clone())
+        .unwrap_or_else(|| st.teams[&m.team].commander.clone());
     changed(
         st,
         now,
-        &m.id,
+        &author,
         &affected,
-        "member dismissed; downstream grants revoked",
+        &format!(
+            "member {} ({alias}) dismissed; downstream grants revoked",
+            m.id
+        ),
     );
     Ok(out("dismissed", vec![m.id]))
 }
@@ -223,7 +230,18 @@ pub fn root_cancel_team(st: &mut State, now: Ms, ev: &Evidence, team: &str) -> R
     let team = st.teams.get_mut(&t.id).unwrap();
     team.status = TeamStatus::Cancelled;
     team.cancelled_at = Some(now);
-    cancel_bu(st, now, &t.root_bu);
+    let affected = cancel_bu(st, now, &t.root_bu);
+    let author = authz::member_for_session(st, &ev.session_id)
+        .filter(|actor| actor.team == t.id)
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| t.commander.clone());
+    changed(
+        st,
+        now,
+        &author,
+        &affected,
+        &format!("team {} cancelled", t.id),
+    );
     root_done(st, now, key, &t.id);
     Ok(out("team cancelled", vec![t.id]))
 }
@@ -242,7 +260,11 @@ pub fn root_rebind(
         return Ok(out("already rebound", vec![m.id]));
     }
     newer(ev, m.created_at)?;
-    rebind(st, now, &m.id, new_alias)?;
+    let author = authz::member_for_session(st, &ev.session_id)
+        .filter(|actor| actor.team == m.team)
+        .map(|actor| actor.id.clone())
+        .unwrap_or_else(|| st.teams[&m.team].commander.clone());
+    rebind(st, now, &author, &m.id, new_alias)?;
     root_done(st, now, key, &m.team);
     Ok(out("rebind pending", vec![m.id]))
 }
@@ -284,7 +306,13 @@ pub fn confirm_binding(
         let superior = m.superior.clone();
         let mut affected = vec![id.clone()];
         affected.extend(superior);
-        changed(st, now, id, &affected, "binding confirmed");
+        changed(
+            st,
+            now,
+            id,
+            &affected,
+            &format!("binding confirmed for {id}"),
+        );
     }
     Ok(id)
 }
@@ -303,7 +331,13 @@ pub fn mark_vacant(st: &mut State, now: Ms, member: &str, reason: &str) -> Resul
     st.leases
         .retain(|_, l| l.holder != member || l.mode != LeaseMode::Exclusive);
     let affected: Vec<_> = superior.into_iter().collect();
-    changed(st, now, member, &affected, reason);
+    changed(
+        st,
+        now,
+        member,
+        &affected,
+        &format!("member {member} vacant: {reason}"),
+    );
     Ok(())
 }
 
@@ -352,7 +386,7 @@ pub fn bu_open(
     if !verbs.is_empty() {
         grant(st, now, actor, &h.id, verbs, &scope)?;
     }
-    changed(st, now, &a.id, &[h.id], "bu opened");
+    changed(st, now, &a.id, &[h.id], &format!("bu {bid} opened"));
     Ok(out("bu opened", vec![bid]))
 }
 
@@ -387,7 +421,7 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         return refuse(Reason::Cancelled, "cancel is sticky");
     }
     st.bus.get_mut(bu).unwrap().status = BuStatus::Closed;
-    changed(st, now, &a.id, &[b.head], "bu closed");
+    changed(st, now, &a.id, &[b.head], &format!("bu {bu} closed"));
     Ok(out("bu closed", vec![bu.into()]))
 }
 
@@ -416,8 +450,14 @@ pub fn bu_cancel(
         .flat_map(|d| d.scope.iter().cloned())
         .collect();
     authz::require(st, &a.id, Verb::Cancel, &scopes)?;
-    cancel_bu(st, now, bu);
-    changed(st, now, &a.id, &[b.head], reason);
+    let affected = cancel_bu(st, now, bu);
+    changed(
+        st,
+        now,
+        &a.id,
+        &affected,
+        &format!("bu {bu} cancelled: {reason}"),
+    );
     Ok(out("bu cancelled", vec![bu.into()]))
 }
 
@@ -456,7 +496,7 @@ pub fn member_add(
         now,
         &a.id,
         &[b.head],
-        "member added; confirmation pending",
+        &format!("member {id} ({alias}) added; confirmation pending"),
     );
     Ok(out("member pending", vec![id]))
 }
@@ -501,7 +541,13 @@ pub fn member_move(
     m.bu = bu.into();
     m.superior = Some(b.head);
     let id = m.id.clone();
-    changed(st, now, &a.id, std::slice::from_ref(&id), "member moved");
+    changed(
+        st,
+        now,
+        &a.id,
+        std::slice::from_ref(&id),
+        &format!("member {id} moved to bu {bu}"),
+    );
     Ok(out("member moved", vec![id]))
 }
 
@@ -517,7 +563,7 @@ pub fn member_rebind(
     authz::require(st, &a.id, Verb::Reassign, &[])?;
     let m = find_member(st, member)?.clone();
     below(st, &a, &m)?;
-    rebind(st, now, &m.id, new_alias)?;
+    rebind(st, now, &a.id, &m.id, new_alias)?;
     Ok(out("rebind pending", vec![m.id]))
 }
 
@@ -543,7 +589,13 @@ pub fn title_set(
         return refuse(Reason::InvalidArgument, "empty title");
     }
     st.members.get_mut(&m.id).unwrap().title = title.into();
-    changed(st, now, &a.id, std::slice::from_ref(&m.id), "title changed");
+    changed(
+        st,
+        now,
+        &a.id,
+        std::slice::from_ref(&m.id),
+        &format!("member {} title changed to '{title}'", m.id),
+    );
     Ok(out("title changed", vec![m.id]))
 }
 
@@ -582,7 +634,7 @@ pub fn grant(
             created_at: now,
         },
     );
-    changed(st, now, &a.id, &[m.id], "grant delegated");
+    changed(st, now, &a.id, &[m.id], &format!("grant {id} delegated"));
     Ok(out("delegated", vec![id]))
 }
 
@@ -599,7 +651,13 @@ pub fn revoke(st: &mut State, now: Ms, actor: &Actor, grant: &str) -> Result<Out
         return refuse(Reason::NoGrant, "not grant issuer or commander");
     }
     st.grants.get_mut(grant).unwrap().status = GrantStatus::Revoked;
-    changed(st, now, &a.id, &[g.grantee], "grant revoked");
+    changed(
+        st,
+        now,
+        &a.id,
+        &[g.grantee],
+        &format!("grant {grant} revoked"),
+    );
     Ok(out("revoked", vec![grant.into()]))
 }
 
@@ -654,7 +712,8 @@ pub fn duty_issue(
             updated_at: now,
         },
     );
-    changed(st, now, &a.id, &[m.id], "new duty proposed");
+    let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
+    changed(st, now, &a.id, &[m.id], &message);
     Ok(out("duty issued", vec![id]))
 }
 
@@ -697,11 +756,10 @@ pub fn duty_respond(
         now,
         &a.id,
         &[issuer],
-        if accept {
-            "duty accepted"
-        } else {
-            "duty declined"
-        },
+        &format!(
+            "duty {duty} {}",
+            if accept { "accepted" } else { "declined" }
+        ),
     );
     Ok(out("duty response recorded", vec![duty.into()]))
 }
@@ -742,7 +800,13 @@ pub fn duty_progress(
     d.version += 1;
     d.updated_at = now;
     let issuer = d.issuer.clone();
-    changed(st, now, &a.id, &[issuer], "duty progress changed");
+    changed(
+        st,
+        now,
+        &a.id,
+        &[issuer],
+        &format!("duty {duty} progress: {status:?}"),
+    );
     Ok(out("duty progress recorded", vec![duty.into()]))
 }
 
@@ -788,7 +852,7 @@ pub fn duty_amend(
         now,
         &a.id,
         &[assignee],
-        "duty amended; acceptance required",
+        &format!("duty {duty} amended; acceptance required"),
     );
     Ok(out("duty amended", vec![duty.into()]))
 }
@@ -815,7 +879,13 @@ pub fn duty_cancel(
     d.version += 1;
     d.updated_at = now;
     let assignee = d.assignee.clone();
-    changed(st, now, &a.id, &[assignee], reason);
+    changed(
+        st,
+        now,
+        &a.id,
+        &[assignee],
+        &format!("duty {duty} cancelled: {reason}"),
+    );
     Ok(out("duty cancelled", vec![duty.into()]))
 }
 
@@ -948,7 +1018,13 @@ pub fn lease_force_release(
     authz::require(st, &a.id, Verb::Arbitrate, std::slice::from_ref(&l.key))?;
     below(st, &a, find_member(st, &l.holder)?)?;
     st.leases.remove(lease);
-    changed(st, now, &a.id, &[l.holder], reason);
+    changed(
+        st,
+        now,
+        &a.id,
+        &[l.holder],
+        &format!("lease {lease} force released: {reason}"),
+    );
     Ok(out("lease force released", vec![lease.into()]))
 }
 
@@ -1025,7 +1101,7 @@ pub fn escalate(
         now,
         &a.id,
         &to.into_iter().collect::<Vec<_>>(),
-        "escalation raised",
+        &format!("escalation {id} raised: {question}"),
     );
     Ok(out("escalation raised", vec![id]))
 }
@@ -1054,7 +1130,13 @@ pub fn escalation_answer(
     e.answer = Some(answer.into());
     e.answered_at = Some(now);
     let from = e.from.clone();
-    changed(st, now, &a.id, &[from], "escalation answered");
+    changed(
+        st,
+        now,
+        &a.id,
+        &[from],
+        &format!("escalation {escalation} answered: {answer}"),
+    );
     Ok(out("escalation answered", vec![escalation.into()]))
 }
 
@@ -1244,7 +1326,7 @@ fn add_member(
     );
     id
 }
-fn rebind(st: &mut State, now: Ms, member: &str, alias: &str) -> Result<()> {
+fn rebind(st: &mut State, now: Ms, author: &str, member: &str, alias: &str) -> Result<()> {
     if st
         .members
         .values()
@@ -1252,15 +1334,16 @@ fn rebind(st: &mut State, now: Ms, member: &str, alias: &str) -> Result<()> {
     {
         return refuse(Reason::Conflict, "alias already assigned");
     }
-    mark_vacant(st, now, member, "rebound")?;
+    let mut affected = vec![member.to_owned()];
+    affected.extend(st.members[member].superior.clone());
     st.leases.retain(|_, l| l.holder != member);
     st.members.get_mut(member).unwrap().binding = pending(alias, now);
     changed(
         st,
         now,
-        member,
-        &[member.into()],
-        "rebind awaiting confirmation",
+        author,
+        &affected,
+        &format!("member {member} binding replaced; awaiting confirmation as {alias}"),
     );
     Ok(())
 }
@@ -1292,7 +1375,7 @@ fn bu_descendants(st: &State, bu: &str) -> std::collections::BTreeSet<String> {
     }
     bus
 }
-fn cancel_bu(st: &mut State, now: Ms, bu: &str) {
+fn cancel_bu(st: &mut State, now: Ms, bu: &str) -> Vec<String> {
     let bus = bu_descendants(st, bu);
     for b in st.bus.values_mut().filter(|b| bus.contains(&b.id)) {
         b.status = BuStatus::Cancelled;
@@ -1313,14 +1396,22 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) {
         .map(|m| m.id.clone())
         .collect();
     st.leases.retain(|_, l| !members.contains(&l.holder));
-    let author = st.bus.get(bu).map(|b| b.head.clone()).unwrap_or_default();
-    changed(st, now, &author, &members, "bu cancelled");
+    members
 }
 fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &str) {
-    let Some(team) = st.members.get(author).map(|m| m.team.clone()) else {
+    let Some(actor) = st.members.get(author) else {
         return;
     };
+    let team = actor.team.clone();
+    let actor_session = actor.binding.session_id.clone();
+    let actor_name = crate::card::display(st, actor);
+    let team_name = st
+        .teams
+        .get(&team)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| team.clone());
     let id = st.mint("r");
+    let body = format!("[gaebu {team_name}] {actor_name}: {text} — {id} — gaebu me");
     st.records.push(Record {
         id,
         team,
@@ -1332,7 +1423,7 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
     });
     let mut seen = std::collections::BTreeSet::new();
     for member in affected {
-        if !seen.insert(member) {
+        if member == author || !seen.insert(member) {
             continue;
         }
         let session = st
@@ -1340,12 +1431,15 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
             .get(member)
             .and_then(|m| m.binding.session_id.clone());
         if let Some(session) = session {
+            if actor_session.as_deref() == Some(&session) {
+                continue;
+            }
             let id = st.mint("n");
             st.outbox.push(Notice {
                 id,
                 to_member: member.clone(),
                 to_session: session,
-                body: text.into(),
+                body: body.clone(),
                 created_at: now,
                 attempts: 0,
             });
