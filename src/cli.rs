@@ -37,6 +37,10 @@ enum Cmd {
         /// Print only the card text (what hooks inject).
         #[arg(long)]
         card: bool,
+        /// Read the card of this session id instead of resolving through pager
+        /// (read-only; used by the Claude mod).
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Show the whole roster (명부).
     Board {
@@ -300,8 +304,10 @@ enum EvidenceCmd {
     Composer {
         #[arg(long)]
         session: String,
+        /// Hash of the normalized prompt; when absent the prompt text is read
+        /// from stdin and hashed here.
         #[arg(long)]
-        sha256: String,
+        sha256: Option<String>,
     },
 }
 
@@ -520,7 +526,6 @@ pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
                 n.attempts += 1;
             }
         }
-        st.outbox.retain(|n| n.attempts < 20);
         Ok(())
     });
 }
@@ -767,18 +772,24 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             crate::mcp::serve(&mut lock, &mut stdout, &store, pager)
                 .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))
         }
-        Cmd::Me { card: text_only } => {
+        Cmd::Me {
+            card: text_only,
+            session,
+        } => {
             let store = open_store()?;
-            let caller = identity::from_pager(pager)?;
+            let session_id = match session {
+                Some(s) => s,
+                None => identity::from_pager(pager)?.session_id,
+            };
             let st = store.read()?;
-            let member = crate::authz::member_for_session(&st, &caller.session_id)
+            let member = crate::authz::member_for_session(&st, &session_id)
                 .ok_or_else(|| {
                     Error::new(Reason::NotMember, "this session holds no seat in any team")
                 })?
                 .id
                 .clone();
             let last_seen = store
-                .session(&caller.session_id)
+                .session(&session_id)
                 .sighting()
                 .ok()
                 .and_then(|s| s.last_seen);
@@ -1035,6 +1046,15 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
         }
         Cmd::Evidence(EvidenceCmd::Composer { session, sha256 }) => {
             let store = open_store()?;
+            let sha256 = match sha256 {
+                Some(h) => h,
+                None => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                        .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+                    evidence::sha256_hex(&evidence::normalize(&text))
+                }
+            };
             store.session(&session).append_composer(&ComposerRecord {
                 at: now_ms(),
                 sha256,
