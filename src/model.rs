@@ -349,7 +349,14 @@ pub struct Notice {
     pub body: String,
     pub created_at: Ms,
     pub attempts: u32,
+    /// Set while a flush is sending this notice. A claim older than
+    /// `NOTICE_CLAIM_MS` is stale (the sender died) and the notice is sent again.
+    #[serde(default)]
+    pub claimed_at: Option<Ms>,
 }
+
+/// How long a flush may hold a notice before another flush may retry it.
+pub const NOTICE_CLAIM_MS: Ms = 60_000;
 
 /// The member acting, after caller resolution and binding checks.
 #[derive(Debug, Clone, PartialEq, Eq)]

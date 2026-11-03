@@ -115,3 +115,13 @@ records the recipient's assertion; review and runtime verification establish
 quality. Automated tests and seeded fixture teams do not prove a real human's
 appointment workflow, host delivery, or context restoration. Report each tested
 evidence class separately and mark unperformed runtime checks as UNVERIFIED.
+
+## Residual races and delivery
+
+A root directive re-checks its evidence under the state lock, but the hook
+records prompts and Stop events under a per-session lock. A prompt or Stop that
+lands between that re-check and the commit can still lose the race; the window
+is the length of one in-memory operation. Notices are delivered at least once:
+a notice leaves the outbox only after pager accepted it, so a crash between
+sending and bookkeeping can deliver it twice but never drops it silently.
+

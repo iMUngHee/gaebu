@@ -1471,6 +1471,7 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
                 body: body.clone(),
                 created_at: now,
                 attempts: 0,
+                claimed_at: None,
             });
         }
     }
