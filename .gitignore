@@ -1,0 +1,17 @@
+# Rust build output.
+/target/
+
+# Mod dependencies.
+node_modules/
+
+# Agent planning state: per-task plans, worktree reservations, session notes.
+# Local working material that names other projects and people.
+.agents/
+
+# Team stores and their WAL sidecars left behind by tests.
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor noise.
+.DS_Store
