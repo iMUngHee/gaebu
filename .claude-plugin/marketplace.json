@@ -1,0 +1,11 @@
+{
+  "name": "gaebu",
+  "owner": { "name": "iMUngHee" },
+  "plugins": [
+    {
+      "name": "gaebu",
+      "source": "./mod",
+      "description": "Gaebu position card, roster pane and status line for Claude Code sessions"
+    }
+  ]
+}
