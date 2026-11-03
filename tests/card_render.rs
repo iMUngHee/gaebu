@@ -257,3 +257,30 @@ fn card_quiet_at_exactly_two_hours() {
     let c = card::build(&st, "m-3", card::QUIET_AFTER_MS - 1, Some(0)).unwrap();
     assert_eq!(c.binding, "bound");
 }
+
+#[test]
+fn card_keeps_cancels_when_truncated() {
+    let mut st = fixture();
+    for i in 2..9 {
+        let mut d = st.duties["d-1"].clone();
+        d.id = format!("d-{i}");
+        st.duties.insert(d.id.clone(), d);
+    }
+    let mut gone = st.duties["d-1"].clone();
+    gone.id = "d-99".into();
+    gone.status = DutyStatus::Cancelled;
+    gone.updated_at = 1_000;
+    st.duties.insert(gone.id.clone(), gone);
+    let c = card::build(&st, "m-3", 2_000, Some(2_000)).unwrap();
+    let text = card::render(&c);
+    assert!(text.lines().count() <= card::MAX_LINES, "{text}");
+    assert!(text.contains("소임 d-99 취소됨"), "{text}");
+}
+
+#[test]
+fn card_hash_stable_while_a_lease_counts_down() {
+    let st = fixture();
+    let a = card::build(&st, "m-3", 1_000, Some(1_000)).unwrap();
+    let b = card::build(&st, "m-3", 10 * 60_000, Some(10 * 60_000)).unwrap();
+    assert_eq!(a.hash, b.hash);
+}
