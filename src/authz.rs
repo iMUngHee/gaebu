@@ -121,7 +121,13 @@ pub fn check_actor<'a>(st: &'a State, actor: &Actor) -> Result<&'a Member> {
 pub fn member_for_session<'a>(st: &'a State, session_id: &str) -> Option<&'a Member> {
     st.members
         .values()
-        .find(|m| m.binding.session_id.as_deref() == Some(session_id))
+        .filter(|m| m.binding.session_id.as_deref() == Some(session_id))
+        .min_by_key(|m| {
+            (
+                m.status != MemberStatus::Active,
+                m.binding.state != BindingState::Bound,
+            )
+        })
 }
 
 fn valid_grant(st: &State, g: &Grant, seen: &mut BTreeSet<String>) -> bool {
