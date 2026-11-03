@@ -774,3 +774,33 @@ fn cancel_notices_name_actual_actor_once_per_recipient() {
         s.outbox.iter().map(|n| n.to_member.clone()).collect();
     assert_eq!(recipients.len(), 2);
 }
+
+#[test]
+fn root_key_distinguishes_new_prompt_same_text() {
+    let (mut s, _, _, _) = setup();
+    let mut first = ev(30);
+    first.sha256 = "identical-text".into();
+    ops::root_assign(&mut s, 30, &first, &["target".into()], "root").unwrap();
+    ops::root_dismiss(&mut s, 40, &ev(40), "target").unwrap();
+    let mut later = ev(50);
+    later.sha256 = first.sha256.clone();
+    ops::root_assign(&mut s, 50, &later, &["target".into()], "root").unwrap();
+    assert_eq!(
+        s.members
+            .values()
+            .filter(|m| m.binding.alias == "target" && m.status == MemberStatus::Active)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn same_prompt_retry_idempotent() {
+    let mut s = State::default();
+    let e = ev(1);
+    let first = ops::root_appoint(&mut s, 1, &e, "root", None, "p", None).unwrap();
+    let after = s.clone();
+    let retry = ops::root_appoint(&mut s, 2, &e, "root", None, "p", None).unwrap();
+    assert_eq!(s, after);
+    assert_eq!(first.ids, retry.ids);
+}

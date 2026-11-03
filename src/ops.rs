@@ -20,7 +20,8 @@ pub struct Outcome {
 
 /// Give 가절월 to `alias`: creates the team, the root bu named after the
 /// commander's title, the commander member (pending binding) and the root
-/// grant (all verbs, scope `**`). Idempotent on (prompt sha, action, target).
+/// grant (all verbs, scopes `**` and `res:**`). Idempotent on
+/// (session id, prompt sequence, action, target).
 pub fn root_appoint(
     st: &mut State,
     now: Ms,
@@ -32,7 +33,13 @@ pub fn root_appoint(
 ) -> Result<Outcome> {
     let key = root_key(ev, "appoint", alias);
     if let Some(action) = st.root_actions.get(&key) {
-        return Ok(out("already appointed", vec![action.team.clone()]));
+        return Ok(out(
+            "already appointed",
+            vec![
+                st.teams[&action.team].commander.clone(),
+                action.team.clone(),
+            ],
+        ));
     }
     if alias.trim().is_empty()
         || st
@@ -1222,7 +1229,7 @@ fn out(summary: &str, ids: Vec<String>) -> Outcome {
     }
 }
 fn root_key(ev: &Evidence, action: &str, target: &str) -> String {
-    format!("{}:{action}:{target}", ev.sha256)
+    format!("{}:{}:{action}:{target}", ev.session_id, ev.prompt_seq)
 }
 fn root_done(st: &mut State, now: Ms, key: String, team: &str) {
     st.root_actions.insert(
