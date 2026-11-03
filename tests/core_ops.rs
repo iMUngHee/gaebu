@@ -183,6 +183,7 @@ fn rebind_requires_reassign() {
 #[test]
 fn cancel_blocks_issue_accept_lease() {
     let (mut s, a, b, _) = setup();
+    ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope()).unwrap();
     let d = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
         .unwrap()
         .ids[0]
@@ -346,8 +347,11 @@ fn concurrent_cancel_vs_issue_is_serialized() {
     for n in 0..100 {
         let path = home.join(n.to_string());
         let store = Store::open(&path).unwrap();
-        let (s, a, b, _) = setup();
-        let bu = s.members[&a.member].bu.clone();
+        let (mut s, a, b, _) = setup();
+        let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+            .unwrap()
+            .ids[0]
+            .clone();
         store
             .transact(Duration::from_secs(1), |state| {
                 *state = s;
@@ -693,12 +697,21 @@ fn bu_cancel_checks_descendant_duty_scopes() {
     .ids[0]
         .clone();
     ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
-    ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &scope()).unwrap();
+    let child = ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::grant(&mut s, 14, &a, &c.member, &[Verb::Open], &scope()).unwrap();
+    let grand = ops::member_add(&mut s, 14, &a, &child, "grandchild", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::bu_open(&mut s, 14, &c, &grand, None, &[], &scope()).unwrap();
     let mut wide = spec();
     wide.scope = vec!["docs/**".into()];
-    ops::duty_issue(&mut s, 14, &a, &c.member, wide).unwrap();
+    ops::duty_issue(&mut s, 14, &a, &grand, wide).unwrap();
     assert_eq!(
-        ops::bu_cancel(&mut s, 15, &b, &bu, "stop")
+        ops::bu_cancel(&mut s, 15, &b, &child, "stop")
             .unwrap_err()
             .reason,
         Reason::OutOfScope
@@ -803,4 +816,96 @@ fn same_prompt_retry_idempotent() {
     let retry = ops::root_appoint(&mut s, 2, &e, "root", None, "p", None).unwrap();
     assert_eq!(s, after);
     assert_eq!(first.ids, retry.ids);
+}
+
+#[test]
+fn commander_cannot_cancel_root_bu() {
+    let (mut s, a, _, _) = setup();
+    let root = s.members[&a.member].bu.clone();
+    assert_eq!(
+        ops::bu_cancel(&mut s, 20, &a, &root, "stop")
+            .unwrap_err()
+            .reason,
+        Reason::NoGrant
+    );
+    assert_eq!(
+        ops::bu_close(&mut s, 20, &a, &root).unwrap_err().reason,
+        Reason::NoGrant
+    );
+    assert_eq!(s.bus[&root].status, BuStatus::Open);
+}
+
+#[test]
+fn head_cannot_cancel_own_bu() {
+    let (mut s, a, b, _) = setup();
+    let bu = ops::bu_open(
+        &mut s,
+        11,
+        &a,
+        &b.member,
+        None,
+        &[Verb::Open, Verb::Cancel],
+        &scope(),
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    assert_eq!(
+        ops::bu_cancel(&mut s, 20, &b, &bu, "stop")
+            .unwrap_err()
+            .reason,
+        Reason::NoGrant
+    );
+    assert_eq!(
+        ops::bu_close(&mut s, 20, &b, &bu).unwrap_err().reason,
+        Reason::NoGrant
+    );
+}
+
+#[test]
+fn root_grant_cannot_be_revoked_by_member() {
+    let (mut s, a, _, _) = setup();
+    let root = s
+        .grants
+        .values()
+        .find(|g| g.grantor.is_none())
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        ops::revoke(&mut s, 20, &a, &root).unwrap_err().reason,
+        Reason::NoGrant
+    );
+    assert_eq!(s.grants[&root].status, GrantStatus::Active);
+}
+
+#[test]
+fn bu_open_cannot_move_an_existing_head() {
+    let (mut s, a, b, _) = setup();
+    ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope()).unwrap();
+    assert_eq!(
+        ops::bu_open(&mut s, 12, &a, &b.member, None, &[], &scope())
+            .unwrap_err()
+            .reason,
+        Reason::Conflict
+    );
+}
+
+#[test]
+fn cancelled_notice_has_fallback_for_empty_reason() {
+    let (mut s, a, b, _) = setup();
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    let d = ops::duty_issue(&mut s, 12, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.outbox.clear();
+    ops::duty_cancel(&mut s, 13, &a, &d, "").unwrap();
+    assert!(s.outbox.iter().any(|n| n.body.contains("사유 없음")));
+    s.outbox.clear();
+    ops::bu_cancel(&mut s, 14, &a, &bu, "  ").unwrap();
+    assert!(s.outbox.iter().any(|n| n.body.contains("사유 없음")));
 }

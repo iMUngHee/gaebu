@@ -366,6 +366,16 @@ pub fn bu_open(
     authz::require(st, &a.id, Verb::Open, scope)?;
     let h = find_member(st, head)?.clone();
     below(st, &a, &h)?;
+    if st
+        .bus
+        .values()
+        .any(|b| b.head == h.id && b.status == BuStatus::Open)
+    {
+        return refuse(
+            Reason::Conflict,
+            "close or hand over headed bu before opening another",
+        );
+    }
     for verb in verbs {
         authz::require(st, &a.id, *verb, scope)?;
     }
@@ -405,7 +415,7 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         .get(bu)
         .cloned()
         .ok_or_else(|| Error::new(Reason::NotFound, "bu not found"))?;
-    if b.team != a.team || !(b.head == a.id || authz::is_below(st, &a.id, &b.head)) {
+    if b.team != a.team || !authz::is_below(st, &a.id, &b.head) {
         return refuse(Reason::NoGrant, "not a subordinate bu");
     }
     authz::require(st, &a.id, Verb::Open, &[])?;
@@ -446,7 +456,7 @@ pub fn bu_cancel(
         .get(bu)
         .cloned()
         .ok_or_else(|| Error::new(Reason::NotFound, "bu not found"))?;
-    if b.team != a.team || !(b.head == a.id || authz::is_below(st, &a.id, &b.head)) {
+    if b.team != a.team || !authz::is_below(st, &a.id, &b.head) {
         return refuse(Reason::NoGrant, "not a subordinate bu");
     }
     let bus = bu_descendants(st, bu);
@@ -457,6 +467,11 @@ pub fn bu_cancel(
         .flat_map(|d| d.scope.iter().cloned())
         .collect();
     authz::require(st, &a.id, Verb::Cancel, &scopes)?;
+    let reason = if reason.trim().is_empty() {
+        "사유 없음"
+    } else {
+        reason
+    };
     let affected = cancel_bu(st, now, bu);
     changed(
         st,
@@ -652,6 +667,12 @@ pub fn revoke(st: &mut State, now: Ms, actor: &Actor, grant: &str) -> Result<Out
         .get(grant)
         .cloned()
         .ok_or_else(|| Error::new(Reason::NotFound, "grant not found"))?;
+    if g.grantor.is_none() {
+        return refuse(
+            Reason::NoGrant,
+            "root grant can only be removed by a user root directive",
+        );
+    }
     if g.team != a.team
         || g.grantor.as_deref() != Some(&a.id) && st.teams[&a.team].commander != a.id
     {
@@ -872,6 +893,11 @@ pub fn duty_cancel(
     duty: &str,
     reason: &str,
 ) -> Result<Outcome> {
+    let reason = if reason.trim().is_empty() {
+        "사유 없음"
+    } else {
+        reason
+    };
     let a = authz::check_actor(st, actor)?.clone();
     let d = find_duty(st, duty)?.clone();
     let m = find_member(st, &d.assignee)?;
@@ -1428,11 +1454,7 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
         text: text.into(),
         at: now,
     });
-    let mut seen = std::collections::BTreeSet::new();
     for member in affected {
-        if member == author || !seen.insert(member) {
-            continue;
-        }
         let session = st
             .members
             .get(member)
