@@ -363,3 +363,21 @@ fn transact_respects_total_deadline() {
         assert_eq!(fs::read(home.0.join("state.json")).unwrap(), before);
     }
 }
+
+#[test]
+fn legacy_sighting_defaults_pending_throttle_fields() {
+    let sighting: gaebu::store::Sighting = serde_json::from_str(r#"{"last_seen":10}"#).unwrap();
+    assert_eq!(sighting.pending_checked_at, None);
+    assert_eq!(sighting.pending_checked_rev, None);
+    let home = Home::new();
+    let store = home.store();
+    let log = store.session("pending");
+    log.update_sighting(|s| {
+        s.pending_checked_at = Some(10);
+        s.pending_checked_rev = Some(2);
+    })
+    .unwrap();
+    let stored = log.sighting().unwrap();
+    assert_eq!(stored.pending_checked_at, Some(10));
+    assert_eq!(stored.pending_checked_rev, Some(2));
+}
