@@ -1,0 +1,9 @@
+{
+  "session_id": "captured-claude-session",
+  "transcript_path": "C:\redacted\transcript.jsonl",
+  "cwd": "C:\redacted",
+  "hook_event_name": "SessionStart",
+  "source": "resume",
+  "seconds_since_last_response": 1167,
+  "prompt_cache_likely_expired": false
+}
