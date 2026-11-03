@@ -1,0 +1,1 @@
+{"session_id":"fixture-codex","hook_event_name":"UserPromptSubmit","prompt":"pager: new mail for bepo from gapu (claude session). [pager-poke] If it is not shown with this turn, run msg_list.","project_dir":"/fixture/project","fixture_source":"Synthetic payload using the wrapper observed in bepo's prompt; not a captured host payload"}

@@ -758,10 +758,17 @@ fn parse_member_spec(s: &str) -> Result<(String, Option<String>, Option<Tool>)> 
 fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
     match cmd {
         Cmd::Hook { tool } => {
-            let store = open_store()?;
-            let mut stdin = std::io::stdin();
-            let mut stdout = std::io::stdout();
-            crate::hook::run(tool.into(), &mut stdin, &mut stdout, &store, pager);
+            let store = match open_store() {
+                Ok(store) => store,
+                Err(e) => {
+                    eprintln!("gaebu: hook: {e}");
+                    return Ok(());
+                }
+            };
+            let pager = CliPager {
+                timeout: Duration::from_millis(1_500),
+            };
+            crate::hook::run_stdio(tool.into(), &store, &pager);
             Ok(())
         }
         Cmd::Mcp => {
