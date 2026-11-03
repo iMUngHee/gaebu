@@ -329,3 +329,55 @@ fn multiprocess_writers_serialize() {
     assert_eq!(state.next_id, 101);
     assert_eq!(state.rev, 100);
 }
+
+#[test]
+fn transact_respects_total_deadline() {
+    let home = Home::new();
+    let store = home.store();
+    store.transact(Duration::from_secs(1), |_| Ok(())).unwrap();
+    let before = fs::read(home.0.join("state.json")).unwrap();
+    let result = store.transact(Duration::from_millis(10), |s| {
+        s.next_id = 999;
+        std::thread::sleep(Duration::from_millis(30));
+        Ok(())
+    });
+    assert_eq!(result.unwrap_err().reason, Reason::StoreWriteFailed);
+    assert_eq!(fs::read(home.0.join("state.json")).unwrap(), before);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = fs::File::options()
+            .read(true)
+            .share_mode(1)
+            .open(home.0.join("state.json"))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let result = store.transact(Duration::from_millis(140), |_| {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(())
+        });
+        let elapsed = start.elapsed();
+        drop(held);
+        assert_eq!(result.unwrap_err().reason, Reason::StoreWriteFailed);
+        assert!(elapsed < Duration::from_millis(230), "elapsed={elapsed:?}");
+        assert_eq!(fs::read(home.0.join("state.json")).unwrap(), before);
+    }
+}
+
+#[test]
+fn legacy_sighting_defaults_pending_throttle_fields() {
+    let sighting: gaebu::store::Sighting = serde_json::from_str(r#"{"last_seen":10}"#).unwrap();
+    assert_eq!(sighting.pending_checked_at, None);
+    assert_eq!(sighting.pending_checked_rev, None);
+    let home = Home::new();
+    let store = home.store();
+    let log = store.session("pending");
+    log.update_sighting(|s| {
+        s.pending_checked_at = Some(10);
+        s.pending_checked_rev = Some(2);
+    })
+    .unwrap();
+    let stored = log.sighting().unwrap();
+    assert_eq!(stored.pending_checked_at, Some(10));
+    assert_eq!(stored.pending_checked_rev, Some(2));
+}
