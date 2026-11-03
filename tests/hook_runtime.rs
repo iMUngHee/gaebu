@@ -628,3 +628,162 @@ fn live_host_alias_movement_vacates_old_binding() {
         Some("alias_moved")
     );
 }
+
+#[test]
+fn vacant_seat_does_not_block_new_pending_on_same_session() {
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .transact(std::time::Duration::from_secs(1), |st| {
+            let old = st.members.get_mut("m").unwrap();
+            old.binding.state = BindingState::Vacant;
+            old.binding.alias = "old-alias".into();
+            let mut new = old.clone();
+            new.id = "new".into();
+            new.title = "new-title".into();
+            new.superior = Some("m".into());
+            new.binding.state = BindingState::Pending;
+            new.binding.session_id = None;
+            new.binding.alias = "bepo".into();
+            new.binding.tool = None;
+            new.binding.bound_at = None;
+            st.members.insert(new.id.clone(), new);
+            Ok(())
+        })
+        .unwrap();
+    let output = f.run(
+        Tool::Codex,
+        br#"{"session_id":"fixture-codex","hook_event_name":"SessionStart"}"#,
+        &FakePager(HostStatus::Unknown),
+    );
+    let state = f.store.read().unwrap();
+    assert_eq!(state.members["new"].binding.state, BindingState::Bound);
+    assert_eq!(state.members["m"].binding.state, BindingState::Vacant);
+    assert!(context(&output).contains("new-title"));
+    let caller = identity::Caller {
+        session_id: "fixture-codex".into(),
+        tool: Some(Tool::Codex),
+        source: identity::Source::McpThreadMeta,
+    };
+    assert_eq!(identity::actor(&state, &caller).unwrap().member, "new");
+    let mut output = Vec::new();
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"me","_meta":{"threadId":"fixture-codex"}}});
+    gaebu::mcp::serve(
+        &mut Cursor::new(format!("{request}\n")),
+        &mut output,
+        &f.store,
+        &FakePager(HostStatus::Unknown),
+    )
+    .unwrap();
+    let reply: Value = serde_json::from_slice(&output).unwrap();
+    let card: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(card["member"], "new");
+}
+
+#[test]
+fn missing_pager_name_is_unknown_not_alias_movement() {
+    struct MissingName;
+    impl Pager for MissingName {
+        fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
+            gaebu::pager::parse_whoami(&format!("session: {} (via flag)\n", session.unwrap()))
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            Ok(HostStatus::Live)
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    assert!(
+        identity::refresh_bindings(&f.store, &MissingName)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.store.read().unwrap().members["m"].binding.state,
+        BindingState::Bound
+    );
+}
+
+#[test]
+fn mcp_read_survives_binding_refresh_lock_timeout() {
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .session("fixture-codex")
+        .update_sighting(|s| {
+            s.tool = Some(Tool::Codex);
+            s.last_seen = Some(now_ms());
+        })
+        .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.path.join("state.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"me","_meta":{"threadId":"fixture-codex"}}});
+    let mut out = Vec::new();
+    gaebu::mcp::serve(
+        &mut Cursor::new(format!("{request}\n")),
+        &mut out,
+        &f.store,
+        &FakePager(HostStatus::Gone),
+    )
+    .unwrap();
+    lock.unlock().unwrap();
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
+
+#[test]
+fn hook_pending_lookup_is_throttled_until_revision_changes() {
+    struct CountingPager(std::cell::Cell<usize>);
+    impl Pager for CountingPager {
+        fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
+            self.0.set(self.0.get() + 1);
+            Ok(WhoAmI {
+                session_id: session.unwrap().into(),
+                via: "flag".into(),
+                alias: Some("unrelated".into()),
+                tool: None,
+            })
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            panic!("hook must not poll roster")
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            panic!("hook must not send")
+        }
+    }
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .transact(std::time::Duration::from_secs(1), |st| {
+            let b = &mut st.members.get_mut("m").unwrap().binding;
+            b.state = BindingState::Pending;
+            b.session_id = None;
+            Ok(())
+        })
+        .unwrap();
+    let pager = CountingPager(std::cell::Cell::new(0));
+    let raw=br#"{"session_id":"unrelated-session","hook_event_name":"UserPromptSubmit","prompt":"fixture user request"}"#;
+    for _ in 0..2 {
+        assert!(f.run(Tool::Codex, raw, &pager).is_empty());
+    }
+    assert_eq!(pager.0.get(), 1);
+    f.store
+        .transact(std::time::Duration::from_secs(1), |_| Ok(()))
+        .unwrap();
+    assert!(f.run(Tool::Codex, raw, &pager).is_empty());
+    assert_eq!(pager.0.get(), 2);
+    f.store
+        .session("unrelated-session")
+        .update_sighting(|s| s.pending_checked_at = Some(now_ms() - 300_001))
+        .unwrap();
+    assert!(f.run(Tool::Codex, raw, &pager).is_empty());
+    assert_eq!(pager.0.get(), 3);
+}

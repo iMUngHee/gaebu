@@ -106,6 +106,7 @@ pub fn actor(st: &State, caller: &Caller) -> Result<Actor> {
         .values()
         .find(|m| {
             m.status == MemberStatus::Active
+                && m.binding.state == crate::model::BindingState::Bound
                 && m.binding.session_id.as_deref() == Some(&caller.session_id)
         })
         .ok_or_else(|| Error::new(Reason::NotMember, "session has no active member"))?;
@@ -139,7 +140,10 @@ pub fn refresh_bindings(store: &Store, pager: &dyn Pager) -> Result<Vec<String>>
             match pager.whoami(Some(session)) {
                 Ok(who)
                     if who.session_id == session
-                        && who.alias.as_deref() != Some(&member.binding.alias) =>
+                        && who
+                            .alias
+                            .as_deref()
+                            .is_some_and(|alias| alias != member.binding.alias) =>
                 {
                     Some("alias_moved")
                 }
