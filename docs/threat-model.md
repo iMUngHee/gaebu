@@ -48,8 +48,12 @@ provenance overrides a string exclusion, allowing a human to discuss those
 marker strings. Records are meaningful only within the caller's session log;
 the event structure does not independently identify its session.
 
-Disabling the mod mid-session can leave hook-only evidence unavailable until the
-last heartbeat expires, for at most one hour. An observed Stop closes evidence
+A session counts as mod-active for a prompt when a mod heartbeat falls within
+one hour before the prompt or up to ten seconds after it. The ten seconds absorb
+the mod's heartbeat arriving just after the shell hook records the prompt, since
+the order of the two is not guaranteed. Disabling the mod mid-session can leave
+hook-only evidence unavailable until the last heartbeat expires, for at most one
+hour. An observed Stop closes evidence
 even if another Stop hook keeps the host turn going. These are conservative
 failures. A peer delivery that does not trigger UserPromptSubmit may not close
 the evidence window; that residual risk is accepted for cooperative processes.
