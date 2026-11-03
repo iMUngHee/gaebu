@@ -6,8 +6,8 @@
 //! - MCP: Claude via the server process's `pager whoami`; Codex requires
 //!   `_meta.threadId` on each tools/call, seen recently by gaebu's hook.
 
-use crate::error::Result;
-use crate::model::{Actor, State, Tool};
+use crate::error::{Error, Reason, Result};
+use crate::model::{Actor, MemberStatus, State, Tool, now_ms};
 use crate::pager::Pager;
 use crate::store::Store;
 
@@ -36,19 +36,73 @@ impl Caller {
 
 /// Resolve the CLI caller through pager.
 pub fn from_pager(p: &dyn Pager) -> Result<Caller> {
-    let _ = p;
-    todo!("bepo: identity")
+    let who = p.whoami(None)?;
+    let (source, tool) = match who.via.as_str() {
+        "host" => (Source::PagerHost, Some(Tool::Claude)),
+        "native" => (Source::PagerNative, Some(Tool::Codex)),
+        _ => (Source::Other(who.via), None),
+    };
+    Ok(Caller {
+        session_id: who.session_id,
+        tool,
+        source,
+    })
 }
 
 /// Resolve an MCP caller. `thread_id` is `_meta.threadId` when present.
 pub fn for_mcp(p: &dyn Pager, store: &Store, thread_id: Option<&str>) -> Result<Caller> {
-    let _ = (p, store, thread_id);
-    todo!("bepo: identity")
+    if let Some(id) = thread_id {
+        if id.is_empty() {
+            return Err(Error::new(Reason::UnresolvedCaller, "empty MCP thread id"));
+        }
+        let sighting = store.session(id).sighting()?;
+        if sighting.tool != Some(Tool::Codex)
+            || !sighting
+                .last_seen
+                .is_some_and(|seen| now_ms().saturating_sub(seen) <= 7_200_000)
+        {
+            return Err(Error::new(
+                Reason::UnresolvedCaller,
+                "MCP thread has no recent Codex hook sighting",
+            ));
+        }
+        return Ok(Caller {
+            session_id: id.into(),
+            tool: Some(Tool::Codex),
+            source: Source::McpThreadMeta,
+        });
+    }
+    let caller = from_pager(p)?;
+    if caller.source != Source::PagerHost {
+        return Err(Error::new(
+            Reason::UnresolvedCaller,
+            "Codex MCP requires _meta.threadId",
+        ));
+    }
+    Ok(caller)
 }
 
 /// Map a mutating caller to the acting member. Refuses `unresolved_caller`
 /// for read-only sources and `not_member` when no member is bound.
 pub fn actor(st: &State, caller: &Caller) -> Result<Actor> {
-    let _ = (st, caller);
-    todo!("bepo: identity")
+    if !caller.may_mutate() {
+        return Err(Error::new(
+            Reason::UnresolvedCaller,
+            "pager flag/env identities are read-only",
+        ));
+    }
+    let member = st
+        .members
+        .values()
+        .find(|m| {
+            m.status == MemberStatus::Active
+                && m.binding.session_id.as_deref() == Some(&caller.session_id)
+        })
+        .ok_or_else(|| Error::new(Reason::NotMember, "session has no active member"))?;
+    let actor = Actor {
+        member: member.id.clone(),
+        session_id: caller.session_id.clone(),
+    };
+    crate::authz::check_actor(st, &actor)?;
+    Ok(actor)
 }
