@@ -208,6 +208,7 @@ fn run_budget(
         let mut st = store.read()?;
         member_known = st.members.values().any(|m| {
             m.status == model::MemberStatus::Active
+                && m.binding.state == model::BindingState::Bound
                 && m.binding.session_id.as_deref() == Some(&input.session_id)
         });
         let pending = st.members.values().any(|m| {
@@ -218,12 +219,25 @@ fn run_budget(
             return Ok(None);
         }
         if !member_known && pending {
-            if budget.saturating_sub(started.elapsed()) < Duration::from_millis(2_500) {
+            if sighting.pending_checked_rev == Some(st.rev)
+                && sighting
+                    .pending_checked_at
+                    .is_some_and(|at| now.saturating_sub(at) < 300_000)
+            {
+                return Ok(None);
+            }
+            if budget.saturating_sub(started.elapsed()) < Duration::from_millis(3_000) {
                 return Err(Error::new(
                     Reason::Busy,
                     "pending binding confirmation exceeded hook budget",
                 ));
             }
+            // Cache attempts as well as successes, so an unavailable pager
+            // cannot add its full timeout to every unrelated user prompt.
+            session.update_sighting(|s| {
+                s.pending_checked_at = Some(now);
+                s.pending_checked_rev = Some(st.rev);
+            })?;
             let who = pager.whoami(Some(&input.session_id))?;
             if who.session_id != input.session_id {
                 return Err(Error::new(
@@ -247,6 +261,7 @@ fn run_budget(
         }
         let Some(member) = st.members.values().find(|m| {
             m.status == model::MemberStatus::Active
+                && m.binding.state == model::BindingState::Bound
                 && m.binding.session_id.as_deref() == Some(&input.session_id)
         }) else {
             return Ok(None);

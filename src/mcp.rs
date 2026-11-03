@@ -178,7 +178,9 @@ fn call(
         })?;
     }
     let caller = identity::for_mcp(pager, store, thread)?;
-    identity::refresh_bindings(store, pager)?;
+    if let Err(e) = identity::refresh_bindings(store, pager) {
+        eprintln!("gaebu: MCP binding refresh: {e}");
+    }
     let now = model::now_ms();
     if name == "me" || name == "board" {
         let st = store.read()?;
@@ -187,6 +189,7 @@ fn call(
             .values()
             .find(|m| {
                 m.status == model::MemberStatus::Active
+                    && m.binding.state == model::BindingState::Bound
                     && m.binding.session_id.as_deref() == Some(&caller.session_id)
             })
             .ok_or_else(|| Error::new(Reason::NotMember, "session has no member"))?;
