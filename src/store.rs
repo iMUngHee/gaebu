@@ -244,11 +244,55 @@ impl SessionLog {
             bytes.push(b'\n');
         }
         replace(&self.dir.join("events.jsonl"), &bytes)?;
+        if kind == EventKind::UserPrompt {
+            for entry in fs::read_dir(&self.dir).map_err(write_error)? {
+                let entry = entry.map_err(write_error)?;
+                if marker_at(&entry.file_name().to_string_lossy()).is_some_and(|t| t < at) {
+                    match fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(write_error(e)),
+                    }
+                }
+            }
+        }
         Ok(seq)
     }
 
     pub fn events(&self) -> Result<Vec<SessionEvent>> {
         read_lines(&self.dir.join("events.jsonl"))
+    }
+
+    /// Fail closed when a prompt event could not be written under its lock.
+    pub fn mark_unrecorded(&self, at: Ms) -> Result<()> {
+        fs::create_dir_all(&self.dir).map_err(write_error)?;
+        let path = self.dir.join(format!(
+            "unrecorded-{at}-{}-{}",
+            std::process::id(),
+            TMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(write_error)?;
+        file.sync_all().map_err(write_error)
+    }
+
+    /// A marker at the same millisecond is conservatively considered later.
+    pub fn unrecorded_after(&self, at: Ms) -> Result<bool> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(write_error(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(write_error)?;
+            if marker_at(&entry.file_name().to_string_lossy()).is_some_and(|t| t >= at) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn append_composer(&self, rec: &ComposerRecord) -> Result<()> {
@@ -289,6 +333,14 @@ impl SessionLog {
 
 fn write_error(e: impl std::fmt::Display) -> Error {
     Error::new(Reason::StoreWriteFailed, e.to_string())
+}
+
+fn marker_at(name: &str) -> Option<Ms> {
+    name.strip_prefix("unrecorded-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }
 fn corrupt_error(e: impl std::fmt::Display) -> Error {
     Error::new(Reason::StoreCorrupt, e.to_string())
