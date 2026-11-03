@@ -34,12 +34,19 @@ pub fn serve(
                 continue;
             }
         };
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let raw_id = request.get("id").cloned().unwrap_or(Value::Null);
+        let valid_id = raw_id.is_null() || raw_id.is_string() || raw_id.is_number();
+        let id = if valid_id { raw_id } else { Value::Null };
         let response = if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
             || !request["method"].is_string()
-            || (!id.is_null() && !id.is_string() && !id.is_number())
+            || !valid_id
         {
             json!({"error":{"code":-32600,"message":"Invalid Request"}})
+        } else if request.get("params").is_some_and(|p| !p.is_object()) {
+            if request.get("id").is_none() {
+                continue;
+            }
+            json!({"error":{"code":-32602,"message":"Parameters must be an object"}})
         } else {
             let method = request["method"].as_str().unwrap_or("");
             if request.get("id").is_none() {
@@ -59,7 +66,17 @@ pub fn serve(
                         .cloned()
                         .unwrap_or_else(|| json!({}));
                     let thread = params.pointer("/_meta/threadId").and_then(Value::as_str);
-                    let result = call(name, &args, thread, store, pager);
+                    let malformed_meta = params.get("_meta").is_some_and(|meta| {
+                        !meta.is_object() || meta.get("threadId").is_some_and(|id| !id.is_string())
+                    });
+                    let result = if malformed_meta {
+                        Err(Error::new(
+                            Reason::UnresolvedCaller,
+                            "invalid MCP _meta.threadId",
+                        ))
+                    } else {
+                        call(name, &args, thread, store, pager)
+                    };
                     match result {
                         Ok(value) => {
                             json!({"result":{"content":[{"type":"text","text":value.to_string()}],"isError":false}})

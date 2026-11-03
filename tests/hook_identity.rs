@@ -79,3 +79,25 @@ fn cli_flag_identity_rejected_for_mutation() {
     let caller = identity::from_pager(&FakePager("session: s (via flag)\nname: bepo")).unwrap();
     assert!(!caller.may_mutate());
 }
+
+#[test]
+fn caller_transport_failure_is_unresolved() {
+    struct Unavailable;
+    impl Pager for Unavailable {
+        fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
+            Err(gaebu::Error::new(
+                Reason::PagerUnavailable,
+                "transport failed",
+            ))
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            Ok(HostStatus::Unknown)
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let error = identity::from_pager(&Unavailable).unwrap_err();
+    assert_eq!(error.reason, Reason::UnresolvedCaller);
+    assert!(error.message.contains("transport failed"));
+}

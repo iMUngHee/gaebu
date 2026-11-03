@@ -485,3 +485,90 @@ fn vacant_when_pager_reports_gone() {
         BindingState::Vacant
     );
 }
+
+#[test]
+fn hook_pending_binding_confirms_on_target_hook() {
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .transact(std::time::Duration::from_secs(1), |st| {
+            let b = &mut st.members.get_mut("m").unwrap().binding;
+            b.state = BindingState::Pending;
+            b.session_id = None;
+            b.tool = None;
+            b.bound_at = None;
+            Ok(())
+        })
+        .unwrap();
+    let text = context(&f.run(
+        Tool::Codex,
+        br#"{"session_id":"fixture-codex","hook_event_name":"SessionStart"}"#,
+        &FakePager(HostStatus::Live),
+    ));
+    assert!(text.contains("fixture-title"));
+    let binding = f.store.read().unwrap().members["m"].binding.clone();
+    assert_eq!(binding.state, BindingState::Bound);
+    assert_eq!(binding.session_id.as_deref(), Some("fixture-codex"));
+    assert_eq!(binding.tool, Some(Tool::Codex));
+    assert!(binding.bound_at.is_some());
+}
+
+#[test]
+fn hook_non_matching_alias_cannot_confirm_pending_binding() {
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .transact(std::time::Duration::from_secs(1), |st| {
+            let b = &mut st.members.get_mut("m").unwrap().binding;
+            b.state = BindingState::Pending;
+            b.session_id = None;
+            b.alias = "someone-else".into();
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        f.run(
+            Tool::Codex,
+            br#"{"session_id":"fixture-codex","hook_event_name":"SessionStart"}"#,
+            &FakePager(HostStatus::Live)
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        f.store.read().unwrap().members["m"].binding.state,
+        BindingState::Pending
+    );
+}
+
+#[test]
+fn live_host_alias_movement_vacates_old_binding() {
+    struct Moved;
+    impl Pager for Moved {
+        fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
+            Ok(WhoAmI {
+                session_id: session.unwrap().into(),
+                via: "flag".into(),
+                alias: Some("new-alias".into()),
+                tool: None,
+            })
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            Ok(HostStatus::Live)
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            panic!("observation must not send")
+        }
+    }
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    assert_eq!(
+        identity::refresh_bindings(&f.store, &Moved).unwrap(),
+        vec!["m"]
+    );
+    let st = f.store.read().unwrap();
+    assert_eq!(st.members["m"].binding.state, BindingState::Vacant);
+    assert_eq!(
+        st.members["m"].binding.vacated_reason.as_deref(),
+        Some("alias_moved")
+    );
+}
