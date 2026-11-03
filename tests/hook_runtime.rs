@@ -387,6 +387,39 @@ fn hook_io_errors_do_not_panic() {
 }
 
 #[test]
+fn hook_failed_prompt_or_stop_marks_old_evidence_unusable() {
+    for event in ["UserPromptSubmit", "Stop"] {
+        let f = Fixture::new();
+        f.seed(Tool::Claude);
+        let session = f.store.session("fixture-claude");
+        session
+            .append(
+                1,
+                EventKind::UserPrompt,
+                Some("old-hash".into()),
+                Some("old appointment".into()),
+                None,
+            )
+            .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(session.dir().join("lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let input = json!({"session_id":"fixture-claude","hook_event_name":event,"prompt":"new appointment"}).to_string();
+        f.run(
+            Tool::Claude,
+            input.as_bytes(),
+            &FakePager(HostStatus::Unknown),
+        );
+        lock.unlock().unwrap();
+        assert!(session.unrecorded_after(1).unwrap());
+        assert_eq!(session.events().unwrap().len(), 1);
+    }
+}
+
+#[test]
 fn mcp_codex_requires_thread_meta() {
     let f = Fixture::new();
     assert_eq!(
