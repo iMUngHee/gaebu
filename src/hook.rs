@@ -61,7 +61,7 @@ pub fn run_stdio(tool: Tool, store: &Store, pager: &dyn Pager) {
         &mut std::io::stdout(),
         store,
         pager,
-        Duration::from_secs(4).saturating_sub(started.elapsed()),
+        || Duration::from_secs(4).saturating_sub(started.elapsed()),
     );
 }
 
@@ -98,7 +98,10 @@ pub fn run(
     store: &Store,
     pager: &dyn Pager,
 ) {
-    run_budget(tool, stdin, stdout, store, pager, Duration::from_secs(4));
+    let started = Instant::now();
+    run_budget(tool, stdin, stdout, store, pager, || {
+        Duration::from_secs(4).saturating_sub(started.elapsed())
+    });
 }
 
 fn run_budget(
@@ -107,9 +110,11 @@ fn run_budget(
     stdout: &mut dyn Write,
     store: &Store,
     pager: &dyn Pager,
-    budget: Duration,
+    remaining: impl Fn() -> Duration,
 ) {
-    let started = Instant::now();
+    // Session writes can wait 500 ms for their lock and retry rename for
+    // another second. Reserve both before starting an uninterruptible write.
+    let session_write_budget = store::SESSION_LOCK_DEADLINE + Duration::from_secs(1);
     let mut event = String::new();
     let mut member_known = false;
     let result = (|| -> Result<Option<String>> {
@@ -156,7 +161,7 @@ fn run_budget(
         }
         let now = model::now_ms();
         let session = store.session(&input.session_id);
-        if budget.saturating_sub(started.elapsed()) < store::SESSION_LOCK_DEADLINE {
+        if remaining() < session_write_budget {
             if let Err(e) = session.mark_unrecorded(now) {
                 eprintln!("gaebu: hook missed-event marker: {e}");
             }
@@ -192,7 +197,7 @@ fn run_budget(
         }
         let mut sighting = session.sighting()?;
         let previous_hash = sighting.last_card_hash.clone();
-        if budget.saturating_sub(started.elapsed()) >= store::SESSION_LOCK_DEADLINE {
+        if remaining() >= session_write_budget {
             if let Err(e) = session.update_sighting(|s| {
                 s.tool = Some(tool);
                 s.last_seen = Some(now);
@@ -204,6 +209,9 @@ fn run_budget(
         }
         if event == "Stop" {
             return Ok(None);
+        }
+        if remaining().is_zero() {
+            return Err(Error::new(Reason::Busy, "hook budget exhausted"));
         }
         let mut st = store.read()?;
         member_known = st.members.values().any(|m| {
@@ -226,7 +234,7 @@ fn run_budget(
             {
                 return Ok(None);
             }
-            if budget.saturating_sub(started.elapsed()) < Duration::from_millis(3_000) {
+            if remaining() < session_write_budget {
                 return Err(Error::new(
                     Reason::Busy,
                     "pending binding confirmation exceeded hook budget",
@@ -238,6 +246,9 @@ fn run_budget(
                 s.pending_checked_at = Some(now);
                 s.pending_checked_rev = Some(st.rev);
             })?;
+            if remaining() < Duration::from_millis(1_500) + store::HOOK_DEADLINE {
+                return Ok(None);
+            }
             let who = pager.whoami(Some(&input.session_id))?;
             if who.session_id != input.session_id {
                 return Err(Error::new(
@@ -252,10 +263,16 @@ fn run_budget(
                         && m.binding.alias == alias
                 })
             {
+                if remaining() < store::HOOK_DEADLINE {
+                    return Ok(None);
+                }
                 let confirmed = store.transact(store::HOOK_DEADLINE, |st| {
                     ops::confirm_binding(st, now, &input.session_id, tool, &alias)
                 })?;
                 member_known = confirmed.is_some();
+                if remaining().is_zero() {
+                    return Err(Error::new(Reason::Busy, "hook budget exhausted"));
+                }
                 st = store.read()?;
             }
         }
@@ -266,7 +283,7 @@ fn run_budget(
         }) else {
             return Ok(None);
         };
-        if started.elapsed() >= budget {
+        if remaining().is_zero() {
             return Err(Error::new(Reason::Busy, "hook budget exhausted"));
         }
         let Some(card) = card::build(&st, &member.id, now, sighting.last_seen) else {
@@ -289,7 +306,7 @@ fn run_budget(
         // mod-owned card must not suppress the next fallback full card.
         Ok(Some(if full {
             emit(stdout, &event, &text)?;
-            if budget.saturating_sub(started.elapsed()) >= store::SESSION_LOCK_DEADLINE
+            if remaining() >= session_write_budget
                 && let Err(e) = session.update_sighting(|s| s.last_card_hash = Some(card.hash))
             {
                 eprintln!("gaebu: hook card hash not recorded: {e}");
@@ -328,4 +345,102 @@ fn emit(stdout: &mut dyn Write, event: &str, text: &str) -> Result<()> {
     writeln!(stdout)
         .and_then(|_| stdout.flush())
         .map_err(|e| Error::new(Reason::StoreWriteFailed, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pager::{HostStatus, WhoAmI};
+    use std::cell::Cell;
+
+    #[test]
+    fn hook_budget_rechecked_after_sighting_write() {
+        struct CountingPager(Cell<usize>);
+        impl Pager for CountingPager {
+            fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
+                self.0.set(self.0.get() + 1);
+                Ok(WhoAmI {
+                    session_id: "budget".into(),
+                    via: "flag".into(),
+                    alias: Some("target".into()),
+                    tool: None,
+                })
+            }
+            fn host_status(&self, _: &str) -> Result<HostStatus> {
+                unreachable!()
+            }
+            fn send(&self, _: &str, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let home = std::env::temp_dir().join(format!(
+            "gaebu-hook-budget-{}-{}",
+            std::process::id(),
+            model::now_ms()
+        ));
+        let store = Store::open(&home).unwrap();
+        let mut value = serde_json::to_value(model::State::default()).unwrap();
+        value["members"]["m"] = json!({"id":"m","team":"t","bu":"b","superior":null,"title":"fixture","status":"active","binding":{"state":"pending","alias":"target","tool":null,"session_id":null,"designated_at":1,"bound_at":null,"vacated_at":null,"vacated_reason":null},"created_at":1});
+        store
+            .transact(store::CLI_DEADLINE, |st| {
+                *st = serde_json::from_value(value).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let pager = CountingPager(Cell::new(0));
+        let mut output = Vec::new();
+        run_budget(
+            Tool::Codex,
+            &mut br#"{"session_id":"budget","hook_event_name":"SessionStart"}"#.as_slice(),
+            &mut output,
+            &store,
+            &pager,
+            || {
+                // Advance the budget at the observable store write boundary;
+                // this avoids depending on scheduler or filesystem timings.
+                if store
+                    .session("budget")
+                    .sighting()
+                    .unwrap()
+                    .pending_checked_rev
+                    .is_some()
+                {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(4)
+                }
+            },
+        );
+        assert_eq!(pager.0.get(), 0);
+        assert!(output.is_empty());
+        store
+            .session("budget")
+            .update_sighting(|s| {
+                s.pending_checked_at = None;
+                s.pending_checked_rev = None;
+            })
+            .unwrap();
+        run_budget(
+            Tool::Codex,
+            &mut br#"{"session_id":"budget","hook_event_name":"SessionStart"}"#.as_slice(),
+            &mut output,
+            &store,
+            &pager,
+            || {
+                if pager.0.get() > 0 {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(4)
+                }
+            },
+        );
+        assert_eq!(pager.0.get(), 1);
+        assert_eq!(
+            store.read().unwrap().rev,
+            1,
+            "insufficient budget must skip the state transaction"
+        );
+        assert!(output.is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }
