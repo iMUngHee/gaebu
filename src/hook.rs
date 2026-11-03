@@ -27,23 +27,65 @@ pub fn run_stdio(tool: Tool, store: &Store, pager: &dyn Pager) {
     let started = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut raw = Vec::new();
-        let result = std::io::stdin()
-            .take(1_048_577)
-            .read_to_end(&mut raw)
-            .map(|_| raw);
-        let _ = tx.send(result);
+        let mut stdin = std::io::stdin().take(1_048_577);
+        let mut buffer = [0; 8192];
+        loop {
+            let packet = stdin.read(&mut buffer).map(|n| buffer[..n].to_vec());
+            let finished = !matches!(&packet, Ok(chunk) if !chunk.is_empty());
+            if tx.send(packet).is_err() || finished {
+                break;
+            }
+        }
     });
-    match rx.recv_timeout(Duration::from_millis(250)) {
-        Ok(Ok(raw)) => run_budget(
-            tool,
-            &mut raw.as_slice(),
-            &mut std::io::stdout(),
-            store,
-            pager,
-            Duration::from_secs(4).saturating_sub(started.elapsed()),
-        ),
-        _ => eprintln!("gaebu: hook stdin unavailable within budget"),
+    let mut raw = Vec::new();
+    loop {
+        let remaining = Duration::from_millis(250).saturating_sub(started.elapsed());
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Ok(chunk)) => {
+                raw.extend_from_slice(&chunk);
+                if raw.len() > 1_048_576 {
+                    break;
+                }
+            }
+            _ => {
+                mark_failed_input(store, &raw);
+                eprintln!("gaebu: hook stdin unavailable within budget");
+                return;
+            }
+        }
+    }
+    run_budget(
+        tool,
+        &mut raw.as_slice(),
+        &mut std::io::stdout(),
+        store,
+        pager,
+        Duration::from_secs(4).saturating_sub(started.elapsed()),
+    );
+}
+
+/// A complete JSON session id can still be recovered when the event's
+/// schema is invalid. Truncated or malformed JSON invalidates all sessions
+/// conservatively, rather than guessing an id from text inside a prompt.
+fn mark_failed_input(store: &Store, raw: &[u8]) {
+    #[derive(Deserialize)]
+    struct SessionOnly {
+        session_id: String,
+    }
+    let identity = serde_json::from_slice::<SessionOnly>(raw).ok();
+    let session = identity
+        .as_ref()
+        .map(|v| v.session_id.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("_global");
+    if let Err(e) = store.session(session).mark_unrecorded(model::now_ms()) {
+        eprintln!("gaebu: hook failed-input marker: {e}");
+        if session != "_global"
+            && let Err(e) = store.session("_global").mark_unrecorded(model::now_ms())
+        {
+            eprintln!("gaebu: hook global failed-input marker: {e}");
+        }
     }
 }
 
@@ -72,16 +114,20 @@ fn run_budget(
     let mut member_known = false;
     let result = (|| -> Result<Option<String>> {
         let mut raw = Vec::new();
-        stdin
-            .take(1_048_577)
-            .read_to_end(&mut raw)
-            .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+        stdin.take(1_048_577).read_to_end(&mut raw).map_err(|e| {
+            mark_failed_input(store, &raw);
+            Error::new(Reason::InvalidArgument, e.to_string())
+        })?;
         if raw.len() > 1_048_576 {
+            mark_failed_input(store, &raw);
             return Err(Error::new(Reason::InvalidArgument, "hook input too large"));
         }
-        let input: Input = serde_json::from_slice(&raw)
-            .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+        let input: Input = serde_json::from_slice(&raw).map_err(|e| {
+            mark_failed_input(store, &raw);
+            Error::new(Reason::InvalidArgument, e.to_string())
+        })?;
         if input.session_id.is_empty() {
+            mark_failed_input(store, &raw);
             return Ok(None);
         }
         event = input.hook_event_name;
