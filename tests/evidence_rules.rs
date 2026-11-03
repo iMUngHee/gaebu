@@ -146,14 +146,15 @@ fn mod_active_hook_only_prompt_not_evidence_but_invalidates() {
         Some("현재 다른 지시를 줄게"),
     ));
     refused(&later, &[composer(100)], QUOTE);
-    // A late heartbeat must not retroactively disable hook fallback.
+    // A heartbeat outside the permitted arrival-skew window does not disable
+    // hook fallback for this prompt.
     assert!(
         current_turn_evidence(
             "caller",
-            &[prompt(), event(3, 110, EventKind::ModHeartbeat, None)],
+            &[prompt(), event(3, 10_101, EventKind::ModHeartbeat, None)],
             &[],
             QUOTE,
-            1000
+            20_000
         )
         .is_ok()
     );
@@ -165,8 +166,9 @@ fn mod_inactive_falls_back_to_hook_filtered() {
     let heartbeat = event(1, 100, EventKind::ModHeartbeat, None);
     assert!(mod_active_at(std::slice::from_ref(&heartbeat), 100));
     assert!(mod_active_at(std::slice::from_ref(&heartbeat), 3_600_099));
-    assert!(!mod_active_at(std::slice::from_ref(&heartbeat), 3_600_100));
-    assert!(!mod_active_at(std::slice::from_ref(&heartbeat), 99));
+    assert!(mod_active_at(std::slice::from_ref(&heartbeat), 3_600_100));
+    assert!(!mod_active_at(std::slice::from_ref(&heartbeat), 3_600_101));
+    assert!(mod_active_at(std::slice::from_ref(&heartbeat), 99));
     assert!(!mod_active_at(&[event(1, 100, EventKind::Stop, None)], 100));
     let old = event(1, 0, EventKind::ModHeartbeat, None);
     let p = event(2, 3_600_100, EventKind::UserPrompt, Some(TEXT));
@@ -176,6 +178,43 @@ fn mod_inactive_falls_back_to_hook_filtered() {
             .attest,
         Attest::HookFiltered
     );
+}
+
+#[test]
+fn mod_heartbeat_just_after_prompt_counts_active() {
+    for at in [101, 10_100] {
+        let events = [prompt(), event(3, at, EventKind::ModHeartbeat, None)];
+        assert!(mod_active_at(&events, 100));
+        assert_eq!(
+            current_turn_evidence("caller", &events, &[], QUOTE, 20_000)
+                .unwrap_err()
+                .reason,
+            Reason::NoUserEvidence
+        );
+        assert_eq!(
+            current_turn_evidence("caller", &events, &[composer(100)], QUOTE, 20_000)
+                .unwrap()
+                .attest,
+            Attest::Composer
+        );
+    }
+    let too_late = [prompt(), event(3, 10_101, EventKind::ModHeartbeat, None)];
+    assert!(!mod_active_at(&too_late, 100));
+    assert_eq!(
+        current_turn_evidence("caller", &too_late, &[], QUOTE, 20_000)
+            .unwrap()
+            .attest,
+        Attest::HookFiltered
+    );
+    // Bounds must also work near the clock's integer limits.
+    assert!(mod_active_at(
+        &[event(1, 0, EventKind::ModHeartbeat, None)],
+        0
+    ));
+    assert!(mod_active_at(
+        &[event(1, u64::MAX, EventKind::ModHeartbeat, None)],
+        u64::MAX
+    ));
 }
 
 #[test]
