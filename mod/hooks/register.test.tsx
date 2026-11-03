@@ -147,3 +147,25 @@ test('only a composer-stamped prompt is recorded as evidence', async ($, on) => 
   expect(evidence.length).toBe(1)
   expect(evidence[0]?.stdin).toBe('너한테 가절월 줄게')
 })
+
+test('evidence follows the current session id after /clear', async ($, on) => {
+  const calls: string[][] = []
+  let id = 'old-session'
+  on('session.id', () => ({ value: id }))
+  on('command.register', () => ({ value: { command: 'gaebu' } }))
+  on('clock.every', () => ({ value: () => {} }))
+  on('ui.status', () => ({ value: undefined }))
+  on('process.run', (_, e) => {
+    calls.push((e as { argv: string[] }).argv)
+    return ran('', 1)
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('prompt.submit', (_, e) => e)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  id = 'new-session'
+  await $.prompt.submit({ text: '개부해라', origin: { kind: 'composer' } } as never)
+
+  const evidence = calls.filter(a => a.includes('evidence'))
+  expect(evidence.at(-1)?.at(-1)).toBe('new-session')
+})
