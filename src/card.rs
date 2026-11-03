@@ -273,8 +273,9 @@ fn render_body(c: &Card) -> String {
     // the remaining room in priority order. One line is left for the footer.
     let mut keep: Vec<String> = vec![
         format!(
-            "[개부] {} · {} · binding {}",
+            "[개부] {} · {} · 팀 {} · binding {}",
             c.chain.last().cloned().unwrap_or_default(),
+            c.bu,
             c.team,
             c.binding
         ),
