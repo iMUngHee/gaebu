@@ -740,6 +740,62 @@ fn mcp_read_survives_binding_refresh_lock_timeout() {
 }
 
 #[test]
+fn mcp_mutation_refuses_when_refresh_fails() {
+    struct Gone(std::sync::mpsc::Sender<()>);
+    impl Pager for Gone {
+        fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
+            unreachable!()
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            self.0.send(()).unwrap();
+            Ok(HostStatus::Gone)
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    f.seed(Tool::Codex);
+    f.store
+        .session("fixture-codex")
+        .update_sighting(|s| {
+            s.tool = Some(Tool::Codex);
+            s.last_seen = Some(now_ms());
+        })
+        .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.path.join("state.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        // The refresh times out first; a subsequent mutation would acquire
+        // the lock once it is released and wrongly use the old binding.
+        std::thread::sleep(gaebu::store::CLI_DEADLINE + std::time::Duration::from_secs(1));
+        lock.unlock().unwrap();
+    });
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"record_add","arguments":{"text":"must not write after refresh failure"},"_meta":{"threadId":"fixture-codex"}}});
+    let mut out = Vec::new();
+    gaebu::mcp::serve(
+        &mut Cursor::new(format!("{request}\n")),
+        &mut out,
+        &f.store,
+        &Gone(tx),
+    )
+    .unwrap();
+    holder.join().unwrap();
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let error: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["reason"], "busy");
+    assert!(f.store.read().unwrap().records.is_empty());
+}
+
+#[test]
 fn hook_pending_lookup_is_throttled_until_revision_changes() {
     struct CountingPager(std::cell::Cell<usize>);
     impl Pager for CountingPager {

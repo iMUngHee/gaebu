@@ -179,6 +179,12 @@ fn call(
     }
     let caller = identity::for_mcp(pager, store, thread)?;
     if let Err(e) = identity::refresh_bindings(store, pager) {
+        if name != "me" && name != "board" {
+            return Err(Error::new(
+                Reason::Busy,
+                format!("binding refresh failed: {e}"),
+            ));
+        }
         eprintln!("gaebu: MCP binding refresh: {e}");
     }
     let now = model::now_ms();
