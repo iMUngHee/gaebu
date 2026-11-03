@@ -149,6 +149,25 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
         .filter(|o| o.bu == m.bu || o.superior.as_deref() == Some(&m.id) || bu.head == o.id)
         .map(|o| display(st, o))
         .collect();
+    // ...and anyone holding a live lease that overlaps one of my duty scopes.
+    let my_scopes: Vec<crate::scope::Pattern> = duties
+        .iter()
+        .flat_map(|d| d.scope.iter())
+        .filter_map(|s| crate::scope::parse(s).ok())
+        .collect();
+    for l in st.leases.values() {
+        if l.holder == m.id || l.expires_at <= now {
+            continue;
+        }
+        let Ok(key) = crate::scope::parse(&l.key) else {
+            continue;
+        };
+        if my_scopes.iter().any(|s| s.overlaps(&key))
+            && let Some(h) = st.members.get(&l.holder)
+        {
+            peers.push(format!("{} (점유 {})", display(st, h), l.key));
+        }
+    }
     peers.sort();
     peers.dedup();
 
