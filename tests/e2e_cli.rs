@@ -286,3 +286,25 @@ fn non_member_cannot_issue_duties() {
     );
     assert_eq!(code, 1);
 }
+
+#[test]
+fn dev_seed_refused_on_default_home() {
+    let (_g, _dir, _store) = setup();
+    let default = Store::default_home();
+    // SAFETY: SERIAL is held.
+    unsafe { std::env::set_var("GAEBU_HOME", &default) };
+    let before = std::fs::metadata(default.join("state.json"))
+        .and_then(|m| m.modified())
+        .ok();
+    let pager = FakePager::new(&[("s-x", "x")]);
+    pager.as_session("s-x");
+    let code = gaebu(
+        &pager,
+        &["dev", "seed", "--team", "t", "--commander", "x:s-x:codex"],
+    );
+    let after = std::fs::metadata(default.join("state.json"))
+        .and_then(|m| m.modified())
+        .ok();
+    assert_eq!(code, 1);
+    assert_eq!(before, after, "the default store must not be written");
+}
