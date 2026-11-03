@@ -68,12 +68,12 @@ fn peer_wrapper_prompts_not_recorded() {
         "[SYSTEM NOTIFICATION hi",
         "<side-sessions-event>hi",
         "<task-notification>hi",
-        "From gapu: hi",
     ] {
         assert!(matches!(classify(text), PromptClass::Excluded(_)), "{text}");
     }
     assert_eq!(classify(TEXT), PromptClass::User);
     assert_eq!(classify("Fromage recipe please"), PromptClass::User);
+    assert_eq!(classify("From now on use Gaebu"), PromptClass::User);
 }
 
 #[test]
@@ -258,4 +258,20 @@ fn hashing_and_whitespace_normalization() {
         sha256_hex(""),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+}
+
+#[test]
+fn evidence_boundary_and_repeated_turns() {
+    let six = event(1, 1000, EventKind::UserPrompt, Some("가나다라마바"));
+    assert!(current_turn_evidence("caller", &[six], &[], "가나다라마바", 1000).is_ok());
+    let events = [
+        event(1, 90, EventKind::ModHeartbeat, None),
+        prompt(),
+        event(3, 103, EventKind::Stop, None),
+        event(4, 108, EventKind::ModHeartbeat, None),
+        event(5, 110, EventKind::UserPrompt, Some(TEXT)),
+    ];
+    refused(&events, &[composer(103)], QUOTE);
+    assert!(current_turn_evidence("caller", &events, &[composer(105)], QUOTE, 1000).is_ok());
+    assert!(current_turn_evidence("caller", &events, &[composer(1000)], QUOTE, 1000).is_ok());
 }
