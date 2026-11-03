@@ -405,11 +405,15 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
 
 /// `run` with an injected pager (tests use a fake).
 pub fn run_with(args: impl IntoIterator<Item = OsString>, pager: &dyn Pager) -> i32 {
+    let args: Vec<OsString> = args.into_iter().collect();
+    // A hook must never fail its host, even when it is registered wrongly:
+    // exit 2 from a prompt hook can block the prompt.
+    let is_hook = args.get(1).is_some_and(|a| a == "hook");
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
             let _ = e.print();
-            return if e.use_stderr() { 2 } else { 0 };
+            return if is_hook || !e.use_stderr() { 0 } else { 2 };
         }
     };
     let json = cli.json;
@@ -542,30 +546,64 @@ pub const GLOBAL_MARKERS: &str = "_global";
 /// Deliver pending notices through pager and drop the delivered ones.
 /// Failures stay queued for the next call.
 pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
-    let Ok(st) = store.read() else { return };
-    if st.outbox.is_empty() {
+    // Claim a batch under the lock so concurrent CLI/MCP calls never send the
+    // same notice twice, send outside the lock, then requeue what failed.
+    let Ok(batch) = store.transact(store::CLI_DEADLINE, |st| {
+        let n = st.outbox.len().min(MAX_NOTICES_PER_FLUSH);
+        Ok(st.outbox.drain(..n).collect::<Vec<_>>())
+    }) else {
+        return;
+    };
+    if batch.is_empty() {
         return;
     }
-    let mut delivered = Vec::new();
     let mut failed = Vec::new();
-    for n in &st.outbox {
-        match pager.send(&n.to_session, &n.body) {
-            Ok(()) => delivered.push(n.id.clone()),
-            Err(e) => {
-                eprintln!("gaebu: notice {} not delivered: {e}", n.id);
-                failed.push(n.id.clone());
-            }
+    for n in batch {
+        if let Err(e) = pager.send(&n.to_session, &n.body) {
+            eprintln!("gaebu: notice {} not delivered: {e}", n.id);
+            failed.push(n);
         }
     }
+    if failed.is_empty() {
+        return;
+    }
     let _ = store.transact(store::CLI_DEADLINE, |st| {
-        st.outbox.retain(|n| !delivered.contains(&n.id));
-        for n in st.outbox.iter_mut() {
-            if failed.contains(&n.id) {
-                n.attempts += 1;
+        let now = now_ms();
+        for mut n in failed {
+            n.attempts += 1;
+            if n.attempts < MAX_NOTICE_ATTEMPTS {
+                st.outbox.push(n);
+                continue;
+            }
+            // Give up, but leave a trace in the team record.
+            if let Some(team) = st.members.get(&n.to_member).map(|m| m.team.clone()) {
+                let id = st.mint("r");
+                st.records.push(crate::model::Record {
+                    id,
+                    team,
+                    kind: RecordKind::Note,
+                    author: n.to_member.clone(),
+                    refs: vec![n.id.clone()],
+                    text: format!(
+                        "undelivered notice after {} attempts: {}",
+                        n.attempts, n.body
+                    ),
+                    at: now,
+                });
             }
         }
         Ok(())
     });
+}
+
+/// Notices sent per call, so a backlog never stalls a command for long.
+const MAX_NOTICES_PER_FLUSH: usize = 10;
+/// Attempts before a notice is dropped into the team record.
+const MAX_NOTICE_ATTEMPTS: u32 = 10;
+
+/// Lease minutes to ms, capped at the 8 h maximum ops enforces anyway.
+fn ttl_ms(minutes: Option<u64>) -> Option<u64> {
+    minutes.map(|m| m.min(8 * 60).saturating_mul(60_000))
 }
 
 /// Resolve a member reference: id (`m-3`), pager alias, or title, among
@@ -1063,10 +1101,10 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     } else {
                         LeaseMode::Exclusive
                     };
-                    ops::lease_acquire(st, now, actor, &key, mode, ttl.map(|m| m * 60_000), &reason)
+                    ops::lease_acquire(st, now, actor, &key, mode, ttl_ms(ttl), &reason)
                 }
                 LeaseCmd::Renew { lease, ttl } => {
-                    ops::lease_renew(st, now, actor, &lease, ttl.map(|m| m * 60_000))
+                    ops::lease_renew(st, now, actor, &lease, ttl_ms(ttl))
                 }
                 LeaseCmd::Release { lease } => ops::lease_release(st, now, actor, &lease),
                 LeaseCmd::ForceRelease { lease, reason } => {
