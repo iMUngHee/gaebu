@@ -98,6 +98,9 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // session.start does not fire on /clear, which starts a new session id:
+    // read it again so heartbeats and evidence land on the current session.
+    sessionId = await $.session.id()
     if (sessionId !== '') {
       await gaebu($, ['session', 'heartbeat', '--session', sessionId, '--mod'])
       // Only an Enter the engine itself stamped counts as the person's own words.

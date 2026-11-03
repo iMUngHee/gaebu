@@ -26,6 +26,15 @@ least six Unicode scalar values. Prompt hashing trims outer whitespace and
 converts CRLF to LF. Prompt text is bounded, so a quote outside the retained
 prefix cannot be checked.
 
+The most recent 50 user-prompt texts per session, each at most 4 KB, are retained
+under `~/.gaebu/sessions/`. These records can contain private instructions and
+project information; treat that directory as local session data.
+
+`~/.gaebu/capture.on` enables developer capture of raw hook stdin from every
+session into `~/.gaebu/capture/`. Capture may include private prompt and host
+metadata. Remove `capture.on` after collecting the needed fixtures and redact
+personal content and session identifiers before publishing them.
+
 For a mod-active Claude prompt, a matching composer record is required. Heartbeat
 activity is evaluated at prompt time and expires after one hour. Hook-only
 prompts still invalidate an older prompt even when they cannot supply evidence.
@@ -39,8 +48,12 @@ provenance overrides a string exclusion, allowing a human to discuss those
 marker strings. Records are meaningful only within the caller's session log;
 the event structure does not independently identify its session.
 
-Disabling the mod mid-session can leave hook-only evidence unavailable until the
-last heartbeat expires, for at most one hour. An observed Stop closes evidence
+A session counts as mod-active for a prompt when a mod heartbeat falls within
+one hour before the prompt or up to ten seconds after it. The ten seconds absorb
+the mod's heartbeat arriving just after the shell hook records the prompt, since
+the order of the two is not guaranteed. Disabling the mod mid-session can leave
+hook-only evidence unavailable until the last heartbeat expires, for at most one
+hour. An observed Stop closes evidence
 even if another Stop hook keeps the host turn going. These are conservative
 failures. A peer delivery that does not trigger UserPromptSubmit may not close
 the evidence window; that residual risk is accepted for cooperative processes.
@@ -53,6 +66,10 @@ host messaging socket content, or use terminal send-keys to imitate typed input.
 The CLI and MCP do not prevent those actions. A digest detects matching text; it
 does not establish who typed it. Host metadata and composer provenance support
 accident prevention under the cooperative assumption.
+
+The deployed `Bash(gaebu*)` permission also lets an agent invoke the composer
+recording command directly. Deliberately doing so is local forgery outside this
+threat model; the permission is not proof of a human composer event.
 
 Filtering recognizes a finite set of observed or explicitly documented wrapper
 markers. New delivery formats can be classified as user prompts until captured
