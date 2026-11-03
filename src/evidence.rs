@@ -37,9 +37,6 @@ pub fn classify(prompt: &str) -> PromptClass {
             return PromptClass::Excluded(marker);
         }
     }
-    if prompt.starts_with("From ") {
-        return PromptClass::Excluded("desktop-peer");
-    }
     PromptClass::User
 }
 
@@ -97,27 +94,25 @@ pub fn current_turn_evidence(
     records.sort_by_key(|rec| rec.at);
     let mut consumed = vec![false; records.len()];
     let mut latest_composer = false;
-    // Pair in prompt sequence order, consuming each composer record once.
-    // The Stop bounds prevent an older identical Enter authorizing a new turn.
-    for (index, prompt) in ordered.iter().enumerate() {
+    // Only the open turn can authorize anything: the latest event above is
+    // not Stop, so there is no next Stop in this window. Pair its prompts in
+    // sequence order and consume each composer once. Closed turns cannot
+    // consume a record that belongs to this window.
+    let previous_stop = ordered.iter().rev().find(|e| e.kind == EventKind::Stop);
+    for prompt in &ordered {
+        if previous_stop.is_some_and(|stop| prompt.seq <= stop.seq) {
+            continue;
+        }
         if !matches!(
             prompt.kind,
             EventKind::UserPrompt | EventKind::ExcludedPrompt
         ) {
             continue;
         }
-        let previous_stop = ordered[..index]
-            .iter()
-            .rev()
-            .find(|e| e.kind == EventKind::Stop);
-        let next_stop = ordered[index + 1..]
-            .iter()
-            .find(|e| e.kind == EventKind::Stop);
         let matched = records.iter().enumerate().find(|(i, rec)| {
             !consumed[*i]
                 && prompt.sha256.as_ref() == Some(&rec.sha256)
                 && previous_stop.is_none_or(|stop| rec.at > stop.at)
-                && next_stop.is_none_or(|stop| rec.at < stop.at)
         });
         if let Some((i, _)) = matched {
             consumed[i] = true;
