@@ -1783,7 +1783,7 @@ fn notice_classification_matrix() {
         let records = s.records.len();
         op(&mut s, &a, &b, &c, &arg);
         let added = &s.records[records..];
-        assert!(!added.is_empty(), "{name}: every change is recorded");
+        assert_eq!(added.len(), 1, "{name}: one team record per event");
         let want: usize = added.iter().map(|r| expected_notices(&s, r, act)).sum();
         assert_eq!(s.outbox.len(), want, "{name}: notices");
         if act {
