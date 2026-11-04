@@ -61,8 +61,27 @@ pub fn mod_active_at(events: &[SessionEvent], at: Ms) -> bool {
     })
 }
 
+/// A fragment of a prompt must be at least this long to count as the person's
+/// words. A quote of the whole prompt may be shorter: "잠깐 멈춰" is everything
+/// the person said, so there is no larger sentence it could be cut from.
+const MIN_FRAGMENT_SCALARS: usize = 6;
+
+/// `quote` occurs in `text`, the whitespace-collapsed text of prompt `e`. A
+/// shorter quote counts only as all of the prompt, and only when the log kept
+/// all of it: the log keeps a 4 KB prefix, and the whole of a prefix is not the
+/// whole of the prompt its digest covers.
+fn long_enough(quote: &str, text: &str, e: &SessionEvent) -> bool {
+    quote.chars().count() >= MIN_FRAGMENT_SCALARS
+        || (quote == text
+            && e.text
+                .as_deref()
+                .zip(e.sha256.as_deref())
+                .is_some_and(|(t, h)| sha256_hex(&normalize(t)) == h))
+}
+
 /// Find the caller's current-turn user prompt and check that `quote`
-/// (whitespace-normalized, at least 6 Unicode scalars) is a substring of it.
+/// (whitespace-normalized) is a substring of it, at least 6 Unicode scalars
+/// long unless it is the whole prompt.
 /// Rules: it is the latest user-or-excluded prompt event, no Stop after it,
 /// and in mod-active sessions it must be upgraded by a matching composer
 /// record (same sha256, before the next Stop). Refuses `no_user_evidence`.
@@ -74,11 +93,8 @@ pub fn current_turn_evidence(
     now: Ms,
 ) -> Result<Evidence> {
     let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
-    if quote.chars().count() < 6 {
-        return refuse(
-            Reason::NoUserEvidence,
-            "quote must contain at least 6 Unicode scalars",
-        );
+    if quote.is_empty() {
+        return refuse(Reason::NoUserEvidence, "quote is empty");
     }
     // The caller must load these logs through Store::session(caller.session_id).
     // SessionEvent intentionally carries no cross-session identity of its own.
@@ -141,6 +157,12 @@ pub fn current_turn_evidence(
     if !text.contains(&quote) {
         return refuse(Reason::NoUserEvidence, "quote is not in the current prompt");
     }
+    if !long_enough(&quote, &text, latest) {
+        return refuse(
+            Reason::NoUserEvidence,
+            "a quote under 6 Unicode scalars must be the whole prompt",
+        );
+    }
     let Some(hash) = latest.sha256.as_ref() else {
         return refuse(Reason::NoUserEvidence, "prompt digest is unavailable");
     };
@@ -160,7 +182,8 @@ pub fn current_turn_evidence(
 }
 
 /// Find `quote` in a user prompt the hook recorded in this session, in any
-/// recent turn (the log keeps the last 50). Excluded prompts never count.
+/// recent turn (the log keeps the last 50), under the same length rule as
+/// root evidence. Excluded prompts never count.
 /// This is provenance for a duty, not authority: it records which of the
 /// user's words a duty answers.
 pub fn recorded_source(
@@ -169,28 +192,27 @@ pub fn recorded_source(
     quote: &str,
 ) -> Result<crate::model::Source> {
     let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
-    if quote.chars().count() < 6 {
-        return refuse(
-            Reason::NoUserEvidence,
-            "source quote must contain at least 6 Unicode scalars",
-        );
+    if quote.is_empty() {
+        return refuse(Reason::NoUserEvidence, "source quote is empty");
     }
     let hit = events
         .iter()
         .filter(|e| e.kind == EventKind::UserPrompt)
         .filter(|e| {
             e.text.as_deref().is_some_and(|t| {
-                t.split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .contains(&quote)
+                let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                t.contains(&quote) && long_enough(&quote, &t, e)
             })
         })
         .max_by_key(|e| e.seq);
     let Some(e) = hit else {
         return refuse(
             Reason::NoUserEvidence,
-            "source quote is not in a user prompt recorded in this session",
+            if quote.chars().count() < MIN_FRAGMENT_SCALARS {
+                "a source quote under 6 Unicode scalars must be a whole recorded user prompt"
+            } else {
+                "source quote is not in a user prompt recorded in this session"
+            },
         );
     };
     let Some(sha256) = e.sha256.clone() else {

@@ -22,9 +22,16 @@ The engine checks provenance and boundaries, not natural-language meaning.
 UserPromptSubmit events determine prompt sequence. Only the latest user or
 excluded prompt can supply evidence, and an observed Stop closes the window.
 A quote must occur in that prompt after whitespace normalization and contain at
-least six Unicode scalar values. Prompt hashing trims outer whitespace and
-converts CRLF to LF. Prompt text is bounded, so a quote outside the retained
-prefix cannot be checked.
+least six Unicode scalar values, unless it is the whole prompt. A fragment that
+short could be cut from a sentence that says something else; a whole prompt
+cannot, and a stop is often that short ("잠깐 멈춰"). The exception covers every
+root directive, so a short reply such as "네" can back an appointment the agent
+proposed; the six-scalar floor never judged meaning either, and `strength`
+records how directly the words named the action. Duty sources follow the same
+rule against a recorded user prompt. Prompt hashing trims outer whitespace
+and converts CRLF to LF. Prompt text is bounded, so a quote outside the retained
+prefix cannot be checked, and a short quote of a prompt longer than the prefix
+is never the whole prompt.
 
 The most recent 50 user-prompt texts per session, each at most 4 KB, are retained
 under `~/.gaebu/sessions/`. These records can contain private instructions and

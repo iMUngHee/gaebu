@@ -345,3 +345,104 @@ fn recorded_source_must_match_prompt() {
     assert_eq!(refused("nowhere in any prompt"), Reason::NoUserEvidence);
     assert_eq!(refused("nawi"), Reason::NoUserEvidence, "under 6 scalars");
 }
+
+#[test]
+fn short_quote_counts_only_as_the_whole_prompt() {
+    // "잠깐 멈춰" is 5 scalars: the whole prompt stands, a fragment that short does not.
+    let stop = [event(1, 100, EventKind::UserPrompt, Some("  잠깐\n멈춰 "))];
+    let evidence = current_turn_evidence("caller", &stop, &[], "잠깐  멈춰", 1000).unwrap();
+    assert_eq!(evidence.quote, "잠깐 멈춰");
+    refused(&stop, &[], "멈춰");
+    refused(&stop, &[], " \n ");
+    let longer = [event(1, 100, EventKind::UserPrompt, Some("잠깐 멈춰 줘"))];
+    let err = current_turn_evidence("caller", &longer, &[], "잠깐 멈춰", 1000).unwrap_err();
+    assert!(err.message.contains("whole prompt"), "{}", err.message);
+    // Six scalars is a fragment long enough on its own; five is not.
+    let six = [event(
+        1,
+        100,
+        EventKind::UserPrompt,
+        Some("가나다라마바 사"),
+    )];
+    assert!(current_turn_evidence("caller", &six, &[], "가나다라마바", 1000).is_ok());
+    refused(&six, &[], "가나다라마");
+    // An empty quote is no quote, even of an empty composer-attested prompt.
+    let empty = [
+        event(1, 90, EventKind::ModHeartbeat, None),
+        event(2, 100, EventKind::ExcludedPrompt, Some("")),
+    ];
+    let attested = [ComposerRecord {
+        at: 100,
+        sha256: sha256_hex(""),
+    }];
+    refused(&empty, &attested, "  ");
+}
+
+/// The log keeps a 4 KB prefix of a prompt, cut on a char boundary, and the
+/// digest of all of it.
+fn cut_prompt(pad: &str) -> SessionEvent {
+    let full = format!("잠깐 멈춰 {}아니 계속 진행해", pad.repeat(4100));
+    let mut end = 4096;
+    while !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    SessionEvent {
+        seq: 1,
+        at: 100,
+        kind: EventKind::UserPrompt,
+        sha256: Some(sha256_hex(&normalize(&full))),
+        text: Some(full[..end].to_string()),
+        excluded_by: None,
+    }
+}
+
+#[test]
+fn short_quote_of_a_cut_prompt_is_not_the_whole_prompt() {
+    use gaebu::evidence::recorded_source;
+    // "잠깐 멈춰 " is 14 bytes, so 3-byte ideographic spaces end the cut at 4094.
+    for (pad, kept) in [(" ", 4096), ("\u{3000}", 4094)] {
+        let cut = [cut_prompt(pad)];
+        assert_eq!(cut[0].text.as_ref().map(String::len), Some(kept));
+        refused(&cut, &[], "잠깐 멈춰");
+        assert_eq!(
+            recorded_source("caller", &cut, "잠깐 멈춰")
+                .unwrap_err()
+                .reason,
+            Reason::NoUserEvidence
+        );
+    }
+}
+
+#[test]
+fn short_source_counts_only_as_a_whole_recorded_prompt() {
+    use gaebu::evidence::recorded_source;
+    let events = [
+        event(1, 10, EventKind::UserPrompt, Some("고쳐 줘")),
+        event(2, 20, EventKind::Stop, None),
+        event(3, 30, EventKind::ExcludedPrompt, Some("고쳐 줘")),
+        event(4, 40, EventKind::UserPrompt, Some("고쳐 줘 지금")),
+        event(5, 50, EventKind::UserPrompt, Some("고쳐  줘")),
+        // The hook never records an empty user prompt; the empty-quote guard
+        // must hold even if one were there.
+        event(6, 60, EventKind::UserPrompt, Some("")),
+    ];
+    // Seq 4 holds it only as a fragment and seq 3 is not the user's.
+    let s = recorded_source("caller", &events[..4], "고쳐 줘").unwrap();
+    assert_eq!((s.prompt_seq, s.quote.as_str()), (1, "고쳐 줘"));
+    // Of two whole prompts, the latest is the source.
+    let s = recorded_source("caller", &events, "고쳐 줘").unwrap();
+    assert_eq!(s.prompt_seq, 5);
+    let refused = |q: &str| recorded_source("caller", &events, q).unwrap_err();
+    assert!(
+        refused("고쳐")
+            .message
+            .contains("whole recorded user prompt")
+    );
+    // Six scalars is long enough to be a fragment, so it is simply not there.
+    assert!(
+        refused("가나다라마바")
+            .message
+            .contains("not in a user prompt")
+    );
+    assert_eq!(refused("  ").reason, Reason::NoUserEvidence);
+}
