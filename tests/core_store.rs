@@ -11,6 +11,13 @@ use std::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Deadline for the writer-serialization tests. They check that no update is
+/// lost, not how fast 100 commits land: on a Windows runner each commit fsyncs
+/// twice and the lock is polled, not queued, so one writer could wait out the
+/// CLI's 5 s and fail `busy` (CI, 2026-11-04) though nothing was lost.
+const SERIAL_DEADLINE: Duration = Duration::from_secs(60);
+
 struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
@@ -117,7 +124,7 @@ fn concurrent_writers_serialize() {
                 let store = Store::open(path).unwrap();
                 for _ in 0..25 {
                     store
-                        .transact(Duration::from_secs(5), |s| {
+                        .transact(SERIAL_DEADLINE, |s| {
                             s.next_id += 1;
                             Ok(())
                         })
@@ -301,7 +308,7 @@ fn writer_child() {
     let store = Store::open(PathBuf::from(path)).unwrap();
     for _ in 0..25 {
         store
-            .transact(Duration::from_secs(5), |s| {
+            .transact(SERIAL_DEADLINE, |s| {
                 s.next_id += 1;
                 Ok(())
             })
