@@ -191,6 +191,11 @@ impl Store {
         replace_until(&self.home.join("state.json"), &bytes, deadline)
     }
 
+    /// The last hook sighting of `session_id`, when one was recorded.
+    pub fn last_seen(&self, session_id: &str) -> Option<Ms> {
+        self.session(session_id).sighting().ok()?.last_seen
+    }
+
     pub fn session(&self, session_id: &str) -> SessionLog {
         SessionLog {
             dir: self.home.join("sessions").join(sanitize(session_id)),

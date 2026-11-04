@@ -295,3 +295,159 @@ fn card_header_names_the_bu() {
     let first = card::render(&c).lines().next().unwrap().to_string();
     assert!(first.contains("좌장군부"), "{first}");
 }
+
+// ----- stage table and holds on the card (plan gaebu-v0-2, Decisions 11–11b) -----
+
+fn hold(until: &str) -> Hold {
+    Hold {
+        evidence: Evidence {
+            session_id: "s-gapu".into(),
+            prompt_seq: 1,
+            sha256: "h".into(),
+            attest: Attest::HookFiltered,
+            quote: "잠깐 멈춰".into(),
+            at: 0,
+            strength: Strength::Explicit,
+        },
+        until: until.into(),
+        at: 0,
+    }
+}
+
+fn escalation(duty: &str) -> Escalation {
+    Escalation {
+        id: "e-1".into(),
+        team: "t-1".into(),
+        from: "m-3".into(),
+        to: Some("m-2".into()),
+        duty: Some(duty.into()),
+        question: "may I?".into(),
+        status: EscalationStatus::Open,
+        answer: None,
+        created_at: 0,
+        answered_at: None,
+        superseded_by: None,
+    }
+}
+
+#[test]
+fn stage_first_matching_row() {
+    use card::Stage::*;
+    let now = 1_000;
+    let stage = |st: &State, seen: Option<Ms>| card::stage(st, &st.duties["d-1"], now, seen);
+    let with = |f: &dyn Fn(&mut State)| {
+        let mut st = fixture();
+        f(&mut st);
+        st
+    };
+    // 7 진행
+    assert_eq!(stage(&fixture(), Some(now)), Working);
+    // 6 자리 빔: vacant, pending, or quiet.
+    let st = with(&|s| s.members.get_mut("m-3").unwrap().binding.state = BindingState::Vacant);
+    assert_eq!(stage(&st, Some(now)), Vacant);
+    let st = with(&|s| s.members.get_mut("m-3").unwrap().binding.state = BindingState::Pending);
+    assert_eq!(stage(&st, Some(now)), Vacant);
+    assert_eq!(
+        card::stage(&fixture(), &fixture().duties["d-1"], 3 * 3_600_000, Some(0)),
+        Vacant
+    );
+    // 5 막힘, 4 수락 대기
+    let st = with(&|s| s.duties.get_mut("d-1").unwrap().status = DutyStatus::Blocked);
+    assert_eq!(stage(&st, Some(now)), Blocked);
+    let st = with(&|s| s.duties.get_mut("d-1").unwrap().status = DutyStatus::Proposed);
+    assert_eq!(stage(&st, Some(now)), AwaitingAcceptance);
+    // 3 답변 대기 beats 수락 대기
+    let st = with(&|s| {
+        s.duties.get_mut("d-1").unwrap().status = DutyStatus::Proposed;
+        s.escalations.insert("e-1".into(), escalation("d-1"));
+    });
+    assert_eq!(stage(&st, Some(now)), AwaitingAnswer);
+    // 2 보류 beats 답변 대기 and 수락 대기; a bu hold counts too.
+    let st = with(&|s| {
+        s.duties.get_mut("d-1").unwrap().status = DutyStatus::Proposed;
+        s.escalations.insert("e-1".into(), escalation("d-1"));
+        s.duties.get_mut("d-1").unwrap().hold = Some(hold("대협 확인"));
+    });
+    assert_eq!(stage(&st, Some(now)), Held);
+    let st = with(&|s| s.bus.get_mut("b-1").unwrap().hold = Some(hold("전체")));
+    assert_eq!(stage(&st, Some(now)), Held);
+    // 1 종료 beats everything, a hold included.
+    for status in [
+        DutyStatus::Done,
+        DutyStatus::Declined,
+        DutyStatus::Cancelled,
+        DutyStatus::HandedOff,
+    ] {
+        let st = with(&|s| {
+            let d = s.duties.get_mut("d-1").unwrap();
+            d.status = status;
+            d.hold = Some(hold("x"));
+        });
+        assert_eq!(stage(&st, Some(now)), Ended, "{status:?}");
+    }
+    let st = with(&|s| {
+        s.bus.get_mut("b-2").unwrap().status = BuStatus::Cancelled;
+        s.duties.get_mut("d-1").unwrap().hold = Some(hold("x"));
+    });
+    assert_eq!(stage(&st, Some(now)), Ended);
+}
+
+#[test]
+fn card_keeps_holds_under_truncation() {
+    let mut st = fixture();
+    for i in 2..=5 {
+        let mut d = st.duties["d-1"].clone();
+        d.id = format!("d-{i}");
+        st.duties.insert(d.id.clone(), d);
+    }
+    st.duties.get_mut("d-4").unwrap().hold = Some(hold("디자인 확정 후"));
+    st.duties.get_mut("d-5").unwrap().hold = Some(hold("대협이 풀 때까지"));
+    let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
+    assert!(text.contains("보류: 소임 d-4 — 디자인 확정 후"), "{text}");
+    assert!(text.contains("보류: 소임 d-5 — 대협이 풀 때까지"), "{text}");
+    assert!(text.lines().count() <= MAX_LINES);
+    // Five holds, a cancel and an open escalation at once.
+    for i in 1..=5 {
+        st.duties.get_mut(&format!("d-{i}")).unwrap().hold = Some(hold(&format!("조건 {i}")));
+    }
+    let mut cancelled = st.duties["d-1"].clone();
+    cancelled.id = "d-9".into();
+    cancelled.status = DutyStatus::Cancelled;
+    cancelled.updated_at = 900;
+    st.duties.insert("d-9".into(), cancelled);
+    st.escalations.insert("e-1".into(), escalation("d-1"));
+    let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
+    assert_eq!(text.matches("보류: 소임").count(), 3, "{text}");
+    assert!(text.contains("보류 +2"), "{text}");
+    assert!(text.contains("취소: 소임 d-9 취소됨"), "{text}");
+    assert!(text.contains("escalation: e-1"), "{text}");
+    assert!(text.lines().count() <= MAX_LINES, "{text}");
+}
+
+#[test]
+fn inferred_root_grant_render() {
+    let mut st = fixture();
+    let grant = |strength| Grant {
+        id: "g-1".into(),
+        team: "t-1".into(),
+        grantor: None,
+        grantee: "m-1".into(),
+        verbs: Verb::ALL.into_iter().collect(),
+        scope: vec!["**".into(), "res:**".into()],
+        status: GrantStatus::Active,
+        evidence: Some(Evidence {
+            strength,
+            ..hold("x").evidence
+        }),
+        created_at: 0,
+    };
+    st.grants.insert("g-1".into(), grant(Strength::Inferred));
+    let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
+    assert!(
+        text.contains("대협 → 가절월(추론)을 받은 승상 gapu"),
+        "{text}"
+    );
+    st.grants.insert("g-1".into(), grant(Strength::Explicit));
+    let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
+    assert!(text.contains("대협 → 가절월을 받은 승상 gapu"), "{text}");
+}
