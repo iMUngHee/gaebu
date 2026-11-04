@@ -58,6 +58,13 @@ grants, and grants only narrow as they go down the tree.
    not blocked, and record handoffs.
 5. Cancellation is sticky. Nothing new can be issued, accepted or leased under
    a cancelled 부.
+6. The user can stop work in their own words ("잠깐 멈춰, 내가 확인할 때까지").
+   The agent runs `gaebu hold <duty|bu> --until "..." --evidence "..."`, and the
+   work stays held until the user lifts it with `gaebu release`. Questions,
+   peer messages and bot feedback never lift a hold.
+7. Members are interrupted only for changes they must act on. Everything else
+   waits for the next position card, and the roster lists each duty by stage
+   (보류, 답변 대기, 수락 대기, 막힘, 자리 빔, 진행).
 
 See [docs/model.md](docs/model.md) for the data contract,
 [docs/protocol.md](docs/protocol.md) for the behaviour rules agents follow
@@ -75,6 +82,14 @@ cargo install --git https://github.com/iMUngHee/gaebu --locked
 Or from a checkout: `scripts/install.sh` (macOS/Linux) or
 `scripts/install.ps1` (Windows). Both build a release binary into
 `~/.local/bin`.
+
+### Upgrading from 0.1
+
+0.2 stores schema 2. The first command after the upgrade migrates
+`~/.gaebu/state.json` and keeps the 0.1 original in `~/.gaebu/state.v1.json`.
+A 0.1 binary cannot read schema 2 and fails closed, so install the new binary
+first, then restart the Claude Code and Codex sessions that run `gaebu mcp`.
+See [docs/model.md](docs/model.md#schema-2-migration).
 
 ### Claude Code
 
