@@ -113,6 +113,7 @@ fn tools() -> Vec<Value> {
         ("lease_release", "Release your resource claim", json!({"lease":string}), vec!["lease"]),
         ("escalate", "Ask your superior to resolve a decision", json!({"duty":string,"question":string}), vec!["question"]),
         ("escalation_answer", "Answer an escalation addressed to you", json!({"escalation":string,"answer":string}), vec!["escalation","answer"]),
+        ("escalation_withdraw", "Clear an open escalation you raised", json!({"escalation":string,"note":string}), vec!["escalation"]),
         ("record_add", "Record a team decision, change or handoff", json!({"kind":{"type":"string","enum":["decision","handoff","change","note"]},"refs":strings,"text":string}), vec!["text"]),
     ].into_iter().map(|(name, description, properties, required)| json!({
         "name":name,"description":description,
@@ -268,6 +269,13 @@ fn call(
                 &actor,
                 required(args, "escalation")?,
                 required(args, "answer")?,
+            ),
+            "escalation_withdraw" => ops::escalation_withdraw(
+                st,
+                now,
+                &actor,
+                required(args, "escalation")?,
+                args["note"].as_str(),
             ),
             "record_add" => {
                 let kind =

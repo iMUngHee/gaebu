@@ -1184,3 +1184,192 @@ fn lease_expiry_keeps_hold() {
         None
     )));
 }
+
+// ----- structured escalations (plan gaebu-v0-2, Decisions 9, 9a) -----
+
+/// a commands b, who heads a child bu that c belongs to (a → b → c).
+fn chain() -> (State, Actor, Actor, Actor) {
+    let (mut s, a, b, c) = setup();
+    let bu = ops::bu_open(&mut s, 15, &a, &b.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 16, &a, &c.member, &bu).unwrap();
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(b.member.as_str())
+    );
+    (s, a, b, c)
+}
+
+#[test]
+fn escalation_reuse_and_supersede() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    let first = ops::escalate(&mut s, 30, &b, Some(&d), "may I change the API?").unwrap();
+    let id = first.ids[0].clone();
+    let queued = s.outbox.len();
+    // The same question (whitespace aside) is the same request: no new notice.
+    let again = ops::escalate(&mut s, 31, &b, Some(&d), "may I  change the API?").unwrap();
+    assert_eq!(again.ids, vec![id.clone()]);
+    assert!(again.summary.contains("reused"));
+    assert_eq!(s.outbox.len(), queued);
+    // A different question replaces it, with one notice.
+    let other = ops::escalate(&mut s, 32, &b, Some(&d), "may I drop the API?").unwrap();
+    let new = other.ids[0].clone();
+    assert_ne!(new, id);
+    assert!(other.summary.contains(&format!("superseded {id}")));
+    assert_eq!(s.outbox.len(), queued + 1);
+    assert_eq!(s.escalations[&id].status, EscalationStatus::Superseded);
+    assert_eq!(
+        s.escalations[&id].superseded_by.as_deref(),
+        Some(new.as_str())
+    );
+    assert_eq!(s.escalations[&new].status, EscalationStatus::Open);
+    // A question on another duty (or none) is a separate request.
+    ops::escalate(&mut s, 33, &b, None, "may I drop the API?").unwrap();
+    let open = s
+        .escalations
+        .values()
+        .filter(|e| e.status == EscalationStatus::Open)
+        .count();
+    assert_eq!(open, 2);
+}
+
+#[test]
+fn escalation_withdraw_only_by_asker() {
+    let (mut s, a, b, c) = setup();
+    let e = ops::escalate(&mut s, 30, &b, None, "which branch?")
+        .unwrap()
+        .ids[0]
+        .clone();
+    for who in [&a, &c] {
+        let err = ops::escalation_withdraw(&mut s, 31, who, &e, None).unwrap_err();
+        assert_eq!(err.reason, Reason::NoGrant);
+    }
+    let queued = s.outbox.len();
+    ops::escalation_withdraw(&mut s, 32, &b, &e, Some("found it")).unwrap();
+    assert_eq!(s.escalations[&e].status, EscalationStatus::Withdrawn);
+    assert_eq!(
+        s.outbox.len(),
+        queued + 1,
+        "the recipient stops considering it"
+    );
+    let err = ops::escalation_withdraw(&mut s, 33, &b, &e, None).unwrap_err();
+    assert_eq!(err.reason, Reason::Conflict);
+    let err = ops::escalation_answer(&mut s, 34, &a, &e, "main").unwrap_err();
+    assert_eq!(err.reason, Reason::Conflict);
+}
+
+#[test]
+fn escalation_reuse_reroutes_when_recipient_unavailable() {
+    let (mut s, a, b, c) = chain();
+    let e = ops::escalate(&mut s, 30, &c, None, "is the schema frozen?")
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(s.escalations[&e].to.as_deref(), Some(b.member.as_str()));
+    // b's seat goes vacant without any commit hook running.
+    s.members.get_mut(&b.member).unwrap().binding.state = BindingState::Vacant;
+    let queued = s.outbox.len();
+    let again = ops::escalate(&mut s, 31, &c, None, "is the schema frozen?").unwrap();
+    assert_eq!(again.ids, vec![e.clone()]);
+    assert!(again.summary.contains("rerouted"));
+    assert_eq!(s.escalations[&e].to.as_deref(), Some(a.member.as_str()));
+    assert_eq!(s.outbox.len(), queued + 1);
+    assert_eq!(s.outbox.last().unwrap().to_session, a.session_id);
+    let queued = s.outbox.len();
+    let third = ops::escalate(&mut s, 32, &c, None, "is the schema frozen?").unwrap();
+    assert!(third.summary.contains("reused"));
+    assert_eq!(s.outbox.len(), queued);
+    ops::escalation_answer(&mut s, 33, &a, &e, "yes").unwrap();
+}
+
+#[test]
+fn escalations_reroute_after_commit() {
+    use gaebu::store::Store;
+    use std::time::Duration;
+    type Cause = fn(&mut State, &Actor, &Actor) -> Result<ops::Outcome, gaebu::Error>;
+    let causes: [(&str, Cause, bool); 6] = [
+        (
+            "mark_vacant",
+            |s, _, b| {
+                let m = b.member.clone();
+                ops::mark_vacant(s, 40, &m, "pager_gone").map(|_| ops::Outcome {
+                    summary: String::new(),
+                    ids: vec![],
+                })
+            },
+            true,
+        ),
+        (
+            "dismiss",
+            |s, _, _| ops::root_dismiss(s, 40, &hev("root-session", 1_000), "child"),
+            true,
+        ),
+        (
+            "bu cancel",
+            |s, a, b| {
+                let bu = s.members[&b.member].bu.clone();
+                ops::bu_cancel(s, 40, a, &bu, "reorg")
+            },
+            true,
+        ),
+        (
+            "team cancel",
+            |s, _, _| {
+                let t = s.teams.keys().next().unwrap().clone();
+                ops::root_cancel_team(s, 40, &hev("root-session", 1_001), &t)
+            },
+            false,
+        ),
+        (
+            "root rebind",
+            |s, _, b| {
+                let m = b.member.clone();
+                ops::root_rebind(s, 40, &hev("root-session", 1_002), &m, "child2")
+            },
+            true,
+        ),
+        (
+            "member rebind",
+            |s, a, b| {
+                let m = b.member.clone();
+                ops::member_rebind(s, 40, a, &m, "child3")
+            },
+            true,
+        ),
+    ];
+    for (i, (name, cause, to_commander)) in causes.into_iter().enumerate() {
+        let (mut s, a, b, c) = chain();
+        let e = ops::escalate(&mut s, 30, &c, None, "is the schema frozen?")
+            .unwrap()
+            .ids[0]
+            .clone();
+        let home = std::env::temp_dir().join(format!(
+            "gaebu-reroute-{}-{}-{i}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Store::open(&home).unwrap();
+        store
+            .transact(Duration::from_secs(5), |st| {
+                *st = s.clone();
+                Ok(())
+            })
+            .unwrap();
+        store
+            .transact(Duration::from_secs(5), |st| cause(st, &a, &b))
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let mut st = store.read().unwrap();
+        let to = st.escalations[&e].to.clone();
+        if to_commander {
+            assert_eq!(to.as_deref(), Some(a.member.as_str()), "{name}");
+            ops::escalation_answer(&mut st, 50, &a, &e, "yes")
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+        } else {
+            assert_eq!(to, None, "{name}: no live superior → the user's queue");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

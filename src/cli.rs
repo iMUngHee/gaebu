@@ -158,6 +158,9 @@ enum Cmd {
     },
     /// Answer an escalation addressed to me.
     Answer { escalation: String, answer: String },
+    /// Manage my own escalations.
+    #[command(subcommand)]
+    Escalation(EscalationCmd),
     /// Add a team record (팀기록).
     Record {
         text: String,
@@ -224,6 +227,16 @@ enum MemberCmd {
         member: String,
         #[arg(long)]
         bu: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscalationCmd {
+    /// Clear an open question I raised.
+    Withdraw {
+        escalation: String,
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -1250,6 +1263,12 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             let store = open_store()?;
             member_op(&store, pager, json, |st, now, actor| {
                 ops::escalation_answer(st, now, actor, &escalation, &answer)
+            })
+        }
+        Cmd::Escalation(EscalationCmd::Withdraw { escalation, note }) => {
+            let store = open_store()?;
+            member_op(&store, pager, json, |st, now, actor| {
+                ops::escalation_withdraw(st, now, actor, &escalation, note.as_deref())
             })
         }
         Cmd::Record { text, kind, refs } => {

@@ -57,7 +57,7 @@ fn mcp_initialize_list_call_roundtrip() {
     ]);
     assert_eq!(out.len(), 4);
     assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 12);
     assert_eq!(out[2]["result"]["isError"], true);
     assert_eq!(out[3], json!({"jsonrpc":"2.0","id":"p","result":{}}));
 }
@@ -74,11 +74,18 @@ fn root_not_exposed_over_mcp() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert!(
-        !names
-            .iter()
-            .any(|s| ["appoint", "assign", "rebind", "cancel_team", "evidence"].contains(s))
-    );
+    assert!(!names.iter().any(|s| {
+        [
+            "appoint",
+            "assign",
+            "rebind",
+            "cancel_team",
+            "evidence",
+            "hold",
+            "release",
+        ]
+        .contains(s)
+    }));
     assert_eq!(out[1]["result"]["isError"], true);
     assert!(
         out[1]["result"]["content"][0]["text"]
@@ -266,4 +273,152 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
         serde_json::from_str(reply[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(refusal["reason"], "cancelled");
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn escalation_withdraw_tool() {
+    use gaebu::model::{EscalationStatus, Tool, now_ms};
+    use gaebu::ops::{self, SeedSpec};
+    struct TwoSessions;
+    impl Pager for TwoSessions {
+        fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
+            let id = session.unwrap_or("boss-session");
+            Ok(WhoAmI {
+                session_id: id.into(),
+                via: "host".into(),
+                alias: Some(if id == "boss-session" { "boss" } else { "aide" }.into()),
+                tool: Some("claude".into()),
+            })
+        }
+        fn host_status(&self, _: &str) -> Result<HostStatus> {
+            Ok(HostStatus::Unknown)
+        }
+        fn send(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    let home = std::env::temp_dir().join(format!(
+        "gaebu-mcp-withdraw-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    let store = gaebu::store::Store::open(&home).unwrap();
+    store
+        .transact(std::time::Duration::from_secs(1), |st| {
+            ops::dev_seed(
+                st,
+                now_ms(),
+                &SeedSpec {
+                    team: "withdraw".into(),
+                    project: "fixture".into(),
+                    commander_alias: "boss".into(),
+                    commander_session: Some("boss-session".into()),
+                    commander_tool: Some(Tool::Claude),
+                    members: vec![(
+                        "aide".into(),
+                        Some("aide-session".into()),
+                        Some(Tool::Claude),
+                    )],
+                },
+            )
+        })
+        .unwrap();
+    for session in ["aide-session", "boss-session"] {
+        store
+            .session(session)
+            .update_sighting(|s| {
+                s.tool = Some(Tool::Codex);
+                s.last_seen = Some(now_ms());
+            })
+            .unwrap();
+    }
+    let call = |id: u64, thread: &str, name: &str, args: Value| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":name,"_meta":{"threadId":thread},"arguments":args}})
+    };
+    let text = |v: &Value| {
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let reply = exchange_on(
+        &store,
+        &TwoSessions,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            call(
+                2,
+                "aide-session",
+                "escalate",
+                json!({"question":"may I  rename it?"}),
+            ),
+            call(
+                3,
+                "aide-session",
+                "escalate",
+                json!({"question":"may I rename it?"}),
+            ),
+        ],
+    );
+    let names: Vec<_> = reply[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names.len(), 12);
+    assert!(names.iter().any(|n| n == "escalation_withdraw"));
+    assert!(!names.iter().any(|n| n == "hold" || n == "release"));
+    assert_eq!(reply[1]["result"]["isError"], false, "{}", reply[1]);
+    assert!(
+        text(&reply[2]).contains("escalation reused"),
+        "{}",
+        reply[2]
+    );
+    let esc = store
+        .read()
+        .unwrap()
+        .escalations
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let reply = exchange_on(
+        &store,
+        &TwoSessions,
+        &[
+            call(
+                4,
+                "boss-session",
+                "escalation_withdraw",
+                json!({"escalation":esc}),
+            ),
+            call(
+                5,
+                "aide-session",
+                "escalation_withdraw",
+                json!({"escalation":esc,"note":"solved"}),
+            ),
+            call(
+                6,
+                "aide-session",
+                "escalation_withdraw",
+                json!({"escalation":esc}),
+            ),
+        ],
+    );
+    assert_eq!(
+        reply[0]["result"]["isError"], true,
+        "the recipient cannot withdraw"
+    );
+    assert!(text(&reply[0]).contains("no_grant"));
+    assert_eq!(reply[1]["result"]["isError"], false, "{}", reply[1]);
+    assert_eq!(reply[2]["result"]["isError"], true);
+    assert!(text(&reply[2]).contains("conflict"));
+    assert_eq!(
+        store.read().unwrap().escalations[&esc].status,
+        EscalationStatus::Withdrawn
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }
