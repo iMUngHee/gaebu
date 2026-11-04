@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { BoardView, CardView } from '../types'
+import type { BoardView, CardDuty, CardView, Stage } from '../types'
 
 // The mod shows and injects; it never decides. Every value comes from the
 // gaebu CLI, which owns the state (docs/model.md).
@@ -10,11 +10,33 @@ const PANE = 'gaebu-board'
 const REFRESH_MS = 30_000
 
 // Bump a shape tag when the stored value's fields change.
-const card = atom({ plugin: 'gaebu', key: 'card' } as const, null, { shape: 'card-1' })
+const card = atom({ plugin: 'gaebu', key: 'card' } as const, null, { shape: 'card-2' })
 const cardText = atom({ plugin: 'gaebu', key: 'cardText' } as const, '', { shape: 'text-1' })
-const board = atom({ plugin: 'gaebu', key: 'board' } as const, null, { shape: 'board-1' })
+const board = atom({ plugin: 'gaebu', key: 'board' } as const, null, { shape: 'board-2' })
 
-type Ctx = Parameters<Parameters<Parameters<Register>[0]>[1]>[0]
+// Panel order: what needs a person first. The CLI decides each stage; the
+// mod only sorts by it.
+const RANK: Record<Stage, number> = {
+  held: 0,
+  awaiting_answer: 1,
+  awaiting_acceptance: 2,
+  blocked: 3,
+  vacant: 4,
+  working: 5,
+  ended: 6,
+}
+const NEEDS_ATTENTION: Stage[] = ['held', 'awaiting_answer', 'awaiting_acceptance', 'blocked']
+
+function byStage(duties: CardDuty[]): CardDuty[] {
+  return [...duties].sort((a, b) => RANK[a.stage] - RANK[b.stage])
+}
+
+function dutyLine(d: CardDuty): string {
+  const hold = d.hold ? ` — ${d.hold}` : ''
+  return `소임 ${d.id} [${d.stage_label}] ${d.outcome}${hold}`
+}
+
+type Ctx = EngineInterface
 
 /** Run the gaebu CLI; `null` when it is missing, fails or refuses. */
 async function gaebu($: Ctx, args: string[], stdin?: string): Promise<string | null> {
@@ -39,9 +61,11 @@ function statusText(c: CardView | null): string | undefined {
   if (c === null) return undefined
   const me = c.chain[c.chain.length - 1] ?? c.alias
   const open = c.duties.length
-  const held = c.leases.length > 0 ? ` · 점유 ${c.leases.length}` : ''
+  const waiting = c.duties.filter(d => NEEDS_ATTENTION.includes(d.stage)).length
+  const attention = waiting > 0 ? ` · 대기 ${waiting}` : ''
+  const leases = c.leases.length > 0 ? ` · 점유 ${c.leases.length}` : ''
   const esc = c.escalations.length > 0 ? ` · escalation ${c.escalations.length}` : ''
-  return `개부: ${me} · 소임 ${open}${held}${esc}`
+  return `개부: ${me} · 소임 ${open}${attention}${leases}${esc}`
 }
 
 /** Toast what changed for me since the last refresh. */
@@ -74,8 +98,10 @@ async function refresh($: Ctx) {
   await update($, cardText, () => text.trim())
   $.ui.status(statusText(next))
   announce($, before, next)
-  const b = parse<BoardView>(await gaebu($, ['--json', 'board']))
-  if (b !== null) await update($, board, () => b)
+  const known = await read($, board)
+  const since = known === null ? [] : ['--since', known.token]
+  const b = parse<BoardView | { unchanged: true }>(await gaebu($, ['--json', 'board', ...since]))
+  if (b !== null && !('unchanged' in b)) await update($, board, () => b)
 }
 
 export const register: Register = on => {
@@ -152,6 +178,7 @@ export const register: Register = on => {
                 <Text>
                   {'  '}
                   {bu.name} [{bu.status}] 장: {bu.head}
+                  {bu.hold ? ` · 보류 — ${bu.hold}` : ''}
                 </Text>
                 {bu.members.map(m => (
                   <Box flexDirection="column" key={m.id}>
@@ -159,9 +186,14 @@ export const register: Register = on => {
                       {'    '}
                       {m.display} · {m.binding}
                     </Text>
-                    {m.duties.map(d => (
-                      <Text dimColor key={d}>
-                        {'      '}소임 {d}
+                    {byStage(m.duties).map(d => (
+                      <Text
+                        dimColor={!NEEDS_ATTENTION.includes(d.stage)}
+                        color={d.stage === 'held' ? 'yellow' : undefined}
+                        key={d.id}
+                      >
+                        {'      '}
+                        {dutyLine(d)}
                       </Text>
                     ))}
                     {m.leases.map(l => (
