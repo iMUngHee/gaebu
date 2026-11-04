@@ -1867,3 +1867,40 @@ fn duplicate_pending_notice_not_queued() {
     ops::duty_progress(&mut s, 37, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
     assert_eq!(s.outbox.len(), 1);
 }
+
+#[test]
+fn hold_survives_cancel_with_terminal_stage() {
+    use gaebu::card::{Stage, stage};
+    type Cancel = fn(&mut State, &Actor, &str);
+    let cancels: [(&str, Cancel); 3] = [
+        ("duty", |s, a, d| {
+            ops::duty_cancel(s, 40, a, d, "drop").unwrap();
+        }),
+        ("bu", |s, a, d| {
+            let bu = s.duties[d].bu.clone();
+            ops::bu_cancel(s, 40, a, &bu, "reorg").unwrap();
+        }),
+        ("team", |s, _, _| {
+            let t = s.teams.keys().next().unwrap().clone();
+            ops::root_cancel_team(s, 40, &hev("root-session", 1_000), &t).unwrap();
+        }),
+    ];
+    for (name, cancel) in cancels {
+        let (mut s, a, b, _) = setup();
+        ops::bu_open(&mut s, 15, &a, &b.member, None, &[], &[]).unwrap();
+        let d = accept(&mut s, &a, &b);
+        ops::root_hold(&mut s, 30, &hev("root-session", 1), &d, "확인 후").unwrap();
+        assert_eq!(
+            stage(&s, &s.duties[&d], 31, Some(31)),
+            Stage::Held,
+            "{name}"
+        );
+        cancel(&mut s, &a, &d);
+        assert!(s.duties[&d].hold.is_some(), "{name}: the hold record stays");
+        assert_eq!(
+            stage(&s, &s.duties[&d], 41, Some(41)),
+            Stage::Ended,
+            "{name}"
+        );
+    }
+}
