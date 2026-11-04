@@ -180,6 +180,18 @@ one JSON file replaced atomically under an OS lock, plus small per-session
 event logs. Gaebu has no daemon and makes no network calls. It talks to other
 sessions only through `pager send`.
 
+## Releasing
+
+Every version bump comes with patch notes. In the same commit:
+
+1. Set the version in `Cargo.toml` (then `Cargo.lock`) and in
+   `mod/.claude-plugin/plugin.json`.
+2. Add `## <version> — <date>` at the top of [CHANGELOG.md](CHANGELOG.md):
+   what changed for someone running Gaebu, with commit ids, and an
+   Upgrading note on state compatibility and what to restart.
+
+`tests/changelog.rs` fails `cargo test`, and so CI, while either is missing.
+
 ## License
 
 MIT
