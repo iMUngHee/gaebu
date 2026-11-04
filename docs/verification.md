@@ -15,7 +15,7 @@ Checked on 2026-11-04 on Windows with `stable-x86_64-pc-windows-gnu`, branch
 | Per-commit code review | PASS | A fresh reviewer read all 9 commits: 0 high, 1 medium, 5 low. Fixed: a dead asker's escalation now goes to the user's queue; dedupe compares only the newest queued notice, so held/released/held arrives in order; the board token ignores `rev`; `until` collapses to one line; a misplaced doc comment. The cancel-and-reissue path around a duty hold is documented in the threat model. Regression tests: `flipping_change_keeps_notice_order`, `hold_until_stays_one_line`, the asker rows of `escalations_reroute_after_commit`, and the rev check in `board_since_detects_quiet_transition`. |
 | Codex hook and MCP host | UNVERIFIED | The Codex hook is still not deployed; no Codex host ran 0.2. |
 | Global deployment | UNVERIFIED | Not installed globally; `~/.local/bin/gaebu` is still 0.1.0. |
-| Hosted CI | UNVERIFIED | The workflow still lives in `ci/` (token lacks `workflow` scope). |
+| Hosted CI | PASS | `.github/workflows/ci.yml` at `42f32cc`, run `41788533905`: fmt, clippy `-D warnings`, test and release build succeed on ubuntu-latest, macos-latest and windows-latest (MSVC). Annotations are GitHub notices only (actions/checkout@v4 runs on Node 24; the ubuntu-latest label migration). |
 
 ```text
 core_store::v1_fixture_migrates_to_v2 -> 1 passed; 0 failed
