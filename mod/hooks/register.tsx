@@ -8,6 +8,8 @@ import type { BoardView, CardDuty, CardView, Stage } from '../types'
 
 const PANE = 'gaebu-board'
 const REFRESH_MS = 30_000
+// prompt.compose runs for every request; the hook trusts a stamp for an hour.
+const COMPOSE_STAMP_MS = 600_000
 
 // Bump a shape tag when the stored value's fields change.
 const card = atom({ plugin: 'gaebu', key: 'card' } as const, null, { shape: 'card-2' })
@@ -88,6 +90,21 @@ function announce($: Ctx, before: CardView | null, after: CardView | null) {
 
 // Module state starts over on reload; the store keeps the truth.
 let sessionId = ''
+let composeStamped = { session: '', at: 0 }
+
+/**
+ * Tell the hook the card section just reached the model, so it may send a
+ * one-line card. On a machine with managed settings, or in Team and Enterprise
+ * organizations, cc-plugin-sec-default passes prompt.compose on past this mod:
+ * nothing is stamped and the hook keeps its own full cards.
+ */
+async function stampCompose($: Ctx): Promise<void> {
+  if (sessionId === '') return
+  const now = await $.clock.now()
+  if (composeStamped.session === sessionId && now - composeStamped.at < COMPOSE_STAMP_MS) return
+  composeStamped = { session: sessionId, at: now }
+  await gaebu($, ['session', 'heartbeat', '--session', sessionId, '--compose'])
+}
 
 async function refresh($: Ctx) {
   if (sessionId === '') return
@@ -142,6 +159,8 @@ export const register: Register = on => {
     const r = await next(e)
     const text = await read($, cardText)
     if (text === '') return r
+    // Only once the section is in; awaited, one CLI call per ten minutes.
+    await stampCompose($).catch(() => {})
     return {
       ...r,
       sections: [

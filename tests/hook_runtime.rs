@@ -334,13 +334,13 @@ fn hook_changed_card_and_compaction_restore_full_context() {
 }
 
 #[test]
-fn hook_mod_heartbeat_shortens_card_then_expires() {
+fn hook_compose_heartbeat_shortens_card_then_expires() {
     let f = Fixture::new();
     f.seed(Tool::Claude);
     let pager = FakePager(HostStatus::Live);
     f.store
         .session("fixture-claude")
-        .update_sighting(|s| s.mod_heartbeat = Some(now_ms()))
+        .update_sighting(|s| s.compose_heartbeat = Some(now_ms()))
         .unwrap();
     assert_eq!(
         context(&f.run(
@@ -354,12 +354,37 @@ fn hook_mod_heartbeat_shortens_card_then_expires() {
     );
     f.store
         .session("fixture-claude")
-        .update_sighting(|s| s.mod_heartbeat = Some(now_ms() - 3_600_001))
+        .update_sighting(|s| s.compose_heartbeat = Some(now_ms() - 3_600_001))
         .unwrap();
     assert!(
         context(&f.run(
             Tool::Claude,
             include_bytes!("fixtures/hooks/synthetic-claude-prompt.json"),
+            &pager
+        ))
+        .lines()
+        .count()
+            > 1
+    );
+}
+
+#[test]
+fn hook_mod_alive_without_compose_keeps_full_card() {
+    // Managed settings or a Team/Enterprise organization: the mod's
+    // session.start and prompt.submit run, but cc-plugin-sec-default passes
+    // prompt.compose on past it, so its card section never lands and the hook
+    // must not shorten its own.
+    let f = Fixture::new();
+    f.seed(Tool::Claude);
+    let pager = FakePager(HostStatus::Live);
+    f.store
+        .session("fixture-claude")
+        .update_sighting(|s| s.mod_heartbeat = Some(now_ms()))
+        .unwrap();
+    assert!(
+        context(&f.run(
+            Tool::Claude,
+            include_bytes!("fixtures/hooks/synthetic-claude-start.json"),
             &pager
         ))
         .lines()

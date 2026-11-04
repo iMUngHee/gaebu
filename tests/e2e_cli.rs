@@ -843,3 +843,22 @@ fn board_since_detects_quiet_transition() {
         0
     );
 }
+
+#[test]
+fn compose_heartbeat_marks_only_the_sighting() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[]);
+    let beat = ["session", "heartbeat", "--session", "s-x", "--compose"];
+    assert_eq!(gaebu(&pager, &beat), 0);
+    let log = store.session("s-x");
+    let seen = log.sighting().unwrap();
+    assert!(seen.compose_heartbeat.is_some());
+    assert!(seen.mod_heartbeat.is_none());
+    // Evidence reads mod heartbeats from the event log; a compose stamp adds none.
+    assert!(
+        log.events()
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != EventKind::ModHeartbeat)
+    );
+}
