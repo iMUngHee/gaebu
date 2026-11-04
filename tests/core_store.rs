@@ -381,3 +381,192 @@ fn legacy_sighting_defaults_pending_throttle_fields() {
     assert_eq!(stored.pending_checked_at, Some(10));
     assert_eq!(stored.pending_checked_rev, Some(2));
 }
+
+// ----- schema v2 migration (plan gaebu-v0-2, Decisions 12–12d) -----
+
+const V1: &str = include_str!("fixtures/state-v1.json");
+const FUTURE: &str = r#"{"schema_version":3,"teams":"a newer shape this model cannot parse"}"#;
+
+fn json(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+/// The fixture migrated by a real transaction, as v2 bytes.
+fn v2_bytes() -> Vec<u8> {
+    let home = Home::new();
+    fs::write(home.0.join("state.json"), V1).unwrap();
+    home.store()
+        .transact(Duration::from_secs(5), |_| Ok(()))
+        .unwrap();
+    fs::read(home.0.join("state.json")).unwrap()
+}
+
+#[test]
+fn v1_fixture_migrates_to_v2() {
+    let home = Home::new();
+    fs::write(home.0.join("state.json"), V1).unwrap();
+    home.store()
+        .transact(Duration::from_secs(5), |_| Ok(()))
+        .unwrap();
+    let st = json(&home.0.join("state.json"));
+    assert_eq!(st["schema_version"], 2);
+    assert_eq!(st["grants"]["g-4"]["evidence"]["strength"], "inferred");
+    assert_eq!(st["escalations"]["e-21"]["status"], "superseded");
+    assert_eq!(st["escalations"]["e-21"]["superseded_by"], "e-22");
+    assert_eq!(st["escalations"]["e-22"]["status"], "open");
+    assert_eq!(st["escalations"]["e-23"]["status"], "answered");
+    let v1: serde_json::Value = serde_json::from_str(V1).unwrap();
+    let original = v1["outbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "n-24")
+        .unwrap();
+    let migrated = st["outbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "n-24")
+        .unwrap();
+    let body = original["body"].as_str().unwrap();
+    assert_eq!(migrated["text"], gaebu::model::notice_key(body).as_str());
+    assert!(!migrated["text"].as_str().unwrap().contains("r-25"));
+    assert_eq!(migrated["body"], original["body"]);
+    assert_eq!(migrated["attempts"], original["attempts"]);
+    assert_eq!(migrated["claimed_at"], original["claimed_at"]);
+}
+
+#[test]
+fn migration_keeps_v1_backup_and_v2_prev() {
+    let home = Home::new();
+    let store = home.store();
+    fs::write(home.0.join("state.json"), V1).unwrap();
+    store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
+    assert_eq!(
+        fs::read(home.0.join("state.v1.json")).unwrap(),
+        V1.as_bytes()
+    );
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    // A second schema-1 file (restored by hand) migrates again but never
+    // replaces the first original.
+    let other = V1.replacen("\"rev\": ", "\"rev\": 9", 1);
+    fs::write(home.0.join("state.json"), &other).unwrap();
+    store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
+    assert_eq!(
+        fs::read(home.0.join("state.v1.json")).unwrap(),
+        V1.as_bytes()
+    );
+    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
+}
+
+#[test]
+fn future_schema_refused_without_fallback() {
+    let home = Home::new();
+    let store = home.store();
+    fs::write(home.0.join("state.prev.json"), v2_bytes()).unwrap();
+    fs::write(home.0.join("state.json"), FUTURE).unwrap();
+    assert_eq!(store.read().unwrap_err().reason, Reason::StoreUnsupported);
+    let err = store
+        .transact(Duration::from_secs(5), |_| Ok(()))
+        .unwrap_err();
+    assert_eq!(err.reason, Reason::StoreUnsupported);
+    assert_eq!(
+        fs::read(home.0.join("state.json")).unwrap(),
+        FUTURE.as_bytes()
+    );
+}
+
+#[test]
+fn migration_resumes_after_partial_write() {
+    // Interrupted after the backup and the v2 prev, before state.json.
+    let home = Home::new();
+    let store = home.store();
+    fs::write(home.0.join("state.v1.json"), V1).unwrap();
+    fs::write(home.0.join("state.prev.json"), v2_bytes()).unwrap();
+    fs::write(home.0.join("state.json"), V1).unwrap();
+    let v1_rev = serde_json::from_str::<serde_json::Value>(V1).unwrap()["rev"]
+        .as_u64()
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    store
+        .transact(Duration::from_secs(5), |st| {
+            calls.set(calls.get() + 1);
+            st.next_id += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1);
+    let st = json(&home.0.join("state.json"));
+    assert_eq!(st["schema_version"], 2);
+    assert_eq!(
+        st["rev"],
+        v1_rev + 2,
+        "one migration commit, one user commit"
+    );
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    assert_eq!(
+        fs::read(home.0.join("state.v1.json")).unwrap(),
+        V1.as_bytes()
+    );
+}
+
+#[test]
+fn failed_migration_skips_user_change() {
+    let home = Home::new();
+    let store = home.store();
+    fs::write(home.0.join("state.json"), V1).unwrap();
+    // A directory where state.prev.json goes makes the migration's write fail.
+    fs::create_dir_all(home.0.join("state.prev.json")).unwrap();
+    let ran = std::cell::Cell::new(false);
+    let err = store
+        .transact(Duration::from_secs(5), |_| {
+            ran.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(err.reason, Reason::StoreWriteFailed);
+    assert!(!ran.get(), "the user change must not run");
+    assert_eq!(fs::read(home.0.join("state.json")).unwrap(), V1.as_bytes());
+}
+
+#[test]
+fn repair_refuses_unsupported_state() {
+    let home = Home::new();
+    let prev = v2_bytes();
+    fs::write(home.0.join("state.prev.json"), &prev).unwrap();
+    fs::write(home.0.join("state.json"), FUTURE).unwrap();
+    let err = home.store().repair().unwrap_err();
+    assert_eq!(err.reason, Reason::StoreUnsupported);
+    assert_eq!(
+        fs::read(home.0.join("state.json")).unwrap(),
+        FUTURE.as_bytes()
+    );
+    assert_eq!(fs::read(home.0.join("state.prev.json")).unwrap(), prev);
+}
+
+#[test]
+fn repair_from_v1_prev_migrates_consistently() {
+    let home = Home::new();
+    fs::write(home.0.join("state.json"), "{").unwrap();
+    fs::write(home.0.join("state.prev.json"), V1).unwrap();
+    home.store().repair().unwrap();
+    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    assert_eq!(
+        fs::read(home.0.join("state.v1.json")).unwrap(),
+        V1.as_bytes()
+    );
+    // Interrupted after prev ← v2: the next repair finishes from the v2 prev.
+    let home = Home::new();
+    let prev = v2_bytes();
+    fs::write(home.0.join("state.json"), "{").unwrap();
+    fs::write(home.0.join("state.prev.json"), &prev).unwrap();
+    fs::write(home.0.join("state.v1.json"), V1).unwrap();
+    home.store().repair().unwrap();
+    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
+    assert_eq!(fs::read(home.0.join("state.prev.json")).unwrap(), prev);
+    assert_eq!(
+        fs::read(home.0.join("state.v1.json")).unwrap(),
+        V1.as_bytes()
+    );
+}

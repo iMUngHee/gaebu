@@ -6,6 +6,7 @@
 //! ```text
 //! state.json            the whole State, replaced atomically
 //! state.prev.json       the previous generation (recovery)
+//! state.v1.json         the schema-1 original, kept by the v2 migration
 //! state.lock            OS lock (never deleted)
 //! sessions/<id>/events.jsonl    SessionEvent lines (hook writes)
 //! sessions/<id>/composer.jsonl  ComposerRecord lines (mod writes via CLI)
@@ -76,12 +77,16 @@ impl Store {
     /// Lock-free read of the current state (falls back to `state.prev.json`
     /// with a warning on stderr when `state.json` does not parse). A missing
     /// file is an empty `State::default()`.
+    /// A schema-1 file is migrated in memory only. A newer schema is refused
+    /// without falling back.
     pub fn read(&self) -> Result<State> {
         match read_state(&self.home.join("state.json")) {
-            Ok(state) => Ok(state.unwrap_or_default()),
+            Ok(loaded) => Ok(loaded.map(|l| l.state).unwrap_or_default()),
             Err(err) if err.reason == Reason::StoreCorrupt => {
                 eprintln!("gaebu: state.json corrupt; reading state.prev.json (run gaebu repair)");
-                read_state(&self.home.join("state.prev.json"))?.ok_or(err)
+                Ok(read_state(&self.home.join("state.prev.json"))?
+                    .ok_or(err)?
+                    .state)
             }
             Err(err) => Err(err),
         }
@@ -110,10 +115,19 @@ impl Store {
         clean_tmp(&self.home)?;
         ensure_budget(deadline)?;
         let path = self.home.join("state.json");
-        let mut state = read_state(&path)?.unwrap_or_default();
+        let (mut state, v1) = match read_state(&path)? {
+            Some(loaded) => (loaded.state, loaded.v1_bytes),
+            None => (State::default(), None),
+        };
         ensure_budget(deadline)?;
+        if let Some(original) = v1 {
+            // Its own commit, before `f`: a failure here leaves the v1 file
+            // as it was and runs no user change.
+            self.publish_migration(&mut state, &original, deadline)?;
+        }
         crate::ops::expire_leases(&mut state, crate::model::now_ms());
         let result = f(&mut state)?;
+        crate::ops::reroute_escalations(&mut state, crate::model::now_ms());
         ensure_budget(deadline)?;
         state.rev = state
             .rev
@@ -129,15 +143,52 @@ impl Store {
         Ok(result)
     }
 
-    /// Restore `state.json` from `state.prev.json` (`gaebu repair`).
+    /// Restore `state.json` from `state.prev.json` (`gaebu repair`). A newer
+    /// schema in `state.json` is never overwritten; a schema-1 previous
+    /// generation goes through the same migration as a schema-1 state.
     pub fn repair(&self) -> Result<()> {
         let _lock = lock(&self.home, "state.lock", CLI_DEADLINE)?;
-        let state = read_state(&self.home.join("state.prev.json"))?
+        let deadline = Instant::now() + CLI_DEADLINE;
+        if let Err(err) = read_state(&self.home.join("state.json"))
+            && err.reason == Reason::StoreUnsupported
+        {
+            return Err(err);
+        }
+        let loaded = read_state(&self.home.join("state.prev.json"))?
             .ok_or_else(|| Error::new(Reason::StoreCorrupt, "previous state missing"))?;
-        replace(
-            &self.home.join("state.json"),
-            &serde_json::to_vec(&state).map_err(write_error)?,
-        )
+        let mut state = loaded.state;
+        match loaded.v1_bytes {
+            Some(original) => self.publish_migration(&mut state, &original, deadline),
+            None => replace(
+                &self.home.join("state.json"),
+                &serde_json::to_vec(&state).map_err(write_error)?,
+            ),
+        }
+    }
+
+    /// Publish a state migrated from schema 1 under the held state lock:
+    /// keep the original once in `state.v1.json`, then write the v2 bytes to
+    /// `state.prev.json` and only then to `state.json`. An interruption at any
+    /// point leaves `state.json` at schema 1, so the next run repeats this, and
+    /// an older binary never finds a schema-1 generation to fall back to once
+    /// `state.json` is v2.
+    fn publish_migration(
+        &self,
+        state: &mut State,
+        original: &[u8],
+        deadline: Instant,
+    ) -> Result<()> {
+        let backup = self.home.join("state.v1.json");
+        if !backup.exists() {
+            replace_until(&backup, original, deadline)?;
+        }
+        state.rev = state
+            .rev
+            .checked_add(1)
+            .ok_or_else(|| Error::new(Reason::StoreWriteFailed, "revision overflow"))?;
+        let bytes = serde_json::to_vec(&*state).map_err(write_error)?;
+        replace_until(&self.home.join("state.prev.json"), &bytes, deadline)?;
+        replace_until(&self.home.join("state.json"), &bytes, deadline)
     }
 
     pub fn session(&self, session_id: &str) -> SessionLog {
@@ -363,18 +414,86 @@ fn corrupt_error(e: impl std::fmt::Display) -> Error {
     Error::new(Reason::StoreCorrupt, e.to_string())
 }
 
-fn read_state(path: &Path) -> Result<Option<State>> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let state: State = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
-            if state.schema_version != crate::model::SCHEMA_VERSION {
-                return Err(corrupt_error("unsupported schema_version"));
-            }
-            Ok(Some(state))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(write_error(e)),
+struct Loaded {
+    state: State,
+    /// The original bytes when the file was schema 1 (migrated in `state`).
+    v1_bytes: Option<Vec<u8>>,
+}
+
+/// Decide the schema before parsing the whole state, so a newer format that
+/// this model cannot parse is refused as unsupported instead of corrupt.
+fn read_state(path: &Path) -> Result<Option<Loaded>> {
+    #[derive(Deserialize)]
+    struct Probe {
+        schema_version: u32,
     }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(write_error(e)),
+    };
+    let probe: Probe = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
+    match probe.schema_version {
+        1 => {
+            // Schema 1 is schema 2 without the fields that default.
+            let mut state: State = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
+            migrate_v1(&mut state);
+            Ok(Some(Loaded {
+                state,
+                v1_bytes: Some(bytes),
+            }))
+        }
+        crate::model::SCHEMA_VERSION => Ok(Some(Loaded {
+            state: serde_json::from_slice(&bytes).map_err(corrupt_error)?,
+            v1_bytes: None,
+        })),
+        v => Err(Error::new(
+            Reason::StoreUnsupported,
+            format!("schema_version {v} is newer than this gaebu"),
+        )),
+    }
+}
+
+/// Bring a schema-1 state to schema 2: one open escalation per asker and
+/// duty (the newest wins), and a dedupe key for every queued notice.
+fn migrate_v1(state: &mut State) {
+    use crate::model::EscalationStatus;
+    type Key = (String, Option<String>);
+    let mut newest: std::collections::BTreeMap<Key, (u64, u64, String)> = Default::default();
+    for e in state.escalations.values() {
+        if e.status != EscalationStatus::Open {
+            continue;
+        }
+        let rank = (e.created_at, id_number(&e.id));
+        let entry = newest.entry((e.from.clone(), e.duty.clone())).or_insert((
+            rank.0,
+            rank.1,
+            e.id.clone(),
+        ));
+        if rank > (entry.0, entry.1) {
+            *entry = (rank.0, rank.1, e.id.clone());
+        }
+    }
+    for e in state.escalations.values_mut() {
+        if e.status != EscalationStatus::Open {
+            continue;
+        }
+        let keep = &newest[&(e.from.clone(), e.duty.clone())].2;
+        if &e.id != keep {
+            e.status = EscalationStatus::Superseded;
+            e.superseded_by = Some(keep.clone());
+        }
+    }
+    for n in &mut state.outbox {
+        n.text = crate::model::notice_key(&n.body);
+    }
+    state.schema_version = crate::model::SCHEMA_VERSION;
+}
+
+fn id_number(id: &str) -> u64 {
+    id.rsplit_once('-')
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0)
 }
 
 fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {

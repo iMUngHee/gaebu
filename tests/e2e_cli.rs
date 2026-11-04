@@ -322,6 +322,7 @@ fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
                     to_member: "m-x".into(),
                     to_session: format!("s-{id}"),
                     body: "b".into(),
+                    text: "b".into(),
                     created_at: now,
                     attempts: 0,
                     claimed_at: claimed,

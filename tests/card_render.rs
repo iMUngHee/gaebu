@@ -61,6 +61,7 @@ fn fixture() -> State {
                 head: head.into(),
                 status: BuStatus::Open,
                 created_at: 0,
+                hold: None,
             },
         );
     }
@@ -109,6 +110,8 @@ fn fixture() -> State {
             note: None,
             created_at: 0,
             updated_at: 0,
+            hold: None,
+            source: None,
         },
     );
     st.leases.insert(

@@ -155,5 +155,6 @@ pub fn current_turn_evidence(
         },
         quote,
         at: latest.at,
+        strength: crate::model::Strength::Inferred,
     })
 }
