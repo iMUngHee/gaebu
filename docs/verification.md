@@ -1,5 +1,87 @@
 # Verification snapshot
 
+## 0.2.0 (plan `gaebu-v0-2`)
+
+Checked on 2026-11-04 on Windows with `stable-x86_64-pc-windows-gnu`, branch
+`agent/gaebu-v0-2` from base `62a0cd3`. The 0.1 record follows below unchanged.
+
+| Criterion | Status | Evidence |
+| --- | --- | --- |
+| Static checks and suite | PASS | `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 170 passed, 0 failed, 2 helper entry points ignored (0.1: 137). |
+| Named criteria tests | PASS | Each of the 31 tests named in the plan's criteria, run alone with `--exact`, reports `1 passed; 0 failed` (list below). |
+| Mod | PASS | `claude plugin test mod` 9 pass, 0 fail (stage order, status count, board token, discarded `card-1`/`board-1` values); `claude plugin validate mod` passes with the 0.1 warnings; `tsc` 0 errors (the 17 type errors 0.1 carried are fixed). |
+| Release MCP round trip | PASS | Release `gaebu mcp` in an isolated home: protocol `2025-06-18`, 12 tools including `escalation_withdraw`, no `hold`/`release`; the same question twice returns the same `e-10`, the second `escalation reused`; `board` returns a view with a token. |
+| Live natural-language hold | PASS | Isolated home, a real `claude -p` session as the aide with `rules/gaebu.md` appended and the Claude hook registered through `--settings`. See below. |
+| Codex hook and MCP host | UNVERIFIED | The Codex hook is still not deployed; no Codex host ran 0.2. |
+| Global deployment | UNVERIFIED | Not installed globally; `~/.local/bin/gaebu` is still 0.1.0. |
+| Hosted CI | UNVERIFIED | The workflow still lives in `ci/` (token lacks `workflow` scope). |
+
+```text
+core_store::v1_fixture_migrates_to_v2 -> 1 passed; 0 failed
+core_store::migration_keeps_v1_backup_and_v2_prev -> 1 passed; 0 failed
+core_store::future_schema_refused_without_fallback -> 1 passed; 0 failed
+core_store::repair_refuses_unsupported_state -> 1 passed; 0 failed
+core_store::repair_from_v1_prev_migrates_consistently -> 1 passed; 0 failed
+core_store::migration_resumes_after_partial_write -> 1 passed; 0 failed
+core_store::failed_migration_skips_user_change -> 1 passed; 0 failed
+core_ops::hold_guard_matrix -> 1 passed; 0 failed
+core_ops::bu_hold_covers_descendant_duties -> 1 passed; 0 failed
+core_ops::amend_keeps_hold -> 1 passed; 0 failed
+core_ops::lease_scope_excludes_held_duties -> 1 passed; 0 failed
+core_ops::lease_expiry_keeps_hold -> 1 passed; 0 failed
+e2e_cli::hold_requires_user_evidence -> 1 passed; 0 failed
+e2e_cli::root_ops_record_strength -> 1 passed; 0 failed
+evidence_rules::recorded_source_must_match_prompt -> 1 passed; 0 failed
+core_ops::escalation_reuse_and_supersede -> 1 passed; 0 failed
+core_ops::escalation_reuse_reroutes_when_recipient_unavailable -> 1 passed; 0 failed
+core_ops::escalations_reroute_after_commit -> 1 passed; 0 failed
+core_ops::nested_holds_release_independently -> 1 passed; 0 failed
+core_ops::escalation_withdraw_only_by_asker -> 1 passed; 0 failed
+core_ops::notice_classification_matrix -> 1 passed; 0 failed
+core_ops::composite_ops_notice_totals -> 1 passed; 0 failed
+core_ops::hold_survives_cancel_with_terminal_stage -> 1 passed; 0 failed
+core_ops::duplicate_pending_notice_not_queued -> 1 passed; 0 failed
+card_render::stage_first_matching_row -> 1 passed; 0 failed
+card_render::card_keeps_holds_under_truncation -> 1 passed; 0 failed
+card_render::inferred_root_grant_render -> 1 passed; 0 failed
+e2e_cli::board_and_card_agree_on_stage -> 1 passed; 0 failed
+e2e_cli::board_since_detects_quiet_transition -> 1 passed; 0 failed
+e2e_cli::source_from_other_session_refused -> 1 passed; 0 failed
+mcp_protocol::escalation_withdraw_tool -> 1 passed; 0 failed
+```
+
+### Live hold
+
+The commander seat was this verification session (`gapu`); the aide seat was a
+fresh `claude -p` session. Duty `d-10` (`docs/**`) was issued to the aide.
+Four turns, each prompt typed as the user:
+
+1. "개부 소임 d-10을 수락해." The agent ran `gaebu duty accept d-10`.
+2. "d-10 잠깐 멈춰. 내가 확인할 때까지 기다려." The agent ran
+   `gaebu hold d-10 --until "대협이 확인할 때까지" --evidence "d-10 잠깐 멈춰.
+   내가 확인할 때까지 기다려." --explicit` and reported `held`.
+3. "d-10 끝났으면 완료로 처리해." The agent did not finish it and kept the hold:
+   it judged a conditional finish request no release.
+4. Asked to run `gaebu duty done d-10` and show the answer, it reported
+   `gaebu: held: duty d-10 is held until: 대협이 확인할 때까지` with exit 1.
+
+The stored state afterwards:
+
+```text
+schema 2 status accepted version 2
+hold until: 대협이 확인할 때까지
+evidence: d-10 잠깐 멈춰. 내가 확인할 때까지 기다려. | explicit | hook_filtered | session c1ad56ff seq 6
+records: ['binding confirmed for m-7', "new duty d-10 'docs 오탈자 정리' proposed", 'duty d-10 accepted', 'd-10 held until: 대협이 확인할 때까지']
+  승상부 속관 장사 live02aide · bound
+    소임 d-10 [보류] docs 오탈자 정리 — 대협이 확인할 때까지
+```
+
+The issue notice queued before the aide session existed was delivered once
+pager knew that session (the aide reported pager message `#2819`). This is a
+seeded team, not an operational human appointment.
+
+## 0.1.0
+
 This intermediate record covers commit `ea740d7`, checked on 2026-11-04 on
 Windows with `stable-x86_64-pc-windows-gnu`. Release acceptance remains open for
 re-review, hosted CI, global deployment and the runtime checks identified below.
