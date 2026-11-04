@@ -114,7 +114,14 @@ pub fn root_appoint(
         },
     );
     root_done(st, now, ev, key, &tid);
-    changed(st, now, &mid, std::slice::from_ref(&mid), "root appointed");
+    changed(
+        st,
+        now,
+        &mid,
+        std::slice::from_ref(&mid),
+        "root appointed",
+        Notify::Record,
+    );
     Ok(out("appointed; awaiting target hook", vec![mid, tid]))
 }
 
@@ -166,6 +173,7 @@ pub fn root_assign(
             &commander.id,
             &[id.clone(), commander.id.clone()],
             &format!("member {id} ({alias}) assigned; confirmation pending"),
+            Notify::Record,
         );
         ids.push(id);
     }
@@ -212,6 +220,7 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
             "member {} ({alias}) dismissed; downstream grants revoked",
             m.id
         ),
+        Notify::Act,
     );
     Ok(out("dismissed", vec![m.id]))
 }
@@ -249,6 +258,7 @@ pub fn root_cancel_team(st: &mut State, now: Ms, ev: &Evidence, team: &str) -> R
         &author,
         &affected,
         &format!("team {} cancelled", t.id),
+        Notify::Act,
     );
     root_done(st, now, ev, key, &t.id);
     Ok(out("team cancelled", vec![t.id]))
@@ -317,6 +327,7 @@ pub fn root_hold(
         &author,
         &affected,
         &format!("{target} held until: {until}"),
+        Notify::Act,
     );
     Ok(out("held", vec![target.into()]))
 }
@@ -343,6 +354,7 @@ pub fn root_release(st: &mut State, now: Ms, ev: &Evidence, target: &str) -> Res
             "{target} released (held for '{}', released for '{}')",
             old.evidence.quote, ev.quote
         ),
+        Notify::Act,
     );
     if let Some(r) = st.records.last_mut() {
         r.kind = RecordKind::Decision;
@@ -452,6 +464,7 @@ pub fn confirm_binding(
             id,
             &affected,
             &format!("binding confirmed for {id}"),
+            Notify::Record,
         );
     }
     Ok(id)
@@ -477,6 +490,7 @@ pub fn mark_vacant(st: &mut State, now: Ms, member: &str, reason: &str) -> Resul
         member,
         &affected,
         &format!("member {member} vacant: {reason}"),
+        Notify::Record,
     );
     Ok(())
 }
@@ -537,7 +551,14 @@ pub fn bu_open(
     if !verbs.is_empty() {
         grant(st, now, actor, &h.id, verbs, &scope)?;
     }
-    changed(st, now, &a.id, &[h.id], &format!("bu {bid} opened"));
+    changed(
+        st,
+        now,
+        &a.id,
+        &[h.id],
+        &format!("bu {bid} opened"),
+        Notify::Act,
+    );
     Ok(out("bu opened", vec![bid]))
 }
 
@@ -572,7 +593,14 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         return refuse(Reason::Cancelled, "cancel is sticky");
     }
     st.bus.get_mut(bu).unwrap().status = BuStatus::Closed;
-    changed(st, now, &a.id, &[b.head], &format!("bu {bu} closed"));
+    changed(
+        st,
+        now,
+        &a.id,
+        &[b.head],
+        &format!("bu {bu} closed"),
+        Notify::Record,
+    );
     Ok(out("bu closed", vec![bu.into()]))
 }
 
@@ -613,6 +641,7 @@ pub fn bu_cancel(
         &a.id,
         &affected,
         &format!("bu {bu} cancelled: {reason}"),
+        Notify::Act,
     );
     Ok(out("bu cancelled", vec![bu.into()]))
 }
@@ -653,6 +682,7 @@ pub fn member_add(
         &a.id,
         &[b.head],
         &format!("member {id} ({alias}) added; confirmation pending"),
+        Notify::Record,
     );
     Ok(out("member pending", vec![id]))
 }
@@ -703,6 +733,7 @@ pub fn member_move(
         &a.id,
         std::slice::from_ref(&id),
         &format!("member {id} moved to bu {bu}"),
+        Notify::Act,
     );
     Ok(out("member moved", vec![id]))
 }
@@ -751,6 +782,7 @@ pub fn title_set(
         &a.id,
         std::slice::from_ref(&m.id),
         &format!("member {} title changed to '{title}'", m.id),
+        Notify::Record,
     );
     Ok(out("title changed", vec![m.id]))
 }
@@ -790,7 +822,14 @@ pub fn grant(
             created_at: now,
         },
     );
-    changed(st, now, &a.id, &[m.id], &format!("grant {id} delegated"));
+    changed(
+        st,
+        now,
+        &a.id,
+        &[m.id],
+        &format!("grant {id} delegated"),
+        Notify::Record,
+    );
     Ok(out("delegated", vec![id]))
 }
 
@@ -819,6 +858,7 @@ pub fn revoke(st: &mut State, now: Ms, actor: &Actor, grant: &str) -> Result<Out
         &a.id,
         &[g.grantee],
         &format!("grant {grant} revoked"),
+        Notify::Act,
     );
     Ok(out("revoked", vec![grant.into()]))
 }
@@ -894,7 +934,7 @@ pub fn duty_issue(
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
-    changed(st, now, &a.id, &[m.id], &message);
+    changed(st, now, &a.id, &[m.id], &message, Notify::Act);
     Ok(out("duty issued", vec![id]))
 }
 
@@ -944,6 +984,7 @@ pub fn duty_respond(
             "duty {duty} {}",
             if accept { "accepted" } else { "declined" }
         ),
+        if accept { Notify::Record } else { Notify::Act },
     );
     Ok(out("duty response recorded", vec![duty.into()]))
 }
@@ -991,6 +1032,11 @@ pub fn duty_progress(
         &a.id,
         &[issuer],
         &format!("duty {duty} progress: {status:?}"),
+        if status == DutyStatus::Accepted {
+            Notify::Record
+        } else {
+            Notify::Act
+        },
     );
     Ok(out("duty progress recorded", vec![duty.into()]))
 }
@@ -1042,6 +1088,7 @@ pub fn duty_amend(
         &a.id,
         &[assignee],
         &format!("duty {duty} amended; acceptance required"),
+        Notify::Act,
     );
     Ok(out("duty amended", vec![duty.into()]))
 }
@@ -1079,6 +1126,7 @@ pub fn duty_cancel(
         &a.id,
         &[assignee],
         &format!("duty {duty} cancelled: {reason}"),
+        Notify::Act,
     );
     Ok(out("duty cancelled", vec![duty.into()]))
 }
@@ -1127,7 +1175,7 @@ pub fn lease_acquire(
             expires_at: now.saturating_add(ttl),
         },
     );
-    changed(st, now, &a.id, &[], "lease acquired");
+    changed(st, now, &a.id, &[], "lease acquired", Notify::Record);
     Ok(out("lease acquired", vec![id]))
 }
 
@@ -1186,7 +1234,7 @@ pub fn lease_renew(
     }
     lease_scope(st, &a.id, &l.key, "accepted duty no longer covers lease")?;
     st.leases.get_mut(lease).unwrap().expires_at = now.saturating_add(ttl);
-    changed(st, now, &a.id, &[], "lease renewed");
+    changed(st, now, &a.id, &[], "lease renewed", Notify::Record);
     Ok(out("lease renewed", vec![lease.into()]))
 }
 
@@ -1200,7 +1248,7 @@ pub fn lease_release(st: &mut State, now: Ms, actor: &Actor, lease: &str) -> Res
         return refuse(Reason::NoGrant, "not lease holder");
     }
     st.leases.remove(lease);
-    changed(st, now, &a.id, &[], "lease released");
+    changed(st, now, &a.id, &[], "lease released", Notify::Record);
     Ok(out("lease released", vec![lease.into()]))
 }
 
@@ -1227,6 +1275,7 @@ pub fn lease_force_release(
         &a.id,
         &[l.holder],
         &format!("lease {lease} force released: {reason}"),
+        Notify::Act,
     );
     Ok(out("lease force released", vec![lease.into()]))
 }
@@ -1286,6 +1335,7 @@ pub fn escalate(
                 &a.id,
                 &to.into_iter().collect::<Vec<_>>(),
                 &format!("escalation {} rerouted: {}", e.id, e.question),
+                Notify::Act,
             );
             return Ok(out("escalation rerouted", vec![e.id]));
         }
@@ -1317,7 +1367,14 @@ pub fn escalate(
         Some(old) => format!("escalation {id} raised (replaces {old}): {question}"),
         None => format!("escalation {id} raised: {question}"),
     };
-    changed(st, now, &a.id, &to.into_iter().collect::<Vec<_>>(), &text);
+    changed(
+        st,
+        now,
+        &a.id,
+        &to.into_iter().collect::<Vec<_>>(),
+        &text,
+        Notify::Act,
+    );
     match replaced {
         Some(old) => Ok(out(
             &format!("escalation raised; superseded {old}"),
@@ -1363,6 +1420,7 @@ pub fn escalation_withdraw(
         &a.id,
         &e.to.into_iter().collect::<Vec<_>>(),
         &format!("escalation {escalation} withdrawn{why}"),
+        Notify::Act,
     );
     Ok(out("escalation withdrawn", vec![escalation.into()]))
 }
@@ -1415,6 +1473,7 @@ pub fn reroute_escalations(st: &mut State, now: Ms) {
             &from,
             &to.into_iter().collect::<Vec<_>>(),
             &format!("escalation {id} rerouted: {question}"),
+            Notify::Act,
         );
     }
 }
@@ -1449,6 +1508,7 @@ pub fn escalation_answer(
         &a.id,
         &[from],
         &format!("escalation {escalation} answered: {answer}"),
+        Notify::Act,
     );
     Ok(out("escalation answered", vec![escalation.into()]))
 }
@@ -1659,6 +1719,7 @@ fn rebind(st: &mut State, now: Ms, author: &str, member: &str, alias: &str) -> R
         author,
         &affected,
         &format!("member {member} binding replaced; awaiting confirmation as {alias}"),
+        Notify::Record,
     );
     Ok(())
 }
@@ -1713,7 +1774,16 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) -> Vec<String> {
     st.leases.retain(|_, l| !members.contains(&l.holder));
     members
 }
-fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &str) {
+/// Whether a change interrupts its recipients (plan gaebu-v0-2, Decision 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notify {
+    /// The recipient must do or stop doing something: a pager notice.
+    Act,
+    /// Visible on the next card; only the team record.
+    Record,
+}
+
+fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &str, notify: Notify) {
     let Some(actor) = st.members.get(author) else {
         return;
     };
@@ -1736,6 +1806,10 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
         text: text.into(),
         at: now,
     });
+    if notify == Notify::Record {
+        return;
+    }
+    let key = notice_key(&body);
     for member in affected {
         let session = st
             .members
@@ -1745,13 +1819,21 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
             if actor_session.as_deref() == Some(&session) {
                 continue;
             }
+            // The same change still waiting for this session: one notice.
+            if st
+                .outbox
+                .iter()
+                .any(|n| n.to_session == session && n.text == key)
+            {
+                continue;
+            }
             let id = st.mint("n");
             st.outbox.push(Notice {
                 id,
                 to_member: member.clone(),
                 to_session: session,
                 body: body.clone(),
-                text: crate::model::notice_key(&body),
+                text: key.clone(),
                 created_at: now,
                 attempts: 0,
                 claimed_at: None,

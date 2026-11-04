@@ -728,12 +728,17 @@ fn notice_not_sent_to_actor() {
         s.outbox.is_empty(),
         "pending target needs no notice; root actor must not receive one"
     );
-    let id = ops::confirm_binding(&mut s, 31, "new-staff-session", Tool::Codex, "new-staff")
+    let records = s.records.len();
+    ops::confirm_binding(&mut s, 31, "new-staff-session", Tool::Codex, "new-staff")
         .unwrap()
         .unwrap();
-    assert_eq!(s.outbox.len(), 1);
-    assert_eq!(s.outbox[0].to_member, a.member);
-    assert_ne!(s.outbox[0].to_member, id);
+    // A confirmed seat is Record-only (plan gaebu-v0-2, Decision 13): the
+    // commander sees it on the next card.
+    assert!(s.outbox.is_empty());
+    assert_eq!(s.records.len(), records + 1);
+    // An Act change from the commander still skips the commander's session.
+    let d = ops::duty_issue(&mut s, 31, &a, &a.member, spec());
+    assert!(d.is_err(), "nobody issues a duty to themself");
     s.outbox.clear();
     let id = ops::root_assign(&mut s, 32, &ev(32), &["same-session".into()], "root")
         .unwrap()
@@ -1372,4 +1377,493 @@ fn escalations_reroute_after_commit() {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+// ----- attention budget (plan gaebu-v0-2, Decisions 4, 13, 15) -----
+
+/// Notices a change should queue under the rule: Act → each distinct bound
+/// recipient session other than the author's own; Record → none.
+fn expected_notices(s: &State, r: &Record, act: bool) -> usize {
+    if !act {
+        return 0;
+    }
+    let own = s
+        .members
+        .get(&r.author)
+        .and_then(|m| m.binding.session_id.clone());
+    let mut sessions: Vec<_> = r
+        .refs
+        .iter()
+        .filter_map(|m| s.members.get(m).and_then(|m| m.binding.session_id.clone()))
+        .filter(|sid| Some(sid) != own.as_ref())
+        .collect();
+    sessions.sort();
+    sessions.dedup();
+    sessions.len()
+}
+
+/// Every `changed()` call site in src/ops.rs, one row per branch:
+/// root_appoint, root_assign, root_dismiss, root_cancel_team, root_hold,
+/// root_release, confirm_binding, mark_vacant, bu_open, bu_close, bu_cancel,
+/// member_add, member_move, title_set, grant, revoke, duty_issue,
+/// duty_respond (accept, decline), duty_progress (unblock, blocked, done,
+/// handoff), duty_amend, duty_cancel, lease_acquire, lease_renew,
+/// lease_release, lease_force_release, escalate (rerouted, raised and
+/// superseded), escalation_withdraw, reroute_escalations,
+/// escalation_answer, rebind (via member_rebind).
+#[test]
+fn notice_classification_matrix() {
+    type Prep = fn(&mut State, &Actor, &Actor, &Actor) -> String;
+    type Op = fn(&mut State, &Actor, &Actor, &Actor, &str);
+    fn none(_: &mut State, _: &Actor, _: &Actor, _: &Actor) -> String {
+        String::new()
+    }
+    fn duty(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        accept(s, a, b)
+    }
+    fn proposed(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        ops::duty_issue(s, 20, a, &b.member, spec()).unwrap().ids[0].clone()
+    }
+    fn blocked(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        let d = accept(s, a, b);
+        ops::duty_progress(s, 22, b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+        d
+    }
+    fn lease(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        accept(s, a, b);
+        ops::lease_acquire(s, 22, b, "src/a", LeaseMode::Exclusive, None, "w")
+            .unwrap()
+            .ids[0]
+            .clone()
+    }
+    fn child_bu(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        ops::bu_open(s, 15, a, &b.member, None, &[], &[])
+            .unwrap()
+            .ids[0]
+            .clone()
+    }
+    fn question(s: &mut State, _: &Actor, b: &Actor, _: &Actor) -> String {
+        ops::escalate(s, 30, b, None, "which branch?").unwrap().ids[0].clone()
+    }
+    fn stranded(s: &mut State, a: &Actor, b: &Actor, c: &Actor) -> String {
+        let bu = child_bu(s, a, b, c);
+        ops::member_move(s, 16, a, &c.member, &bu).unwrap();
+        let e = ops::escalate(s, 30, c, None, "is it frozen?").unwrap().ids[0].clone();
+        s.members.get_mut(&b.member).unwrap().binding.state = BindingState::Vacant;
+        e
+    }
+    fn held(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        let d = accept(s, a, b);
+        ops::root_hold(s, 25, &hev("root-session", 900), &d, "wait").unwrap();
+        d
+    }
+    fn granted(s: &mut State, a: &Actor, b: &Actor, _: &Actor) -> String {
+        ops::grant(s, 39, a, &b.member, &[Verb::Assign], &scope())
+            .unwrap()
+            .ids[0]
+            .clone()
+    }
+    fn assigned(s: &mut State, _: &Actor, _: &Actor, _: &Actor) -> String {
+        ops::root_assign(s, 30, &ev(30), &["new-staff".into()], "root").unwrap();
+        String::new()
+    }
+    let rows: Vec<(&str, Prep, Op, bool)> = vec![
+        (
+            "root_appoint",
+            none,
+            |s, _, _, _, _| {
+                ops::root_appoint(s, 40, &ev(40), "newcmdr", Some("x"), "p", None).unwrap();
+            },
+            false,
+        ),
+        (
+            "root_assign",
+            none,
+            |s, _, _, _, _| {
+                ops::root_assign(s, 40, &ev(40), &["new-staff".into()], "root").unwrap();
+            },
+            false,
+        ),
+        (
+            "root_dismiss",
+            none,
+            |s, _, _, _, _| {
+                ops::root_dismiss(s, 40, &hev("root-session", 1_000), "other").unwrap();
+            },
+            true,
+        ),
+        (
+            "root_cancel_team",
+            none,
+            |s, _, _, _, _| {
+                let t = s.teams.keys().next().unwrap().clone();
+                ops::root_cancel_team(s, 40, &hev("root-session", 1_000), &t).unwrap();
+            },
+            true,
+        ),
+        (
+            "root_hold",
+            duty,
+            |s, _, _, _, d| {
+                ops::root_hold(s, 40, &hev("root-session", 1_000), d, "wait").unwrap();
+            },
+            true,
+        ),
+        (
+            "root_release",
+            held,
+            |s, _, _, _, d| {
+                ops::root_release(s, 40, &hev("root-session", 1_000), d).unwrap();
+            },
+            true,
+        ),
+        (
+            "confirm_binding",
+            assigned,
+            |s, _, _, _, _| {
+                ops::confirm_binding(s, 40, "new-staff-session", Tool::Codex, "new-staff").unwrap();
+            },
+            false,
+        ),
+        (
+            "mark_vacant",
+            none,
+            |s, _, b, _, _| {
+                ops::mark_vacant(s, 40, &b.member, "pager_gone").unwrap();
+            },
+            false,
+        ),
+        (
+            "bu_open",
+            none,
+            |s, a, b, _, _| {
+                ops::bu_open(s, 40, a, &b.member, None, &[], &[]).unwrap();
+            },
+            true,
+        ),
+        (
+            "bu_close",
+            child_bu,
+            |s, a, _, _, bu| {
+                ops::bu_close(s, 40, a, bu).unwrap();
+            },
+            false,
+        ),
+        (
+            "bu_cancel",
+            child_bu,
+            |s, a, _, _, bu| {
+                ops::bu_cancel(s, 40, a, bu, "reorg").unwrap();
+            },
+            true,
+        ),
+        (
+            "member_add",
+            none,
+            |s, a, _, _, _| {
+                let bu = s.members[&a.member].bu.clone();
+                ops::member_add(s, 40, a, &bu, "recruit", None).unwrap();
+            },
+            false,
+        ),
+        (
+            "member_move",
+            child_bu,
+            |s, a, _, c, bu| {
+                ops::member_move(s, 40, a, &c.member, bu).unwrap();
+            },
+            true,
+        ),
+        (
+            "title_set",
+            none,
+            |s, a, b, _, _| {
+                ops::title_set(s, 40, a, &b.member, "참군").unwrap();
+            },
+            false,
+        ),
+        (
+            "grant",
+            none,
+            |s, a, b, _, _| {
+                ops::grant(s, 40, a, &b.member, &[Verb::Assign], &scope()).unwrap();
+            },
+            false,
+        ),
+        (
+            "revoke",
+            granted,
+            |s, a, _, _, g| {
+                ops::revoke(s, 40, a, g).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_issue",
+            none,
+            |s, a, b, _, _| {
+                ops::duty_issue(s, 40, a, &b.member, spec()).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_respond accept",
+            proposed,
+            |s, _, b, _, d| {
+                ops::duty_respond(s, 40, b, d, None, true, None).unwrap();
+            },
+            false,
+        ),
+        (
+            "duty_respond decline",
+            proposed,
+            |s, _, b, _, d| {
+                ops::duty_respond(s, 40, b, d, None, false, Some("no")).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_progress unblock",
+            blocked,
+            |s, _, b, _, d| {
+                ops::duty_progress(s, 40, b, d, DutyStatus::Accepted, None).unwrap();
+            },
+            false,
+        ),
+        (
+            "duty_progress blocked",
+            duty,
+            |s, _, b, _, d| {
+                ops::duty_progress(s, 40, b, d, DutyStatus::Blocked, Some("x")).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_progress done",
+            duty,
+            |s, _, b, _, d| {
+                ops::duty_progress(s, 40, b, d, DutyStatus::Done, None).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_progress handoff",
+            duty,
+            |s, _, b, _, d| {
+                ops::duty_progress(s, 40, b, d, DutyStatus::HandedOff, Some("to c")).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_amend",
+            duty,
+            |s, a, _, _, d| {
+                let v = s.duties[d].version;
+                ops::duty_amend(s, 40, a, d, v, spec()).unwrap();
+            },
+            true,
+        ),
+        (
+            "duty_cancel",
+            duty,
+            |s, a, _, _, d| {
+                ops::duty_cancel(s, 40, a, d, "drop").unwrap();
+            },
+            true,
+        ),
+        (
+            "lease_acquire",
+            duty,
+            |s, _, b, _, _| {
+                ops::lease_acquire(s, 40, b, "src/b", LeaseMode::Exclusive, None, "w").unwrap();
+            },
+            false,
+        ),
+        (
+            "lease_renew",
+            lease,
+            |s, _, b, _, l| {
+                ops::lease_renew(s, 40, b, l, None).unwrap();
+            },
+            false,
+        ),
+        (
+            "lease_release",
+            lease,
+            |s, _, b, _, l| {
+                ops::lease_release(s, 40, b, l).unwrap();
+            },
+            false,
+        ),
+        (
+            "lease_force_release",
+            lease,
+            |s, a, _, _, l| {
+                ops::lease_force_release(s, 40, a, l, "needed").unwrap();
+            },
+            true,
+        ),
+        (
+            "escalate rerouted",
+            stranded,
+            |s, _, _, c, _| {
+                ops::escalate(s, 40, c, None, "is it frozen?").unwrap();
+            },
+            true,
+        ),
+        (
+            "escalate raised",
+            none,
+            |s, _, b, _, _| {
+                ops::escalate(s, 40, b, None, "which branch?").unwrap();
+            },
+            true,
+        ),
+        (
+            "escalate superseded",
+            question,
+            |s, _, b, _, _| {
+                ops::escalate(s, 40, b, None, "which tag?").unwrap();
+            },
+            true,
+        ),
+        (
+            "escalation_withdraw",
+            question,
+            |s, _, b, _, e| {
+                ops::escalation_withdraw(s, 40, b, e, None).unwrap();
+            },
+            true,
+        ),
+        (
+            "reroute_escalations",
+            stranded,
+            |s, _, _, _, _| {
+                ops::reroute_escalations(s, 40);
+            },
+            true,
+        ),
+        (
+            "escalation_answer",
+            question,
+            |s, a, _, _, e| {
+                ops::escalation_answer(s, 40, a, e, "main").unwrap();
+            },
+            true,
+        ),
+        (
+            "rebind",
+            none,
+            |s, a, b, _, _| {
+                ops::member_rebind(s, 40, a, &b.member, "child-next").unwrap();
+            },
+            false,
+        ),
+    ];
+    for (name, prep, op, act) in rows {
+        let (mut s, a, b, c) = setup();
+        let arg = prep(&mut s, &a, &b, &c);
+        s.outbox.clear();
+        let records = s.records.len();
+        op(&mut s, &a, &b, &c, &arg);
+        let added = &s.records[records..];
+        assert!(!added.is_empty(), "{name}: every change is recorded");
+        let want: usize = added.iter().map(|r| expected_notices(&s, r, act)).sum();
+        assert_eq!(s.outbox.len(), want, "{name}: notices");
+        if act {
+            assert!(
+                want > 0,
+                "{name}: an Act row must reach someone in this fixture"
+            );
+        }
+    }
+}
+
+#[test]
+fn record_rows_would_have_reached_someone() {
+    // Record really suppresses: accept's record names the bound issuer.
+    let (mut s, a, b, _) = setup();
+    let d = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.outbox.clear();
+    ops::duty_respond(&mut s, 21, &b, &d, None, true, None).unwrap();
+    let r = s.records.last().unwrap();
+    assert_eq!(r.refs, vec![a.member.clone()]);
+    assert_eq!(expected_notices(&s, r, true), 1);
+    assert!(s.outbox.is_empty());
+}
+
+#[test]
+fn composite_ops_notice_totals() {
+    // bu_open with verbs: the bu opening (Act) and the grant inside it (Record).
+    let (mut s, a, b, _) = setup();
+    s.outbox.clear();
+    let records = s.records.len();
+    ops::bu_open(&mut s, 40, &a, &b.member, None, &[Verb::Assign], &scope()).unwrap();
+    let added: Vec<_> = s.records[records..]
+        .iter()
+        .map(|r| r.text.clone())
+        .collect();
+    assert_eq!(added.len(), 2, "{added:?}");
+    assert!(added.iter().any(|t| t.contains("delegated")));
+    assert!(added.iter().any(|t| t.contains("opened")));
+    assert_eq!(
+        s.outbox.len(),
+        1,
+        "only the opening interrupts the new head"
+    );
+    assert_eq!(s.outbox[0].to_session, b.session_id);
+    // A dismissal that strands an escalation: the dismissal, then the reroute.
+    let (mut s, a, b, c) = chain();
+    ops::escalate(&mut s, 30, &c, None, "is it frozen?").unwrap();
+    s.outbox.clear();
+    let records = s.records.len();
+    ops::root_dismiss(&mut s, 40, &hev("root-session", 1_000), "child").unwrap();
+    ops::reroute_escalations(&mut s, 41);
+    let added = &s.records[records..];
+    assert!(added.iter().any(|r| r.text.contains("rerouted")));
+    let want: usize = added.iter().map(|r| expected_notices(&s, r, true)).sum();
+    assert_eq!(s.outbox.len(), want);
+    assert!(
+        s.outbox
+            .iter()
+            .any(|n| n.to_session == a.session_id && n.body.contains("rerouted"))
+    );
+    let _ = b;
+}
+
+#[test]
+fn duplicate_pending_notice_not_queued() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    s.outbox.clear();
+    // The same change twice (new record ids): one pending notice.
+    ops::duty_progress(&mut s, 30, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+    ops::duty_progress(&mut s, 31, &b, &d, DutyStatus::Accepted, None).unwrap();
+    ops::duty_progress(&mut s, 32, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+    assert_eq!(s.outbox.len(), 1);
+    let ids: Vec<_> = s
+        .records
+        .iter()
+        .rev()
+        .take(3)
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    // Still one while a flush holds it.
+    s.outbox[0].claimed_at = Some(33);
+    ops::duty_progress(&mut s, 34, &b, &d, DutyStatus::Accepted, None).unwrap();
+    ops::duty_progress(&mut s, 35, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+    assert_eq!(s.outbox.len(), 1);
+    // A notice migrated from schema 1 (text derived from its v1 body) dedupes too.
+    let n = s.outbox[0].clone();
+    s.outbox[0].text = notice_key(&n.body.replacen(" — r-", " — r-9", 1));
+    assert_eq!(s.outbox[0].text, n.text);
+    // Delivered and gone: the same change again is a new notice.
+    s.outbox.clear();
+    ops::duty_progress(&mut s, 36, &b, &d, DutyStatus::Accepted, None).unwrap();
+    ops::duty_progress(&mut s, 37, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+    assert_eq!(s.outbox.len(), 1);
 }
