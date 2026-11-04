@@ -49,6 +49,8 @@ enum Cmd {
         since: Option<String>,
     },
     /// Root directive: give 가절월 to a pager alias (quote the user's words).
+    /// With --explicit on a commander appointed from inferred words, confirms
+    /// the appointment instead.
     Appoint {
         alias: String,
         #[arg(long)]

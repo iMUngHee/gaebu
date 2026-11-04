@@ -298,6 +298,63 @@ fn same_prompt_multi_target_idempotent() {
     assert_eq!(s.next_id, n);
 }
 #[test]
+fn explicit_reappoint_confirms_an_inferred_seat() {
+    let explicit = |seq: u64| Evidence {
+        strength: Strength::Explicit,
+        quote: "너 가절월 맞아".into(),
+        ..ev(seq)
+    };
+    let mut s = State::default();
+    let first = ops::root_appoint(&mut s, 1, &ev(1), "root", Some("t"), "p", None).unwrap();
+    let mid = first.ids[0].clone();
+    assert_eq!(gaebu::card::root_title(&s, &mid), "가절월(추론)");
+
+    // Inferred words again: still the old refusal, and no downgrade path.
+    assert_eq!(
+        ops::root_appoint(&mut s, 2, &ev(2), "root", None, "p", None)
+            .unwrap_err()
+            .reason,
+        Reason::Conflict
+    );
+    // Another team's name is a different appointment.
+    assert_eq!(
+        ops::root_appoint(&mut s, 3, &explicit(3), "root", Some("other"), "p", None)
+            .unwrap_err()
+            .reason,
+        Reason::Conflict
+    );
+    // Evidence not newer than the appointment's cannot confirm it.
+    let mut stale = explicit(4);
+    stale.at = 1;
+    assert_eq!(
+        ops::root_appoint(&mut s, 4, &stale, "root", None, "p", None)
+            .unwrap_err()
+            .reason,
+        Reason::NoUserEvidence
+    );
+
+    let (members, grants, records) = (s.members.len(), s.grants.len(), s.records.len());
+    let done = ops::root_appoint(&mut s, 5, &explicit(5), "root", None, "p", None).unwrap();
+    assert_eq!(done.summary, "appointment confirmed explicitly");
+    assert_eq!(done.ids, first.ids);
+    assert_eq!((s.members.len(), s.grants.len()), (members, grants));
+    assert_eq!(gaebu::card::root_title(&s, &mid), "가절월");
+    let note = &s.records[records..];
+    assert_eq!(note.len(), 1);
+    assert!(
+        note[0].text.contains("was inferred: user instruction"),
+        "{}",
+        note[0].text
+    );
+
+    // The same prompt again is idempotent; a later explicit one is a no-op.
+    let retry = ops::root_appoint(&mut s, 6, &explicit(5), "root", None, "p", None).unwrap();
+    assert_eq!(retry.summary, "already appointed");
+    let again = ops::root_appoint(&mut s, 7, &explicit(7), "root", None, "p", None).unwrap();
+    assert_eq!(again.summary, "already appointed explicitly");
+    assert_eq!(s.records.len(), records + 1);
+}
+#[test]
 fn dismiss_requires_newer_evidence() {
     let mut s = State::default();
     ops::root_appoint(&mut s, 1, &ev(1), "root", None, "p", None).unwrap();
@@ -1491,6 +1548,23 @@ fn notice_classification_matrix() {
             none,
             |s, _, _, _, _| {
                 ops::root_appoint(s, 40, &ev(40), "newcmdr", Some("x"), "p", None).unwrap();
+            },
+            false,
+        ),
+        (
+            "root_appoint (explicit confirmation)",
+            |s, _, _, _| {
+                for g in s.grants.values_mut().filter(|g| g.grantor.is_none()) {
+                    g.evidence = Some(ev(5));
+                }
+                String::new()
+            },
+            |s, _, _, _, _| {
+                let e = Evidence {
+                    strength: Strength::Explicit,
+                    ..ev(40)
+                };
+                ops::root_appoint(s, 40, &e, "root", None, "p", None).unwrap();
             },
             false,
         ),
