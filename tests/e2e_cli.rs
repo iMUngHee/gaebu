@@ -576,3 +576,92 @@ fn root_ops_record_strength() {
     ]);
     assert_eq!(strength_of(&store, "cancel-team"), "explicit");
 }
+
+#[test]
+fn source_from_other_session_refused() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    let duty = team_with_duty(&store, &pager);
+    // The user's words were said in nawi's session, not the issuer's.
+    user_says(&store, "s-nawi", "린터 규칙도 정리해 줘");
+    pager.as_session("s-gapu");
+    let issue = |quote: &str| {
+        gaebu(
+            &pager,
+            &[
+                "duty",
+                "issue",
+                "--to",
+                "nawi",
+                "--outcome",
+                "lint rules",
+                "--scope",
+                "src/scope.rs",
+                "--rights",
+                "r",
+                "--done",
+                "d",
+                "--source",
+                quote,
+            ],
+        )
+    };
+    assert_eq!(issue("린터 규칙도 정리해 줘"), 1);
+    // Through MCP the same quote is refused too.
+    let call = |args: serde_json::Value| -> serde_json::Value {
+        let input = format!(
+            "{}\n",
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"duty_issue","arguments":args,"_meta":{"threadId":"s-gapu"}}})
+        );
+        let mut out = Vec::new();
+        gaebu::mcp::serve(&mut std::io::Cursor::new(input), &mut out, &store, &pager).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    };
+    let spec = |quote: &str| {
+        serde_json::json!({"assignee":"nawi","spec":{"intent":"i","outcome":"lint rules",
+            "scope":["src/scope.rs"],"decision_rights":"r","escalate_on":[],"done_criteria":"d",
+            "source_quote":quote}})
+    };
+    let reply = call(spec("린터 규칙도 정리해 줘"));
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let before = store.read().unwrap().duties.len();
+    // Said in the issuer's own session: recorded with the duty.
+    user_says(&store, "s-gapu", "린터 규칙도 정리해 줘");
+    assert_eq!(issue("린터 규칙도 정리해 줘"), 0);
+    let reply = call(spec("린터 규칙도 정리해"));
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    let st = store.read().unwrap();
+    assert_eq!(st.duties.len(), before + 2);
+    let sourced: Vec<_> = st
+        .duties
+        .values()
+        .filter_map(|d| d.source.as_ref())
+        .collect();
+    assert_eq!(sourced.len(), 2);
+    assert!(sourced.iter().all(|s| s.session_id == "s-gapu"));
+    // Amending without a source keeps the one recorded.
+    let lint = st
+        .duties
+        .values()
+        .find(|d| d.source.is_some() && d.id != duty)
+        .unwrap()
+        .clone();
+    drop(st);
+    let v = lint.version.to_string();
+    let amend = [
+        "duty",
+        "amend",
+        &lint.id,
+        "--version",
+        &v,
+        "--outcome",
+        "lint rules v2",
+        "--scope",
+        "src/scope.rs",
+        "--done",
+        "d",
+    ];
+    assert_eq!(gaebu(&pager, &amend), 0);
+    assert_eq!(store.read().unwrap().duties[&lint.id].source, lint.source);
+}

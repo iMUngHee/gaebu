@@ -835,6 +835,22 @@ pub struct DutySpec {
     pub done_criteria: String,
     pub plan_ref: Option<String>,
     pub exec_root: Option<String>,
+    /// The user's words this duty answers; the caller resolves it into
+    /// `source` against its own session log before the transaction.
+    #[serde(default)]
+    pub source_quote: Option<String>,
+    #[serde(skip)]
+    pub source: Option<Source>,
+}
+
+impl DutySpec {
+    /// A quote that was not resolved into a verified source is refused.
+    fn verified_source(&self) -> Result<Option<Source>> {
+        match (&self.source_quote, &self.source) {
+            (Some(_), None) => refuse(Reason::NoUserEvidence, "source quote was not verified"),
+            (_, source) => Ok(source.clone()),
+        }
+    }
 }
 
 /// Issue a duty to a member below (verb `assign`, scope within grant).
@@ -850,6 +866,7 @@ pub fn duty_issue(
     below(st, &a, &m)?;
     authz::require(st, &a.id, Verb::Assign, &spec.scope)?;
     let scope = scope::normalize_list(&spec.scope)?;
+    let source = spec.verified_source()?;
     let id = st.mint("d");
     st.duties.insert(
         id.clone(),
@@ -873,7 +890,7 @@ pub fn duty_issue(
             created_at: now,
             updated_at: now,
             hold: None,
-            source: None,
+            source,
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
@@ -999,6 +1016,7 @@ pub fn duty_amend(
         return refuse(Reason::Conflict, "duty version or status changed");
     }
     let scope = scope::normalize_list(&spec.scope)?;
+    let source = spec.verified_source()?;
     let mut required = d.scope.clone();
     required.extend(scope.iter().cloned());
     authz::require(st, &a.id, Verb::Amend, &required)?;
@@ -1011,6 +1029,9 @@ pub fn duty_amend(
     d.done_criteria = spec.done_criteria;
     d.plan_ref = spec.plan_ref;
     d.exec_root = spec.exec_root;
+    if source.is_some() {
+        d.source = source;
+    }
     d.version += 1;
     d.updated_at = now;
     d.status = DutyStatus::Proposed;
