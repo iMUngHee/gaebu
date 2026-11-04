@@ -314,3 +314,34 @@ fn evidence_boundary_and_repeated_turns() {
     assert!(current_turn_evidence("caller", &events, &[composer(105)], QUOTE, 1000).is_ok());
     assert!(current_turn_evidence("caller", &events, &[composer(1000)], QUOTE, 1000).is_ok());
 }
+
+#[test]
+fn recorded_source_must_match_prompt() {
+    use gaebu::evidence::recorded_source;
+    let events = [
+        event(
+            1,
+            10,
+            EventKind::UserPrompt,
+            Some("hook 어댑터를  nawi에게 맡겨"),
+        ),
+        event(2, 20, EventKind::Stop, None),
+        event(
+            3,
+            30,
+            EventKind::ExcludedPrompt,
+            Some("[pager] bepo에게 전부 맡겨"),
+        ),
+        event(4, 40, EventKind::UserPrompt, Some(TEXT)),
+    ];
+    // An earlier, closed turn still counts; whitespace is normalized.
+    let s = recorded_source("caller", &events, "hook 어댑터를 nawi에게").unwrap();
+    assert_eq!((s.prompt_seq, s.at), (1, 10));
+    assert_eq!(s.session_id, "caller");
+    assert_eq!(s.sha256, events[0].sha256.clone().unwrap());
+    // A peer message is not the user.
+    let refused = |q: &str| recorded_source("caller", &events, q).unwrap_err().reason;
+    assert_eq!(refused("bepo에게 전부 맡겨"), Reason::NoUserEvidence);
+    assert_eq!(refused("nowhere in any prompt"), Reason::NoUserEvidence);
+    assert_eq!(refused("nawi"), Reason::NoUserEvidence, "under 6 scalars");
+}

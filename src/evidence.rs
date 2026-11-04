@@ -158,3 +158,49 @@ pub fn current_turn_evidence(
         strength: crate::model::Strength::Inferred,
     })
 }
+
+/// Find `quote` in a user prompt the hook recorded in this session, in any
+/// recent turn (the log keeps the last 50). Excluded prompts never count.
+/// This is provenance for a duty, not authority: it records which of the
+/// user's words a duty answers.
+pub fn recorded_source(
+    session_id: &str,
+    events: &[SessionEvent],
+    quote: &str,
+) -> Result<crate::model::Source> {
+    let quote = quote.split_whitespace().collect::<Vec<_>>().join(" ");
+    if quote.chars().count() < 6 {
+        return refuse(
+            Reason::NoUserEvidence,
+            "source quote must contain at least 6 Unicode scalars",
+        );
+    }
+    let hit = events
+        .iter()
+        .filter(|e| e.kind == EventKind::UserPrompt)
+        .filter(|e| {
+            e.text.as_deref().is_some_and(|t| {
+                t.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(&quote)
+            })
+        })
+        .max_by_key(|e| e.seq);
+    let Some(e) = hit else {
+        return refuse(
+            Reason::NoUserEvidence,
+            "source quote is not in a user prompt recorded in this session",
+        );
+    };
+    let Some(sha256) = e.sha256.clone() else {
+        return refuse(Reason::NoUserEvidence, "prompt digest is unavailable");
+    };
+    Ok(crate::model::Source {
+        session_id: session_id.into(),
+        prompt_seq: e.seq,
+        sha256,
+        quote,
+        at: e.at,
+    })
+}

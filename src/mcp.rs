@@ -105,7 +105,7 @@ fn tools() -> Vec<Value> {
     [
         ("me", "Read your current position card", json!({}), vec![]),
         ("board", "Read your team's command tree", json!({}), vec![]),
-        ("duty_issue", "Issue an outcome brief to a subordinate", json!({"assignee":string,"spec":{"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]}},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false}}), vec!["assignee","spec"]),
+        ("duty_issue", "Issue an outcome brief to a subordinate", json!({"assignee":string,"spec":{"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":{"type":"string","description":"The user's words this duty answers, quoted from a prompt in your own session"}},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false}}), vec!["assignee","spec"]),
         ("duty_accept", "Accept your duty", json!({"duty":string,"version":version}), vec!["duty"]),
         ("duty_decline", "Decline your duty with a reason", json!({"duty":string,"version":version,"note":string}), vec!["duty","note"]),
         ("duty_done", "Declare your duty complete", json!({"duty":string,"note":string}), vec!["duty"]),
@@ -216,8 +216,9 @@ fn call(
         let actor = identity::actor(st, &caller)?;
         match name {
             "duty_issue" => {
-                let spec = serde_json::from_value(args["spec"].clone())
+                let mut spec = serde_json::from_value(args["spec"].clone())
                     .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+                crate::cli::attach_source(store, &actor.session_id, &mut spec)?;
                 ops::duty_issue(st, now, &actor, required(args, "assignee")?, spec)
             }
             "duty_accept" | "duty_decline" => ops::duty_respond(

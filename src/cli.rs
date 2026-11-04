@@ -245,6 +245,10 @@ struct SpecArgs {
     plan: Option<String>,
     #[arg(long = "exec-root")]
     exec_root: Option<String>,
+    /// The user's words this duty answers, quoted from a prompt in your own
+    /// session.
+    #[arg(long)]
+    source: Option<String>,
 }
 
 impl SpecArgs {
@@ -258,8 +262,19 @@ impl SpecArgs {
             done_criteria: self.done_criteria,
             plan_ref: self.plan,
             exec_root: self.exec_root,
+            source_quote: self.source,
+            source: None,
         }
     }
+}
+
+/// Resolve a duty's source quote against the caller's own session log.
+pub fn attach_source(store: &Store, session_id: &str, spec: &mut DutySpec) -> Result<()> {
+    if let Some(quote) = &spec.source_quote {
+        let events = store.session(session_id).events()?;
+        spec.source = Some(evidence::recorded_source(session_id, &events, quote)?);
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -1166,7 +1181,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 match d {
                     DutyCmd::Issue { to, spec } => {
                         let m = resolve_member(st, team.as_deref(), &to)?;
-                        ops::duty_issue(st, now, actor, &m, spec.spec())
+                        let mut spec = spec.spec();
+                        attach_source(&store, &actor.session_id, &mut spec)?;
+                        ops::duty_issue(st, now, actor, &m, spec)
                     }
                     DutyCmd::Accept { duty, version } => {
                         ops::duty_respond(st, now, actor, &duty, version, true, None)
@@ -1187,7 +1204,11 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                         duty,
                         version,
                         spec,
-                    } => ops::duty_amend(st, now, actor, &duty, version, spec.spec()),
+                    } => {
+                        let mut spec = spec.spec();
+                        attach_source(&store, &actor.session_id, &mut spec)?;
+                        ops::duty_amend(st, now, actor, &duty, version, spec)
+                    }
                     DutyCmd::Cancel { duty, reason } => {
                         ops::duty_cancel(st, now, actor, &duty, &reason)
                     }
