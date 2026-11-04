@@ -83,6 +83,7 @@ pub fn root_appoint(
             head: mid.clone(),
             status: BuStatus::Open,
             created_at: now,
+            hold: None,
         },
     );
     st.members.insert(
@@ -394,6 +395,7 @@ pub fn bu_open(
             head: h.id.clone(),
             status: BuStatus::Open,
             created_at: now,
+            hold: None,
         },
     );
     let m = st.members.get_mut(&h.id).unwrap();
@@ -738,6 +740,8 @@ pub fn duty_issue(
             note: None,
             created_at: now,
             updated_at: now,
+            hold: None,
+            source: None,
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
@@ -1094,25 +1098,7 @@ pub fn escalate(
     if question.trim().is_empty() {
         return refuse(Reason::InvalidArgument, "empty escalation");
     }
-    let mut to = a.superior.clone();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(id) = &to {
-        if !seen.insert(id.clone()) {
-            to = None;
-            break;
-        }
-        let Some(m) = st.members.get(id) else {
-            to = None;
-            break;
-        };
-        if m.status == MemberStatus::Active
-            && m.binding.state == BindingState::Bound
-            && !authz::bu_cancelled(st, &m.bu)
-        {
-            break;
-        }
-        to = m.superior.clone();
-    }
+    let to = live_superior(st, &a.id);
     let id = st.mint("e");
     st.escalations.insert(
         id.clone(),
@@ -1127,6 +1113,7 @@ pub fn escalate(
             answer: None,
             created_at: now,
             answered_at: None,
+            superseded_by: None,
         },
     );
     changed(
@@ -1137,6 +1124,58 @@ pub fn escalate(
         &format!("escalation {id} raised: {question}"),
     );
     Ok(out("escalation raised", vec![id]))
+}
+
+/// The nearest superior of `member` that can answer: active, bound and not in
+/// a cancelled bu. `None` is the user's queue.
+fn live_superior(st: &State, member: &str) -> Option<String> {
+    let mut to = st.members.get(member).and_then(|m| m.superior.clone());
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(id) = &to {
+        if !seen.insert(id.clone()) {
+            return None;
+        }
+        let m = st.members.get(id)?;
+        if live_recipient(st, m) {
+            return to;
+        }
+        to = m.superior.clone();
+    }
+    None
+}
+
+fn live_recipient(st: &State, m: &crate::model::Member) -> bool {
+    m.status == MemberStatus::Active
+        && m.binding.state == BindingState::Bound
+        && !authz::bu_cancelled(st, &m.bu)
+}
+
+/// Run after every committed change: an open escalation whose recipient can
+/// no longer answer moves to the asker's nearest live superior (or the
+/// user's queue), so a vacancy, dismissal, cancel or rebind never strands it.
+pub fn reroute_escalations(st: &mut State, now: Ms) {
+    let stranded: Vec<(String, String, Option<String>)> = st
+        .escalations
+        .values()
+        .filter(|e| e.status == EscalationStatus::Open)
+        .filter_map(|e| {
+            let to = e.to.as_ref()?;
+            let live = st.members.get(to).is_some_and(|m| live_recipient(st, m));
+            (!live).then(|| (e.id.clone(), e.from.clone(), live_superior(st, &e.from)))
+        })
+        .collect();
+    for (id, from, to) in stranded {
+        let e = st.escalations.get_mut(&id).unwrap();
+        e.to = to.clone();
+        let question = e.question.clone();
+        changed(
+            st,
+            now,
+            &from,
+            &to.into_iter().collect::<Vec<_>>(),
+            &format!("escalation {id} rerouted: {question}"),
+        );
+    }
 }
 
 pub fn escalation_answer(
@@ -1219,6 +1258,7 @@ pub fn dev_seed(st: &mut State, now: Ms, spec: &SeedSpec) -> Result<Outcome> {
         attest: Attest::Fixture,
         quote: "development fixture".into(),
         at: now,
+        strength: crate::model::Strength::Explicit,
     };
     let appointed = root_appoint(
         st,
@@ -1264,6 +1304,7 @@ fn root_done(st: &mut State, now: Ms, key: String, team: &str) {
             team: team.into(),
             rev: st.rev.saturating_add(1),
             at: now,
+            evidence: None,
         },
     );
 }
@@ -1469,6 +1510,7 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
                 to_member: member.clone(),
                 to_session: session,
                 body: body.clone(),
+                text: crate::model::notice_key(&body),
                 created_at: now,
                 attempts: 0,
                 claimed_at: None,

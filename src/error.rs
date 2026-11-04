@@ -23,6 +23,10 @@ pub enum Reason {
     Busy,
     StoreWriteFailed,
     StoreCorrupt,
+    /// The state was written by a newer schema; nothing falls back from it.
+    StoreUnsupported,
+    /// A human hold covers the duty; only the human lifts it.
+    Held,
     PagerUnavailable,
 }
 
@@ -45,6 +49,8 @@ impl Reason {
             Reason::Busy => "busy",
             Reason::StoreWriteFailed => "store_write_failed",
             Reason::StoreCorrupt => "store_corrupt",
+            Reason::StoreUnsupported => "store_unsupported",
+            Reason::Held => "held",
             Reason::PagerUnavailable => "pager_unavailable",
         }
     }

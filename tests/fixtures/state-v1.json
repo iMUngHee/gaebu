@@ -1,0 +1,242 @@
+{
+ "schema_version": 1,
+ "rev": 1,
+ "next_id": 30,
+ "teams": {
+  "t-1": {
+   "id": "t-1",
+   "name": "촉",
+   "project": "fixture",
+   "commander": "m-3",
+   "root_bu": "b-2",
+   "status": "active",
+   "created_at": 1793769553832,
+   "cancelled_at": null
+  }
+ },
+ "bus": {
+  "b-2": {
+   "id": "b-2",
+   "team": "t-1",
+   "parent": null,
+   "name": "승상부",
+   "head": "m-3",
+   "status": "open",
+   "created_at": 1793769553832
+  }
+ },
+ "members": {
+  "m-3": {
+   "id": "m-3",
+   "team": "t-1",
+   "bu": "b-2",
+   "superior": null,
+   "title": "승상",
+   "status": "active",
+   "binding": {
+    "state": "bound",
+    "alias": "curu",
+    "tool": "claude",
+    "session_id": "s-curu",
+    "designated_at": 1793769553832,
+    "bound_at": 1793769553832,
+    "vacated_at": null,
+    "vacated_reason": null
+   },
+   "created_at": 1793769553832
+  },
+  "m-7": {
+   "id": "m-7",
+   "team": "t-1",
+   "bu": "b-2",
+   "superior": "m-3",
+   "title": "장사",
+   "status": "active",
+   "binding": {
+    "state": "bound",
+    "alias": "nawi",
+    "tool": "codex",
+    "session_id": "s-nawi",
+    "designated_at": 1793769553832,
+    "bound_at": 1793769553832,
+    "vacated_at": null,
+    "vacated_reason": null
+   },
+   "created_at": 1793769553832
+  }
+ },
+ "grants": {
+  "g-4": {
+   "id": "g-4",
+   "team": "t-1",
+   "grantor": null,
+   "grantee": "m-3",
+   "verbs": [
+    "assign",
+    "amend",
+    "cancel",
+    "reassign",
+    "open",
+    "arbitrate"
+   ],
+   "scope": [
+    "**",
+    "res:**"
+   ],
+   "status": "active",
+   "evidence": {
+    "session_id": "fixture",
+    "prompt_seq": 1793769553832,
+    "sha256": "fixture-촉-1793769553832",
+    "attest": "fixture",
+    "quote": "development fixture",
+    "at": 1793769553832
+   },
+   "created_at": 1793769553832
+  }
+ },
+ "duties": {
+  "d-20": {
+   "id": "d-20",
+   "team": "t-1",
+   "bu": "b-2",
+   "assignee": "m-7",
+   "issuer": "m-3",
+   "intent": "keep hooks fast",
+   "outcome": "hook adapter",
+   "scope": [
+    "src/hook.rs"
+   ],
+   "decision_rights": "internal structure",
+   "escalate_on": [
+    "public signatures"
+   ],
+   "done_criteria": "cargo test passes",
+   "plan_ref": null,
+   "exec_root": null,
+   "status": "accepted",
+   "version": 2,
+   "note": null,
+   "created_at": 1793769553832,
+   "updated_at": 1793769553832
+  }
+ },
+ "leases": {},
+ "escalations": {
+  "e-21": {
+   "id": "e-21",
+   "team": "t-1",
+   "from": "m-7",
+   "to": "m-3",
+   "duty": "d-20",
+   "question": "may I change the hook signature? (e-21)",
+   "status": "open",
+   "answer": null,
+   "created_at": 1793769553833,
+   "answered_at": null
+  },
+  "e-22": {
+   "id": "e-22",
+   "team": "t-1",
+   "from": "m-7",
+   "to": "m-3",
+   "duty": "d-20",
+   "question": "may I change the hook signature? (e-22)",
+   "status": "open",
+   "answer": null,
+   "created_at": 1793769553834,
+   "answered_at": null
+  },
+  "e-23": {
+   "id": "e-23",
+   "team": "t-1",
+   "from": "m-7",
+   "to": "m-3",
+   "duty": null,
+   "question": "general question",
+   "status": "answered",
+   "answer": "yes",
+   "created_at": 1793769553835,
+   "answered_at": 1793769553836
+  }
+ },
+ "records": [
+  {
+   "id": "r-5",
+   "team": "t-1",
+   "kind": "change",
+   "author": "m-3",
+   "refs": [
+    "m-3"
+   ],
+   "text": "root appointed",
+   "at": 1793769553832
+  },
+  {
+   "id": "r-6",
+   "team": "t-1",
+   "kind": "change",
+   "author": "m-3",
+   "refs": [
+    "m-3"
+   ],
+   "text": "binding confirmed for m-3",
+   "at": 1793769553832
+  },
+  {
+   "id": "r-8",
+   "team": "t-1",
+   "kind": "change",
+   "author": "m-3",
+   "refs": [
+    "m-7",
+    "m-3"
+   ],
+   "text": "member m-7 (nawi) assigned; confirmation pending",
+   "at": 1793769553832
+  },
+  {
+   "id": "r-9",
+   "team": "t-1",
+   "kind": "change",
+   "author": "m-7",
+   "refs": [
+    "m-7",
+    "m-3"
+   ],
+   "text": "binding confirmed for m-7",
+   "at": 1793769553832
+  }
+ ],
+ "root_actions": {
+  "fixture:1793769553832:appoint:curu": {
+   "team": "t-1",
+   "rev": 1,
+   "at": 1793769553832
+  },
+  "fixture:1793769553832:assign:nawi": {
+   "team": "t-1",
+   "rev": 1,
+   "at": 1793769553832
+  }
+ },
+ "outbox": [
+  {
+   "id": "n-10",
+   "to_member": "m-3",
+   "to_session": "s-curu",
+   "body": "[gaebu 촉] 승상부 속관 장사 nawi: binding confirmed for m-7 — r-9 — gaebu me",
+   "created_at": 1793769553832,
+   "attempts": 0
+  },
+  {
+   "id": "n-24",
+   "to_member": "m-7",
+   "to_session": "s-nawi",
+   "body": "[gaebu 촉] 승상 curu: duty d-20 amended; acceptance required — r-25 — gaebu me",
+   "created_at": 1793769553837,
+   "attempts": 3,
+   "claimed_at": 1793769553838
+  }
+ ]
+}

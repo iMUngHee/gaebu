@@ -64,6 +64,7 @@ fn ev(seq: u64) -> Evidence {
         attest: Attest::Fixture,
         quote: "user instruction".into(),
         at: seq,
+        strength: Default::default(),
     }
 }
 

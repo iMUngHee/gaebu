@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub type Ms = u64;
 
@@ -102,6 +102,9 @@ pub struct Bu {
     pub head: String,
     pub status: BuStatus,
     pub created_at: Ms,
+    /// A human hold over every duty in this bu and the bus below it.
+    #[serde(default)]
+    pub hold: Option<Hold>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +209,18 @@ pub enum Attest {
     Fixture,
 }
 
+/// How directly the user's words named the root action and its target.
+/// Recorded and shown, never enforced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Strength {
+    /// The words name both the action and its target.
+    Explicit,
+    /// The agent interpreted the action or the target from the words.
+    #[default]
+    Inferred,
+}
+
 /// Where a root directive's authority came from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Evidence {
@@ -213,6 +228,29 @@ pub struct Evidence {
     pub prompt_seq: u64,
     pub sha256: String,
     pub attest: Attest,
+    pub quote: String,
+    pub at: Ms,
+    #[serde(default)]
+    pub strength: Strength,
+}
+
+/// A human hold: set and lifted only through root evidence. Questions, new
+/// clues and automated feedback never lift it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Hold {
+    pub evidence: Evidence,
+    /// The release condition, in the user's terms.
+    pub until: String,
+    pub at: Ms,
+}
+
+/// The user's words a duty was issued for, matched against a prompt the hook
+/// recorded in the issuer's own session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Source {
+    pub session_id: String,
+    pub prompt_seq: u64,
+    pub sha256: String,
     pub quote: String,
     pub at: Ms,
 }
@@ -267,6 +305,10 @@ pub struct Duty {
     pub note: Option<String>,
     pub created_at: Ms,
     pub updated_at: Ms,
+    #[serde(default)]
+    pub hold: Option<Hold>,
+    #[serde(default)]
+    pub source: Option<Source>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +337,10 @@ pub struct Lease {
 pub enum EscalationStatus {
     Open,
     Answered,
+    /// Cleared by the asker.
+    Withdrawn,
+    /// Replaced by a different question from the same asker on the same duty.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -310,6 +356,8 @@ pub struct Escalation {
     pub answer: Option<String>,
     pub created_at: Ms,
     pub answered_at: Option<Ms>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +386,9 @@ pub struct RootAction {
     pub team: String,
     pub rev: u64,
     pub at: Ms,
+    /// The user's words behind the action (appoint keeps it on the root grant).
+    #[serde(default)]
+    pub evidence: Option<Evidence>,
 }
 
 /// A pending pager notification, flushed after commit.
@@ -347,6 +398,9 @@ pub struct Notice {
     pub to_member: String,
     pub to_session: String,
     pub body: String,
+    /// `body` without its record id: the dedupe key (`notice_key`).
+    #[serde(default)]
+    pub text: String,
     pub created_at: Ms,
     pub attempts: u32,
     /// Set while a flush is sending this notice. A claim older than
@@ -357,6 +411,18 @@ pub struct Notice {
 
 /// How long a flush may hold a notice before another flush may retry it.
 pub const NOTICE_CLAIM_MS: Ms = 60_000;
+
+/// A notice body without its trailing ` — <record id> — gaebu me`, so the same
+/// change raised twice compares equal.
+pub fn notice_key(body: &str) -> String {
+    let rest = body.strip_suffix(" — gaebu me").unwrap_or(body);
+    match rest.rsplit_once(" — r-") {
+        Some((head, id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+            head.to_owned()
+        }
+        _ => body.to_owned(),
+    }
+}
 
 /// The member acting, after caller resolution and binding checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
