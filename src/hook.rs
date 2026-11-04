@@ -384,6 +384,14 @@ mod tests {
             std::process::id(),
             model::now_ms()
         ));
+        // Removed even when an assertion below fails (every mutant run).
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(home.clone());
         let store = Store::open(&home).unwrap();
         let mut value = serde_json::to_value(model::State::default()).unwrap();
         value["members"]["m"] = json!({"id":"m","team":"t","bu":"b","superior":null,"title":"fixture","status":"active","binding":{"state":"pending","alias":"target","tool":null,"session_id":null,"designated_at":1,"bound_at":null,"vacated_at":null,"vacated_reason":null},"created_at":1});
@@ -444,6 +452,5 @@ mod tests {
             "insufficient budget must skip the state transaction"
         );
         assert!(output.is_empty());
-        std::fs::remove_dir_all(home).unwrap();
     }
 }
