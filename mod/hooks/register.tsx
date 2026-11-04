@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderInput } from 'claude-code'
 
 import type { BoardView, CardDuty, CardView, Stage } from '../types'
 
@@ -59,15 +59,51 @@ function parse<T>(text: string | null): T | null {
   }
 }
 
-function statusText(c: CardView | null): string | undefined {
-  if (c === null) return undefined
-  const me = c.chain[c.chain.length - 1] ?? c.alias
-  const open = c.duties.length
+function seatOf(c: CardView): string {
+  return c.chain[c.chain.length - 1] ?? c.alias
+}
+
+/** My open duties and what waits on someone, shared by the status line and the band. */
+function countsText(c: CardView): string {
   const waiting = c.duties.filter(d => NEEDS_ATTENTION.includes(d.stage)).length
   const attention = waiting > 0 ? ` · 대기 ${waiting}` : ''
   const leases = c.leases.length > 0 ? ` · 점유 ${c.leases.length}` : ''
   const esc = c.escalations.length > 0 ? ` · escalation ${c.escalations.length}` : ''
-  return `개부: ${me} · 소임 ${open}${attention}${leases}${esc}`
+  return `소임 ${c.duties.length}${attention}${leases}${esc}`
+}
+
+function statusText(c: CardView | null): string | undefined {
+  if (c === null) return undefined
+  return `개부: ${seatOf(c)} · ${countsText(c)}`
+}
+
+/** The band line above the prompt: my seat and its counts; the name opens /gaebu. */
+function bandLine($: Ctx, e: RenderInput<'AbovePrompt'>, c: CardView | null): RenderElement {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  if (c === null) {
+    return (
+      <Box flexDirection="row">
+        <Button key="open-gaebu" label="⚑ 개부" plain dimColor onPress={() => void openPane($).catch(() => {})} />
+        <Text dimColor> 자리 없음</Text>
+      </Box>
+    )
+  }
+  return (
+    <Box flexDirection="row">
+      <Box flexDirection="row" flexShrink={1}>
+        <Button key="open-gaebu" label={`⚑ ${seatOf(c)}`} plain onPress={() => void openPane($).catch(() => {})} />
+        <Text dimColor wrap="truncate-end">
+          {'  '}
+          {countsText(c)}
+        </Text>
+      </Box>
+    </Box>
+  )
+}
+
+async function openPane($: Ctx): Promise<void> {
+  await refresh($)
+  await $.ui.open({ id: PANE, title: '개부 명부' })
 }
 
 /** Toast what changed for me since the last refresh. */
@@ -135,8 +171,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'gaebu' }, async $ => {
-    await refresh($)
-    await $.ui.open({ id: PANE, title: '개부 명부' })
+    await openPane($)
     return { text: '개부 명부 패널을 열었습니다.' }
   })
 
@@ -172,6 +207,19 @@ export const register: Register = on => {
         },
       ],
     }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const mine = await read($, card)
+    const below = await next(e)
+    const { Box } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {bandLine($, e, mine)}
+        {below}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
