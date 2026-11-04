@@ -350,3 +350,229 @@ fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
         .collect();
     assert_eq!(left, vec!["n-fresh".to_string()]);
 }
+
+// ----- holds and strength (plan gaebu-v0-2) -----
+
+/// gapu commands, nawi accepted one duty. Returns the duty id.
+fn team_with_duty(store: &Store, pager: &FakePager) -> String {
+    user_says(store, "s-gapu", "너한테 가절월 줄게. nawi를 속관으로 주마.");
+    pager.as_session("s-gapu");
+    assert_eq!(
+        gaebu(
+            pager,
+            &[
+                "appoint",
+                "gapu",
+                "--team",
+                "gaebu",
+                "--evidence",
+                "너한테 가절월 줄게"
+            ]
+        ),
+        0
+    );
+    assert_eq!(
+        gaebu(
+            pager,
+            &[
+                "assign",
+                "nawi",
+                "--to",
+                "gapu",
+                "--evidence",
+                "nawi를 속관으로 주마"
+            ]
+        ),
+        0
+    );
+    session_start(store, pager, "s-gapu");
+    session_start(store, pager, "s-nawi");
+    let issue = [
+        "duty",
+        "issue",
+        "--to",
+        "nawi",
+        "--outcome",
+        "scope rules",
+        "--scope",
+        "src/scope.rs",
+        "--rights",
+        "internals",
+        "--done",
+        "cargo test",
+    ];
+    assert_eq!(gaebu(pager, &issue), 0);
+    let duty = store.read().unwrap().duties.keys().next().unwrap().clone();
+    pager.as_session("s-nawi");
+    assert_eq!(gaebu(pager, &["duty", "accept", &duty]), 0);
+    duty
+}
+
+fn strength_of(store: &Store, action: &str) -> String {
+    let st = store.read().unwrap();
+    let (_, ra) = st
+        .root_actions
+        .iter()
+        .filter(|(k, _)| k.contains(&format!(":{action}:")))
+        .max_by_key(|(_, ra)| ra.rev)
+        .unwrap_or_else(|| panic!("no root action {action}"));
+    serde_json::to_value(ra.evidence.as_ref().unwrap().strength)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn hold_requires_user_evidence() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    let duty = team_with_duty(&store, &pager);
+    let hold = |quote: &str| {
+        gaebu(
+            &pager,
+            &["hold", &duty, "--until", "대협 확인", "--evidence", quote],
+        )
+    };
+    // The words are not in the user's current prompt.
+    pager.as_session("s-gapu");
+    assert_eq!(hold("잠깐 멈춰, 내가 확인할 때까지"), 1);
+    // A peer's message is not the user.
+    peer_arrives(&store, "s-gapu", "잠깐 멈춰, 내가 확인할 때까지");
+    assert_eq!(hold("잠깐 멈춰, 내가 확인할 때까지"), 1);
+    assert!(store.read().unwrap().duties[&duty].hold.is_none());
+    // The user says it.
+    user_says(&store, "s-gapu", "잠깐 멈춰, 내가 확인할 때까지");
+    assert_eq!(hold("잠깐 멈춰, 내가 확인할 때까지"), 0);
+    assert!(store.read().unwrap().duties[&duty].hold.is_some());
+    // nawi cannot finish it, and cannot lift it without the user.
+    pager.as_session("s-nawi");
+    assert_eq!(gaebu(&pager, &["duty", "done", &duty]), 1);
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["release", &duty, "--evidence", "이제 진행해도 좋아"]
+        ),
+        1
+    );
+    user_says(&store, "s-nawi", "이제 진행해도 좋아");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["release", &duty, "--evidence", "이제 진행해도 좋아"]
+        ),
+        0
+    );
+    assert_eq!(gaebu(&pager, &["duty", "done", &duty]), 0);
+}
+
+#[test]
+fn root_ops_record_strength() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi"), ("s-bepo", "bepo")]);
+    user_says(&store, "s-gapu", "gapu에게 가절월을 준다");
+    pager.as_session("s-gapu");
+    let root = |args: &[&str]| assert_eq!(gaebu(&pager, args), 0, "{args:?}");
+    root(&[
+        "appoint",
+        "gapu",
+        "--team",
+        "t",
+        "--evidence",
+        "gapu에게 가절월을 준다",
+        "--explicit",
+    ]);
+    let st = store.read().unwrap();
+    let g = st.grants.values().find(|g| g.grantor.is_none()).unwrap();
+    assert_eq!(
+        g.evidence.as_ref().unwrap().strength,
+        gaebu::model::Strength::Explicit
+    );
+    drop(st);
+    assert_eq!(strength_of(&store, "appoint"), "explicit");
+    user_says(&store, "s-gapu", "개부해라, nawi랑 bepo 데리고");
+    root(&[
+        "assign",
+        "nawi",
+        "bepo",
+        "--to",
+        "gapu",
+        "--evidence",
+        "개부해라, nawi랑 bepo",
+    ]);
+    assert_eq!(strength_of(&store, "assign"), "inferred");
+    session_start(&store, &pager, "s-gapu");
+    session_start(&store, &pager, "s-nawi");
+    session_start(&store, &pager, "s-bepo");
+    let issue = [
+        "duty",
+        "issue",
+        "--to",
+        "nawi",
+        "--outcome",
+        "o",
+        "--scope",
+        "src/**",
+        "--rights",
+        "r",
+        "--done",
+        "d",
+    ];
+    root(&issue);
+    let st = store.read().unwrap();
+    let duty = st.duties.keys().next().unwrap().clone();
+    let nawi = st
+        .members
+        .values()
+        .find(|m| m.binding.alias == "nawi")
+        .unwrap()
+        .id
+        .clone();
+    drop(st);
+    user_says(&store, "s-gapu", "그 소임 잠깐 멈춰");
+    root(&[
+        "hold",
+        &duty,
+        "--until",
+        "확인 후",
+        "--evidence",
+        "그 소임 잠깐 멈춰",
+        "--explicit",
+    ]);
+    assert_eq!(strength_of(&store, "hold"), "explicit");
+    assert_eq!(
+        store.read().unwrap().duties[&duty]
+            .hold
+            .as_ref()
+            .unwrap()
+            .evidence
+            .strength,
+        gaebu::model::Strength::Explicit
+    );
+    user_says(&store, "s-gapu", "이제 됐어 계속해");
+    root(&["release", &duty, "--evidence", "이제 됐어 계속해"]);
+    assert_eq!(strength_of(&store, "release"), "inferred");
+    user_says(&store, "s-gapu", "nawi 자리는 nuzu로 바꿔");
+    root(&[
+        "rebind",
+        &nawi,
+        "--alias",
+        "nuzu",
+        "--evidence",
+        "nawi 자리는 nuzu로 바꿔",
+        "--explicit",
+    ]);
+    assert_eq!(strength_of(&store, "rebind"), "explicit");
+    user_says(&store, "s-gapu", "bepo는 이제 빠져도 돼");
+    root(&["dismiss", "bepo", "--evidence", "bepo는 이제 빠져도 돼"]);
+    assert_eq!(strength_of(&store, "dismiss"), "inferred");
+    user_says(&store, "s-gapu", "팀 t 해산해");
+    root(&[
+        "cancel-team",
+        "t",
+        "--evidence",
+        "팀 t 해산해",
+        "--explicit",
+    ]);
+    assert_eq!(strength_of(&store, "cancel-team"), "explicit");
+}
