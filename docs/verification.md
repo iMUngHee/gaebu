@@ -7,11 +7,12 @@ Checked on 2026-11-04 on Windows with `stable-x86_64-pc-windows-gnu`, branch
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
-| Static checks and suite | PASS | `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 170 passed, 0 failed, 2 helper entry points ignored (0.1: 137). |
+| Static checks and suite | PASS | `cargo fmt --check` 0, `cargo clippy --all-targets -- -D warnings` 0, `cargo test` 172 passed, 0 failed, 2 helper entry points ignored (0.1: 137), after the code-review fixes below. |
 | Named criteria tests | PASS | Each of the 31 tests named in the plan's criteria, run alone with `--exact`, reports `1 passed; 0 failed` (list below). |
 | Mod | PASS | `claude plugin test mod` 9 pass, 0 fail (stage order, status count, board token, discarded `card-1`/`board-1` values); `claude plugin validate mod` passes with the 0.1 warnings; `tsc` 0 errors (the 17 type errors 0.1 carried are fixed). |
 | Release MCP round trip | PASS | Release `gaebu mcp` in an isolated home: protocol `2025-06-18`, 12 tools including `escalation_withdraw`, no `hold`/`release`; the same question twice returns the same `e-10`, the second `escalation reused`; `board` returns a view with a token. |
 | Live natural-language hold | PASS | Isolated home, a real `claude -p` session as the aide with `rules/gaebu.md` appended and the Claude hook registered through `--settings`. See below. |
+| Per-commit code review | PASS | A fresh reviewer read all 9 commits: 0 high, 1 medium, 5 low. Fixed: a dead asker's escalation now goes to the user's queue; dedupe compares only the newest queued notice, so held/released/held arrives in order; the board token ignores `rev`; `until` collapses to one line; a misplaced doc comment. The cancel-and-reissue path around a duty hold is documented in the threat model. Regression tests: `flipping_change_keeps_notice_order`, `hold_until_stays_one_line`, the asker rows of `escalations_reroute_after_commit`, and the rev check in `board_since_detects_quiet_transition`. |
 | Codex hook and MCP host | UNVERIFIED | The Codex hook is still not deployed; no Codex host ran 0.2. |
 | Global deployment | UNVERIFIED | Not installed globally; `~/.local/bin/gaebu` is still 0.1.0. |
 | Hosted CI | UNVERIFIED | The workflow still lives in `ci/` (token lacks `workflow` scope). |

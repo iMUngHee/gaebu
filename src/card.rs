@@ -490,8 +490,9 @@ pub fn one_line(card: &Card) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardView {
     pub rev: u64,
-    /// sha256 prefix of this view without the token: `board --since` compares
-    /// it, so a stage that changes with time alone (quiet) is still noticed.
+    /// sha256 prefix of this view without the token or `rev`: `board --since`
+    /// compares it, so a stage that changes with time alone (quiet) is still
+    /// noticed and a commit that changes nothing shown is not.
     pub token: String,
     pub teams: Vec<BoardTeam>,
     pub user_queue: Vec<String>,
@@ -613,7 +614,11 @@ pub fn board(
         teams,
         user_queue,
     };
+    // Hash what is shown, not the revision: commits that change nothing on
+    // the board keep the token.
+    view.rev = 0;
     let bytes = serde_json::to_vec(&view).unwrap_or_default();
     view.token = format!("{:x}", Sha256::digest(&bytes))[..16].to_owned();
+    view.rev = st.rev;
     view
 }

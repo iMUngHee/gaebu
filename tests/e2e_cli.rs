@@ -797,6 +797,23 @@ fn board_since_detects_quiet_transition() {
         store.last_seen(sid)
     });
     assert_eq!(before.token, again.token, "nothing changed: same token");
+    // A commit that changes nothing on the board keeps the token.
+    store
+        .transact(gaebu::store::CLI_DEADLINE, |st| {
+            st.next_id += 1;
+            Ok(())
+        })
+        .unwrap();
+    let st = store.read().unwrap();
+    let committed = gaebu::card::board(&st, gaebu::model::now_ms(), None, &|sid| {
+        store.last_seen(sid)
+    });
+    assert_ne!(committed.rev, before.rev);
+    assert_eq!(
+        committed.token, before.token,
+        "rev alone must not change the token"
+    );
+    let before = committed;
     // No commit at all, only time: nawi falls quiet.
     store
         .session("s-nawi")

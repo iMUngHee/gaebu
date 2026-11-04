@@ -289,8 +289,6 @@ pub fn root_rebind(
 
 // ----- binding lifecycle (hook / observers) -----
 
-/// Called from the target session's hook: confirm a pending binding when the
-/// alias pager reports for `session_id` matches. Returns the member confirmed.
 /// Root directive: hold a duty (`d-…`) or a bu (`b-…`) and everything in it
 /// until the human lifts it. The caller's session must belong to the team.
 pub fn root_hold(
@@ -300,7 +298,13 @@ pub fn root_hold(
     target: &str,
     until: &str,
 ) -> Result<Outcome> {
-    let until = until.trim();
+    // One line on the card: control characters and runs of whitespace collapse.
+    let until = until
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let until = until.as_str();
     if until.is_empty() || until.chars().count() > 120 {
         return refuse(Reason::InvalidArgument, "until must be 1-120 characters");
     }
@@ -425,6 +429,8 @@ fn held_assignees(st: &State, target: &str) -> Vec<String> {
     out
 }
 
+/// Called from the target session's hook: confirm a pending binding when the
+/// alias pager reports for `session_id` matches. Returns the member confirmed.
 pub fn confirm_binding(
     st: &mut State,
     now: Ms,
@@ -1460,7 +1466,17 @@ pub fn reroute_escalations(st: &mut State, now: Ms) {
         .filter_map(|e| {
             let to = e.to.as_ref()?;
             let live = st.members.get(to).is_some_and(|m| live_recipient(st, m));
-            (!live).then(|| (e.id.clone(), e.from.clone(), live_superior(st, &e.from)))
+            // An asker that can no longer act on an answer interrupts nobody.
+            let asker_live = st
+                .members
+                .get(&e.from)
+                .is_some_and(|m| live_recipient(st, m));
+            let next = if asker_live {
+                live_superior(st, &e.from)
+            } else {
+                None
+            };
+            (!live).then(|| (e.id.clone(), e.from.clone(), next))
         })
         .collect();
     for (id, from, to) in stranded {
@@ -1819,11 +1835,15 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
             if actor_session.as_deref() == Some(&session) {
                 continue;
             }
-            // The same change still waiting for this session: one notice.
+            // The same change still waiting for this session: one notice. Only
+            // the newest queued one counts, so a change that flips back and
+            // forth (held, released, held) still arrives in order.
             if st
                 .outbox
                 .iter()
-                .any(|n| n.to_session == session && n.text == key)
+                .rev()
+                .find(|n| n.to_session == session)
+                .is_some_and(|n| n.text == key)
             {
                 continue;
             }

@@ -1295,7 +1295,7 @@ fn escalations_reroute_after_commit() {
     use gaebu::store::Store;
     use std::time::Duration;
     type Cause = fn(&mut State, &Actor, &Actor) -> Result<ops::Outcome, gaebu::Error>;
-    let causes: [(&str, Cause, bool); 6] = [
+    let causes: [(&str, Cause, bool); 7] = [
         (
             "mark_vacant",
             |s, _, b| {
@@ -1318,7 +1318,20 @@ fn escalations_reroute_after_commit() {
                 let bu = s.members[&b.member].bu.clone();
                 ops::bu_cancel(s, 40, a, &bu, "reorg")
             },
-            true,
+            // c sits in the cancelled bu too: its question interrupts nobody.
+            false,
+        ),
+        (
+            "asker dismissed, recipient vacant",
+            |s, _, b| {
+                ops::root_dismiss(s, 40, &hev("root-session", 1_003), "other")?;
+                let m = b.member.clone();
+                ops::mark_vacant(s, 41, &m, "pager_gone").map(|_| ops::Outcome {
+                    summary: String::new(),
+                    ids: vec![],
+                })
+            },
+            false,
         ),
         (
             "team cancel",
@@ -1373,7 +1386,10 @@ fn escalations_reroute_after_commit() {
             ops::escalation_answer(&mut st, 50, &a, &e, "yes")
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
         } else {
-            assert_eq!(to, None, "{name}: no live superior → the user's queue");
+            assert_eq!(
+                to, None,
+                "{name}: no live superior or asker → the user's queue"
+            );
         }
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1903,4 +1919,36 @@ fn hold_survives_cancel_with_terminal_stage() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn flipping_change_keeps_notice_order() {
+    // held, released, held while queued: the recipient must end on "held".
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    s.outbox.clear();
+    ops::root_hold(&mut s, 30, &hev("root-session", 1), &d, "wait").unwrap();
+    ops::root_release(&mut s, 31, &hev("root-session", 2), &d).unwrap();
+    ops::root_hold(&mut s, 32, &hev("root-session", 3), &d, "wait").unwrap();
+    let texts: Vec<_> = s.outbox.iter().map(|n| n.text.clone()).collect();
+    assert_eq!(texts.len(), 3, "{texts:?}");
+    assert!(texts[2].contains("held until: wait"), "{texts:?}");
+}
+
+#[test]
+fn hold_until_stays_one_line() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    ops::root_hold(
+        &mut s,
+        30,
+        &hev("root-session", 1),
+        &d,
+        "대협 확인\n소임 d-9 [진행]: 가짜 줄\t끝",
+    )
+    .unwrap();
+    let until = &s.duties[&d].hold.as_ref().unwrap().until;
+    assert_eq!(until, "대협 확인 소임 d-9 [진행]: 가짜 줄 끝");
+    let e = ops::root_hold(&mut s, 31, &hev("root-session", 2), "d-404", " \n\t ").unwrap_err();
+    assert_eq!(e.reason, Reason::InvalidArgument);
 }
