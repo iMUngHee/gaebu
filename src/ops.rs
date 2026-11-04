@@ -1265,7 +1265,38 @@ pub fn escalate(
         return refuse(Reason::InvalidArgument, "empty escalation");
     }
     let to = live_superior(st, &a.id);
+    // One open question per asker and duty: the same question is reused
+    // (rerouted if its recipient can no longer answer), a different one
+    // replaces it.
+    let open = st
+        .escalations
+        .values()
+        .find(|e| e.status == EscalationStatus::Open && e.from == a.id && e.duty.as_deref() == duty)
+        .cloned();
+    let mut replaced = None;
+    if let Some(e) = open {
+        if same_question(&e.question, question) {
+            if e.to == to {
+                return Ok(out("escalation reused", vec![e.id]));
+            }
+            st.escalations.get_mut(&e.id).unwrap().to = to.clone();
+            changed(
+                st,
+                now,
+                &a.id,
+                &to.into_iter().collect::<Vec<_>>(),
+                &format!("escalation {} rerouted: {}", e.id, e.question),
+            );
+            return Ok(out("escalation rerouted", vec![e.id]));
+        }
+        replaced = Some(e.id);
+    }
     let id = st.mint("e");
+    if let Some(old) = &replaced {
+        let e = st.escalations.get_mut(old).unwrap();
+        e.status = EscalationStatus::Superseded;
+        e.superseded_by = Some(id.clone());
+    }
     st.escalations.insert(
         id.clone(),
         Escalation {
@@ -1282,14 +1313,58 @@ pub fn escalate(
             superseded_by: None,
         },
     );
+    let text = match &replaced {
+        Some(old) => format!("escalation {id} raised (replaces {old}): {question}"),
+        None => format!("escalation {id} raised: {question}"),
+    };
+    changed(st, now, &a.id, &to.into_iter().collect::<Vec<_>>(), &text);
+    match replaced {
+        Some(old) => Ok(out(
+            &format!("escalation raised; superseded {old}"),
+            vec![id, old],
+        )),
+        None => Ok(out("escalation raised", vec![id])),
+    }
+}
+
+fn same_question(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    norm(a) == norm(b)
+}
+
+/// The asker clears an open escalation; later progress never clears one.
+pub fn escalation_withdraw(
+    st: &mut State,
+    now: Ms,
+    actor: &Actor,
+    escalation: &str,
+    note: Option<&str>,
+) -> Result<Outcome> {
+    let a = authz::check_actor(st, actor)?.clone();
+    let e = st
+        .escalations
+        .get(escalation)
+        .cloned()
+        .ok_or_else(|| Error::new(Reason::NotFound, "escalation not found"))?;
+    if e.from != a.id || e.team != a.team {
+        return refuse(Reason::NoGrant, "only the asker may withdraw");
+    }
+    if e.status != EscalationStatus::Open {
+        return refuse(Reason::Conflict, "escalation is not open");
+    }
+    st.escalations.get_mut(escalation).unwrap().status = EscalationStatus::Withdrawn;
+    let why = note
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| format!(": {n}"))
+        .unwrap_or_default();
     changed(
         st,
         now,
         &a.id,
-        &to.into_iter().collect::<Vec<_>>(),
-        &format!("escalation {id} raised: {question}"),
+        &e.to.into_iter().collect::<Vec<_>>(),
+        &format!("escalation {escalation} withdrawn{why}"),
     );
-    Ok(out("escalation raised", vec![id]))
+    Ok(out("escalation withdrawn", vec![escalation.into()]))
 }
 
 /// The nearest superior of `member` that can answer: active, bound and not in
