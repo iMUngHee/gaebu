@@ -930,3 +930,257 @@ fn superior_closes_only_clean_subordinate_bu() {
     ops::bu_close(&mut s, 15, &a, &bu).unwrap();
     assert_eq!(s.bus[&bu].status, BuStatus::Closed);
 }
+
+// ----- human holds (plan gaebu-v0-2, Decisions 2, 5–7) -----
+
+/// Root evidence quoted in `session`'s current prompt.
+fn hev(session: &str, seq: u64) -> Evidence {
+    Evidence {
+        session_id: session.into(),
+        ..ev(seq)
+    }
+}
+fn root_bu(s: &State) -> String {
+    s.teams.values().next().unwrap().root_bu.clone()
+}
+fn held(r: Result<ops::Outcome, gaebu::Error>) -> bool {
+    r.is_err_and(|e| e.reason == Reason::Held)
+}
+
+#[test]
+fn hold_guard_matrix() {
+    let (mut s, a, b, _) = setup();
+    let done = accept(&mut s, &a, &b);
+    let blocked = accept(&mut s, &a, &b);
+    ops::duty_progress(&mut s, 22, &b, &blocked, DutyStatus::Blocked, Some("stuck")).unwrap();
+    let proposed = ops::duty_issue(&mut s, 23, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    let declined = ops::duty_issue(&mut s, 23, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    let lease = ops::lease_acquire(&mut s, 24, &b, "src/a", LeaseMode::Exclusive, None, "w")
+        .unwrap()
+        .ids[0]
+        .clone();
+    for (i, d) in [&done, &blocked, &proposed, &declined]
+        .into_iter()
+        .enumerate()
+    {
+        ops::root_hold(
+            &mut s,
+            30,
+            &hev("root-session", 100 + i as u64),
+            d,
+            "대협 확인",
+        )
+        .unwrap();
+    }
+    // Refused for the assignee while held.
+    assert!(held(ops::duty_respond(
+        &mut s, 31, &b, &proposed, None, true, None
+    )));
+    assert!(held(ops::duty_progress(
+        &mut s,
+        31,
+        &b,
+        &done,
+        DutyStatus::Done,
+        None
+    )));
+    assert!(held(ops::duty_progress(
+        &mut s,
+        31,
+        &b,
+        &done,
+        DutyStatus::Blocked,
+        Some("x")
+    )));
+    assert!(held(ops::duty_progress(
+        &mut s,
+        31,
+        &b,
+        &done,
+        DutyStatus::HandedOff,
+        Some("x")
+    )));
+    assert!(held(ops::duty_progress(
+        &mut s,
+        31,
+        &b,
+        &blocked,
+        DutyStatus::Accepted,
+        None
+    )));
+    assert!(held(ops::lease_acquire(
+        &mut s,
+        31,
+        &b,
+        "src/b",
+        LeaseMode::Exclusive,
+        None,
+        "w"
+    )));
+    let err = ops::duty_progress(&mut s, 31, &b, &done, DutyStatus::Done, None).unwrap_err();
+    assert!(err.message.contains("대협 확인"), "{}", err.message);
+    // Allowed while held: letting go and asking.
+    ops::duty_respond(&mut s, 32, &b, &declined, None, false, Some("no")).unwrap();
+    ops::escalate(&mut s, 32, &b, Some(&done), "may I?").unwrap();
+    ops::record_add(&mut s, 32, &b, RecordKind::Note, &[], "noted").unwrap();
+    ops::lease_release(&mut s, 32, &b, &lease).unwrap();
+    // The superior may still amend and cancel; neither lifts the hold.
+    let v = s.duties[&done].version;
+    ops::duty_amend(&mut s, 33, &a, &done, v, spec()).unwrap();
+    assert!(s.duties[&done].hold.is_some());
+    ops::duty_cancel(&mut s, 33, &a, &blocked, "drop").unwrap();
+    assert!(s.duties[&blocked].hold.is_some());
+    // Released: back to what it was.
+    ops::root_release(&mut s, 34, &hev("root-session", 200), &done).unwrap();
+    assert!(
+        s.records
+            .iter()
+            .any(|r| r.kind == RecordKind::Decision && r.text.contains("released"))
+    );
+    assert_eq!(
+        s.duties[&done].status,
+        DutyStatus::Proposed,
+        "the amend asked again"
+    );
+    ops::duty_respond(&mut s, 35, &b, &done, None, true, None).unwrap();
+    ops::duty_progress(&mut s, 35, &b, &done, DutyStatus::Done, None).unwrap();
+}
+
+#[test]
+fn hold_needs_a_team_session_and_refuses_duplicates() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    let e = ops::root_hold(&mut s, 30, &hev("stranger", 1), &d, "later").unwrap_err();
+    assert_eq!(e.reason, Reason::NotMember);
+    let e = ops::root_hold(&mut s, 30, &hev("child-session", 1), &d, "").unwrap_err();
+    assert_eq!(e.reason, Reason::InvalidArgument);
+    // The assignee's own session may hold (the human spoke there).
+    ops::root_hold(&mut s, 30, &hev("child-session", 2), &d, "later").unwrap();
+    let e = ops::root_hold(&mut s, 31, &hev("root-session", 3), &d, "again").unwrap_err();
+    assert_eq!(e.reason, Reason::Conflict);
+    // Same prompt, same target: idempotent.
+    ops::root_hold(&mut s, 31, &hev("child-session", 2), &d, "later").unwrap();
+    let e = ops::root_release(&mut s, 32, &hev("root-session", 4), "d-999").unwrap_err();
+    assert_eq!(e.reason, Reason::NotFound);
+    ops::root_release(&mut s, 32, &hev("root-session", 5), &d).unwrap();
+    let e = ops::root_release(&mut s, 33, &hev("root-session", 6), &d).unwrap_err();
+    assert_eq!(e.reason, Reason::NotFound);
+}
+
+#[test]
+fn bu_hold_covers_descendant_duties() {
+    let (mut s, a, b, _) = setup();
+    ops::bu_open(&mut s, 15, &a, &b.member, None, &[], &[]).unwrap();
+    let d = accept(&mut s, &a, &b);
+    let rb = root_bu(&s);
+    assert_ne!(s.duties[&d].bu, rb, "duty lives in the child bu");
+    ops::root_hold(&mut s, 30, &hev("root-session", 1), &rb, "전체 대기").unwrap();
+    assert!(held(ops::duty_progress(
+        &mut s,
+        31,
+        &b,
+        &d,
+        DutyStatus::Done,
+        None
+    )));
+    ops::root_release(&mut s, 32, &hev("root-session", 2), &rb).unwrap();
+    ops::duty_progress(&mut s, 33, &b, &d, DutyStatus::Done, None).unwrap();
+}
+
+#[test]
+fn amend_keeps_hold() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    ops::root_hold(&mut s, 30, &hev("root-session", 1), &d, "wait").unwrap();
+    let v = s.duties[&d].version;
+    ops::duty_amend(&mut s, 31, &a, &d, v, spec()).unwrap();
+    assert_eq!(s.duties[&d].hold.as_ref().unwrap().until, "wait");
+    assert!(held(ops::duty_respond(
+        &mut s, 32, &b, &d, None, true, None
+    )));
+}
+
+#[test]
+fn nested_holds_release_independently() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    let rb = root_bu(&s);
+    ops::root_hold(&mut s, 30, &hev("root-session", 1), &d, "own").unwrap();
+    ops::root_hold(&mut s, 30, &hev("root-session", 2), &rb, "unit").unwrap();
+    let e = ops::duty_progress(&mut s, 31, &b, &d, DutyStatus::Done, None).unwrap_err();
+    assert!(
+        e.message.contains("own") && e.message.contains("(+1)"),
+        "{}",
+        e.message
+    );
+    ops::root_release(&mut s, 32, &hev("root-session", 3), &d).unwrap();
+    let e = ops::duty_progress(&mut s, 33, &b, &d, DutyStatus::Done, None).unwrap_err();
+    assert_eq!(e.reason, Reason::Held);
+    assert!(e.message.contains("unit"), "{}", e.message);
+    ops::root_release(&mut s, 34, &hev("root-session", 4), &rb).unwrap();
+    ops::duty_progress(&mut s, 35, &b, &d, DutyStatus::Done, None).unwrap();
+}
+
+#[test]
+fn lease_scope_excludes_held_duties() {
+    let (mut s, a, b, _) = setup();
+    let free = ops::duty_issue(
+        &mut s,
+        20,
+        &a,
+        &b.member,
+        DutySpec {
+            scope: vec!["docs/**".into()],
+            ..spec()
+        },
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    ops::duty_respond(&mut s, 21, &b, &free, None, true, None).unwrap();
+    let held_duty = accept(&mut s, &a, &b);
+    let renewable = ops::lease_acquire(&mut s, 22, &b, "src/r", LeaseMode::Exclusive, None, "w")
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::root_hold(&mut s, 30, &hev("root-session", 1), &held_duty, "확인 후").unwrap();
+    assert!(held(ops::lease_acquire(
+        &mut s,
+        31,
+        &b,
+        "src/x",
+        LeaseMode::Exclusive,
+        None,
+        "w"
+    )));
+    assert!(ops::lease_acquire(&mut s, 31, &b, "docs/x", LeaseMode::Exclusive, None, "w").is_ok());
+    let e =
+        ops::lease_acquire(&mut s, 31, &b, "other/x", LeaseMode::Exclusive, None, "w").unwrap_err();
+    assert_eq!(e.reason, Reason::OutOfScope);
+    assert!(held(ops::lease_renew(&mut s, 32, &b, &renewable, None)));
+}
+
+#[test]
+fn lease_expiry_keeps_hold() {
+    let (mut s, a, b, _) = setup();
+    let d = accept(&mut s, &a, &b);
+    ops::lease_acquire(&mut s, 22, &b, "src/a", LeaseMode::Exclusive, Some(10), "w").unwrap();
+    ops::root_hold(&mut s, 25, &hev("root-session", 1), &d, "wait").unwrap();
+    ops::expire_leases(&mut s, 1_000);
+    assert!(s.leases.is_empty());
+    assert!(s.duties[&d].hold.is_some());
+    assert!(held(ops::duty_progress(
+        &mut s,
+        1_001,
+        &b,
+        &d,
+        DutyStatus::Done,
+        None
+    )));
+}

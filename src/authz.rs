@@ -5,8 +5,8 @@
 
 use crate::error::{Reason, Result, refuse};
 use crate::model::{
-    Actor, BindingState, BuStatus, Grant, GrantStatus, Member, MemberStatus, State, TeamStatus,
-    Verb,
+    Actor, BindingState, BuStatus, Duty, Grant, GrantStatus, Hold, Member, MemberStatus, State,
+    TeamStatus, Verb,
 };
 use std::collections::BTreeSet;
 
@@ -88,6 +88,42 @@ pub fn bu_cancelled(st: &State, bu: &str) -> bool {
         next = b.parent.as_deref();
     }
     false
+}
+
+/// Every human hold covering `duty`: its own first, then its bu and the bus
+/// above it, nearest first. Holds are independent; any one keeps it held.
+pub fn holds<'a>(st: &'a State, duty: &'a Duty) -> Vec<&'a Hold> {
+    let mut out: Vec<&Hold> = duty.hold.iter().collect();
+    let mut next = Some(duty.bu.as_str());
+    let mut seen = BTreeSet::new();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            break;
+        }
+        let Some(b) = st.bus.get(id) else { break };
+        out.extend(b.hold.iter());
+        next = b.parent.as_deref();
+    }
+    out
+}
+
+/// Refuse `held` with the effective release condition when a hold covers
+/// `duty`.
+pub fn not_held(st: &State, duty: &Duty) -> Result<()> {
+    match holds(st, duty).as_slice() {
+        [] => Ok(()),
+        [first, rest @ ..] => {
+            let more = if rest.is_empty() {
+                String::new()
+            } else {
+                format!(" (+{})", rest.len())
+            };
+            refuse(
+                Reason::Held,
+                format!("duty {} is held until: {}{more}", duty.id, first.until),
+            )
+        }
+    }
 }
 
 /// Resolve the acting member and check it may act now: active member, bound

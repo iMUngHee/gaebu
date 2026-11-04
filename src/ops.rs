@@ -113,7 +113,7 @@ pub fn root_appoint(
             created_at: now,
         },
     );
-    root_done(st, now, key, &tid);
+    root_done(st, now, ev, key, &tid);
     changed(st, now, &mid, std::slice::from_ref(&mid), "root appointed");
     Ok(out("appointed; awaiting target hook", vec![mid, tid]))
 }
@@ -159,7 +159,7 @@ pub fn root_assign(
             alias,
             None,
         );
-        root_done(st, now, key, &commander.team);
+        root_done(st, now, ev, key, &commander.team);
         changed(
             st,
             now,
@@ -198,7 +198,7 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
         d.version += 1;
         d.updated_at = now;
     }
-    root_done(st, now, key, &m.team);
+    root_done(st, now, ev, key, &m.team);
     let author = authz::member_for_session(st, &ev.session_id)
         .filter(|actor| actor.team == m.team)
         .map(|actor| actor.id.clone())
@@ -250,7 +250,7 @@ pub fn root_cancel_team(st: &mut State, now: Ms, ev: &Evidence, team: &str) -> R
         &affected,
         &format!("team {} cancelled", t.id),
     );
-    root_done(st, now, key, &t.id);
+    root_done(st, now, ev, key, &t.id);
     Ok(out("team cancelled", vec![t.id]))
 }
 
@@ -273,7 +273,7 @@ pub fn root_rebind(
         .map(|actor| actor.id.clone())
         .unwrap_or_else(|| st.teams[&m.team].commander.clone());
     rebind(st, now, &author, &m.id, new_alias)?;
-    root_done(st, now, key, &m.team);
+    root_done(st, now, ev, key, &m.team);
     Ok(out("rebind pending", vec![m.id]))
 }
 
@@ -281,6 +281,138 @@ pub fn root_rebind(
 
 /// Called from the target session's hook: confirm a pending binding when the
 /// alias pager reports for `session_id` matches. Returns the member confirmed.
+/// Root directive: hold a duty (`d-…`) or a bu (`b-…`) and everything in it
+/// until the human lifts it. The caller's session must belong to the team.
+pub fn root_hold(
+    st: &mut State,
+    now: Ms,
+    ev: &Evidence,
+    target: &str,
+    until: &str,
+) -> Result<Outcome> {
+    let until = until.trim();
+    if until.is_empty() || until.chars().count() > 120 {
+        return refuse(Reason::InvalidArgument, "until must be 1-120 characters");
+    }
+    let key = root_key(ev, "hold", target);
+    if st.root_actions.contains_key(&key) {
+        return Ok(out("already held", vec![target.into()]));
+    }
+    let (team, author) = hold_target(st, ev, target)?;
+    let hold = crate::model::Hold {
+        evidence: ev.clone(),
+        until: until.into(),
+        at: now,
+    };
+    let slot = hold_slot(st, target)?;
+    if slot.is_some() {
+        return refuse(Reason::Conflict, "already held; release it first");
+    }
+    *slot = Some(hold);
+    root_done(st, now, ev, key, &team);
+    let affected = held_assignees(st, target);
+    changed(
+        st,
+        now,
+        &author,
+        &affected,
+        &format!("{target} held until: {until}"),
+    );
+    Ok(out("held", vec![target.into()]))
+}
+
+/// Root directive: lift the human hold on a duty or bu. Holds above or below
+/// it stay.
+pub fn root_release(st: &mut State, now: Ms, ev: &Evidence, target: &str) -> Result<Outcome> {
+    let key = root_key(ev, "release", target);
+    if st.root_actions.contains_key(&key) {
+        return Ok(out("already released", vec![target.into()]));
+    }
+    let (team, author) = hold_target(st, ev, target)?;
+    let Some(old) = hold_slot(st, target)?.take() else {
+        return refuse(Reason::NotFound, "no hold on target");
+    };
+    root_done(st, now, ev, key, &team);
+    let affected = held_assignees(st, target);
+    changed(
+        st,
+        now,
+        &author,
+        &affected,
+        &format!(
+            "{target} released (held for '{}', released for '{}')",
+            old.evidence.quote, ev.quote
+        ),
+    );
+    if let Some(r) = st.records.last_mut() {
+        r.kind = RecordKind::Decision;
+    }
+    Ok(out("released", vec![target.into()]))
+}
+
+/// The team of a hold target and the caller's member in it.
+fn hold_target(st: &State, ev: &Evidence, target: &str) -> Result<(String, String)> {
+    let team = if let Some(d) = st.duties.get(target) {
+        d.team.clone()
+    } else if let Some(b) = st.bus.get(target) {
+        b.team.clone()
+    } else {
+        return refuse(Reason::NotFound, "hold target must be a duty or bu id");
+    };
+    let caller = st
+        .members
+        .values()
+        .find(|m| {
+            m.team == team
+                && m.status == MemberStatus::Active
+                && m.binding.state == BindingState::Bound
+                && m.binding.session_id.as_deref() == Some(&ev.session_id)
+        })
+        .ok_or_else(|| Error::new(Reason::NotMember, "caller session is not in that team"))?;
+    Ok((team, caller.id.clone()))
+}
+
+fn hold_slot<'a>(st: &'a mut State, target: &str) -> Result<&'a mut Option<crate::model::Hold>> {
+    if let Some(d) = st.duties.get_mut(target) {
+        return Ok(&mut d.hold);
+    }
+    match st.bus.get_mut(target) {
+        Some(b) => Ok(&mut b.hold),
+        None => refuse(Reason::NotFound, "hold target must be a duty or bu id"),
+    }
+}
+
+/// Assignees of open duties the target covers (the duty, or every duty in
+/// the bu and the bus below it).
+fn held_assignees(st: &State, target: &str) -> Vec<String> {
+    let covered = |d: &Duty| {
+        if d.id == target {
+            return true;
+        }
+        let mut next = Some(d.bu.as_str());
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = next {
+            if id == target {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            next = st.bus.get(id).and_then(|b| b.parent.as_deref());
+        }
+        false
+    };
+    let mut out: Vec<String> = st
+        .duties
+        .values()
+        .filter(|d| duty_open(d.status) && covered(d))
+        .map(|d| d.assignee.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn confirm_binding(
     st: &mut State,
     now: Ms,
@@ -773,6 +905,9 @@ pub fn duty_respond(
     if !accept && note.is_none_or(|n| n.trim().is_empty()) {
         return refuse(Reason::InvalidArgument, "decline requires reason");
     }
+    if accept {
+        authz::not_held(st, &d)?;
+    }
     let d = st.duties.get_mut(duty).unwrap();
     d.status = if accept {
         DutyStatus::Accepted
@@ -826,6 +961,7 @@ pub fn duty_progress(
     {
         return refuse(Reason::InvalidArgument, "blocked/handoff requires note");
     }
+    authz::not_held(st, &d)?;
     let d = st.duties.get_mut(duty).unwrap();
     d.status = status;
     d.note = note.map(str::to_owned);
@@ -942,19 +1078,7 @@ pub fn lease_acquire(
     let a = authz::check_actor(st, actor)?.clone();
     let key = scope::parse(key)?;
     let key_text = key.as_string();
-    let scopes: Vec<_> = st
-        .duties
-        .values()
-        .filter(|d| {
-            d.assignee == a.id
-                && d.status == DutyStatus::Accepted
-                && !authz::bu_cancelled(st, &d.bu)
-        })
-        .flat_map(|d| d.scope.iter().cloned())
-        .collect();
-    if !scope::within(std::slice::from_ref(&key_text), &scopes)? {
-        return refuse(Reason::OutOfScope, "lease requires accepted duty scope");
-    }
+    lease_scope(st, &a.id, &key_text, "lease requires accepted duty scope")?;
     let ttl = ttl(ttl_ms)?;
     expire_leases(st, now);
     for l in st.leases.values().filter(|l| l.team == a.team) {
@@ -986,6 +1110,39 @@ pub fn lease_acquire(
     Ok(out("lease acquired", vec![id]))
 }
 
+/// A lease key must sit inside an accepted duty of `member` that no hold
+/// covers. Inside only held duties it is refused `held`; elsewhere
+/// `out_of_scope`.
+fn lease_scope(st: &State, member: &str, key: &str, missing: &str) -> Result<()> {
+    let accepted: Vec<_> = st
+        .duties
+        .values()
+        .filter(|d| {
+            d.assignee == member
+                && d.status == DutyStatus::Accepted
+                && !authz::bu_cancelled(st, &d.bu)
+        })
+        .collect();
+    let (held, free): (Vec<_>, Vec<_>) = accepted
+        .into_iter()
+        .partition(|d| !authz::holds(st, d).is_empty());
+    let scopes =
+        |ds: &[&Duty]| -> Vec<String> { ds.iter().flat_map(|d| d.scope.iter().cloned()).collect() };
+    let key = std::slice::from_ref(&key.to_owned()).to_vec();
+    if scope::within(&key, &scopes(&free))? {
+        return Ok(());
+    }
+    for d in &held {
+        if scope::within(&key, &d.scope)? {
+            return authz::not_held(st, d);
+        }
+    }
+    if scope::within(&key, &scopes(&held))? {
+        return refuse(Reason::Held, "lease scope lies in held duties");
+    }
+    refuse(Reason::OutOfScope, missing)
+}
+
 pub fn lease_renew(
     st: &mut State,
     now: Ms,
@@ -1006,19 +1163,7 @@ pub fn lease_renew(
     if l.expires_at <= now {
         return refuse(Reason::Conflict, "lease expired");
     }
-    let scopes: Vec<_> = st
-        .duties
-        .values()
-        .filter(|d| {
-            d.assignee == a.id
-                && d.status == DutyStatus::Accepted
-                && !authz::bu_cancelled(st, &d.bu)
-        })
-        .flat_map(|d| d.scope.iter().cloned())
-        .collect();
-    if !scope::within(std::slice::from_ref(&l.key), &scopes)? {
-        return refuse(Reason::OutOfScope, "accepted duty no longer covers lease");
-    }
+    lease_scope(st, &a.id, &l.key, "accepted duty no longer covers lease")?;
     st.leases.get_mut(lease).unwrap().expires_at = now.saturating_add(ttl);
     changed(st, now, &a.id, &[], "lease renewed");
     Ok(out("lease renewed", vec![lease.into()]))
@@ -1297,14 +1442,14 @@ fn out(summary: &str, ids: Vec<String>) -> Outcome {
 fn root_key(ev: &Evidence, action: &str, target: &str) -> String {
     format!("{}:{}:{action}:{target}", ev.session_id, ev.prompt_seq)
 }
-fn root_done(st: &mut State, now: Ms, key: String, team: &str) {
+fn root_done(st: &mut State, now: Ms, ev: &Evidence, key: String, team: &str) {
     st.root_actions.insert(
         key,
         RootAction {
             team: team.into(),
             rev: st.rev.saturating_add(1),
             at: now,
-            evidence: None,
+            evidence: Some(ev.clone()),
         },
     );
 }

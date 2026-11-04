@@ -59,6 +59,9 @@ enum Cmd {
         title: Option<String>,
         #[arg(long)]
         evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     /// Root directive: put aliases under a commander.
     Assign {
@@ -67,18 +70,27 @@ enum Cmd {
         to: String,
         #[arg(long)]
         evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     /// Root directive: dismiss a member (revokes everything below it).
     Dismiss {
         alias: String,
         #[arg(long)]
         evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     /// Root directive: cancel a whole team.
     CancelTeam {
         team: String,
         #[arg(long)]
         evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     /// Re-point a member at a new alias. With --evidence it is a root
     /// directive; without, it needs `reassign` over the member.
@@ -88,6 +100,31 @@ enum Cmd {
         alias: String,
         #[arg(long)]
         evidence: Option<String>,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
+    },
+    /// Root directive: hold a duty (`d-…`) or a bu (`b-…`) until the human
+    /// lifts it. Questions and automated feedback never lift a hold.
+    Hold {
+        target: String,
+        /// The release condition, in the user's terms (1-120 characters).
+        #[arg(long)]
+        until: String,
+        #[arg(long)]
+        evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
+    },
+    /// Root directive: lift the human hold on a duty or bu.
+    Release {
+        target: String,
+        #[arg(long)]
+        evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     /// Open, close or cancel a bu (부).
     #[command(subcommand)]
@@ -499,6 +536,7 @@ fn root_op(
     pager: &dyn Pager,
     json: bool,
     quote: &str,
+    explicit: bool,
     f: impl FnOnce(&mut State, u64, &crate::model::Evidence) -> Result<Outcome>,
 ) -> Result<()> {
     let caller = mutating_caller(pager)?;
@@ -508,13 +546,18 @@ fn root_op(
     // Checked twice: once to fail fast, and again under the state lock so a
     // Stop, peer prompt or missed prompt recorded meanwhile still wins.
     let verify = || -> Result<crate::model::Evidence> {
-        let ev = evidence::current_turn_evidence(
+        let mut ev = evidence::current_turn_evidence(
             &caller.session_id,
             &log.events()?,
             &log.composers()?,
             quote,
             now_ms(),
         )?;
+        ev.strength = if explicit {
+            crate::model::Strength::Explicit
+        } else {
+            crate::model::Strength::Inferred
+        };
         // A prompt the hook could not record (in this session, or in a hook
         // that could not even tell which session it was) may have arrived
         // after the quoted one; then the quoted prompt is not the current turn.
@@ -960,9 +1003,10 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             project,
             title,
             evidence,
+            explicit,
         } => {
             let store = open_store()?;
-            root_op(&store, pager, json, &evidence, |st, now, ev| {
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
                 ops::root_appoint(
                     st,
                     now,
@@ -978,32 +1022,63 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             aliases,
             to,
             evidence,
+            explicit,
         } => {
             let store = open_store()?;
-            root_op(&store, pager, json, &evidence, |st, now, ev| {
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
                 ops::root_assign(st, now, ev, &aliases, &to)
             })
         }
-        Cmd::Dismiss { alias, evidence } => {
+        Cmd::Dismiss {
+            alias,
+            evidence,
+            explicit,
+        } => {
             let store = open_store()?;
-            root_op(&store, pager, json, &evidence, |st, now, ev| {
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
                 ops::root_dismiss(st, now, ev, &alias)
             })
         }
-        Cmd::CancelTeam { team, evidence } => {
+        Cmd::CancelTeam {
+            team,
+            evidence,
+            explicit,
+        } => {
             let store = open_store()?;
-            root_op(&store, pager, json, &evidence, |st, now, ev| {
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
                 ops::root_cancel_team(st, now, ev, &team)
+            })
+        }
+        Cmd::Hold {
+            target,
+            until,
+            evidence,
+            explicit,
+        } => {
+            let store = open_store()?;
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
+                ops::root_hold(st, now, ev, &target, &until)
+            })
+        }
+        Cmd::Release {
+            target,
+            evidence,
+            explicit,
+        } => {
+            let store = open_store()?;
+            root_op(&store, pager, json, &evidence, explicit, |st, now, ev| {
+                ops::root_release(st, now, ev, &target)
             })
         }
         Cmd::Rebind {
             member,
             alias,
             evidence,
+            explicit,
         } => {
             let store = open_store()?;
             match evidence {
-                Some(q) => root_op(&store, pager, json, &q, |st, now, ev| {
+                Some(q) => root_op(&store, pager, json, &q, explicit, |st, now, ev| {
                     let m = resolve_member(st, None, &member)?;
                     ops::root_rebind(st, now, ev, &m, &alias)
                 }),
