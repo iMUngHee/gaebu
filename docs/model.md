@@ -109,6 +109,15 @@ Paths are project-relative, use `/`, and are compared lowercased. Anything else
 is `invalid_scope`, including empty segments, `.`, `..`, `\`, `:`, a leading
 `/`, and any other wildcard. The root grant's scope is `["**", "res:**"]`.
 
+`a/b` names one path, so a duty scoped `src` does not cover `src/a.rs`: write
+`src/**`. `**` covers paths only, so a resource lease needs `res:<name>` or
+`res:**` in an accepted duty's scope. Delegating `assign`, `amend`, `cancel`
+or `arbitrate` over no scope is refused `invalid_argument`, since every later
+use would be refused; `open` and `reassign` also work unscoped. A duty may
+have no scope, but its assignee then takes no lease. An `out_of_scope`
+refusal names the requested patterns and what the grant or the accepted
+duties allow.
+
 ## Notices
 
 Every change is a team record. Only a change its recipient must act on

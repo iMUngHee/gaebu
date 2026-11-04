@@ -574,6 +574,7 @@ pub fn bu_open(
     scope: &[String],
 ) -> Result<Outcome> {
     let a = authz::check_actor(st, actor)?.clone();
+    scope_for_verbs(verbs, scope)?;
     authz::require(st, &a.id, Verb::Open, scope)?;
     let h = find_member(st, head)?.clone();
     below(st, &a, &h)?;
@@ -868,6 +869,7 @@ pub fn grant(
         return refuse(Reason::InvalidArgument, "empty grant verbs");
     }
     let scope = scope::normalize_list(scope)?;
+    scope_for_verbs(verbs, &scope)?;
     for verb in verbs {
         authz::require(st, &a.id, *verb, &scope)?;
     }
@@ -999,7 +1001,14 @@ pub fn duty_issue(
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
     changed(st, now, &a.id, &[m.id], &message, Notify::Act);
-    Ok(out("duty issued", vec![id]))
+    Ok(out(
+        if st.duties[&id].scope.is_empty() {
+            "duty issued (no scope: the assignee can take no lease)"
+        } else {
+            "duty issued"
+        },
+        vec![id],
+    ))
 }
 
 /// Assignee accepts (`accept = true`) or declines with a reason.
@@ -1273,7 +1282,19 @@ fn lease_scope(st: &State, member: &str, key: &str, missing: &str) -> Result<()>
     if scope::within(&key, &scopes(&held))? {
         return refuse(Reason::Held, "lease scope lies in held duties");
     }
-    refuse(Reason::OutOfScope, missing)
+    if free.is_empty() && held.is_empty() {
+        return refuse(
+            Reason::OutOfScope,
+            format!(
+                "{missing}: no accepted duty; accept one whose scope covers {}",
+                key[0]
+            ),
+        );
+    }
+    refuse(
+        Reason::OutOfScope,
+        format!("{missing}: {}", scope::explain(&key, &scopes(&free))),
+    )
 }
 
 pub fn lease_renew(
@@ -1682,6 +1703,31 @@ fn root_done(st: &mut State, now: Ms, ev: &Evidence, key: String, team: &str) {
             evidence: Some(ev.clone()),
         },
     );
+}
+/// Assign, amend, cancel and arbitrate are checked against the grant's scope
+/// at every use, so delegating them over no scope would only leave a grant
+/// that refuses everything later. Reassign and open also work unscoped.
+fn scope_for_verbs(verbs: &[Verb], scope: &[String]) -> Result<()> {
+    let scoped: Vec<String> = verbs
+        .iter()
+        .filter(|v| {
+            matches!(
+                v,
+                Verb::Assign | Verb::Amend | Verb::Cancel | Verb::Arbitrate
+            )
+        })
+        .map(|v| format!("{v:?}").to_lowercase())
+        .collect();
+    if scope.is_empty() && !scoped.is_empty() {
+        return refuse(
+            Reason::InvalidArgument,
+            format!(
+                "{} need a scope: pass --scope, e.g. src/** or res:<name>",
+                scoped.join(", ")
+            ),
+        );
+    }
+    Ok(())
 }
 fn newer(ev: &Evidence, at: Ms) -> Result<()> {
     if ev.at <= at {
