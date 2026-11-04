@@ -1,6 +1,8 @@
 //! Replays hook payloads captured from an installed Claude Code (2.1.302)
 //! through `gaebu hook`. Session ids and paths are redacted in the fixtures.
 
+mod common;
+
 use gaebu::error::Result;
 use gaebu::model::Tool;
 use gaebu::pager::{HostStatus, Pager, WhoAmI};
@@ -25,7 +27,7 @@ impl Pager for NoPager {
     }
 }
 
-fn home() -> std::path::PathBuf {
+fn home() -> common::RemoveOnDrop {
     let p = std::env::temp_dir().join(format!(
         "gaebu-captured-{}-{}",
         std::process::id(),
@@ -35,7 +37,7 @@ fn home() -> std::path::PathBuf {
             .as_nanos()
     ));
     std::fs::create_dir_all(&p).unwrap();
-    p
+    common::RemoveOnDrop(p)
 }
 
 fn replay(store: &Store, fixture: &str) -> String {
@@ -53,7 +55,7 @@ fn replay(store: &Store, fixture: &str) -> String {
 #[test]
 fn captured_claude_payloads_replay_cleanly() {
     let dir = home();
-    let store = Store::open(&dir).unwrap();
+    let store = Store::open(&dir.0).unwrap();
 
     // A non-member session: SessionStart and Stop print nothing.
     assert_eq!(
@@ -80,6 +82,4 @@ fn captured_claude_payloads_replay_cleanly() {
         prompt.text.as_deref(),
         Some("Reply with the single word OK.")
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

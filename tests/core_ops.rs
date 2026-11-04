@@ -1,3 +1,5 @@
+mod common;
+
 use gaebu::{
     Reason, authz,
     model::*,
@@ -344,6 +346,7 @@ fn concurrent_cancel_vs_issue_is_serialized() {
         time::Duration,
     };
     let home = std::env::temp_dir().join(format!("gaebu-cancel-race-{}", std::process::id()));
+    let _cleanup = common::RemoveOnDrop(home.clone());
     std::fs::create_dir_all(&home).unwrap();
     for n in 0..100 {
         let path = home.join(n.to_string());
@@ -391,7 +394,6 @@ fn concurrent_cancel_vs_issue_is_serialized() {
                 .all(|d| d.status == DutyStatus::Cancelled)
         );
     }
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]
@@ -1369,6 +1371,7 @@ fn escalations_reroute_after_commit() {
             std::process::id(),
             now_ms()
         ));
+        let _cleanup = common::RemoveOnDrop(home.clone());
         let store = Store::open(&home).unwrap();
         store
             .transact(Duration::from_secs(5), |st| {
@@ -1391,7 +1394,6 @@ fn escalations_reroute_after_commit() {
                 "{name}: no live superior or asker → the user's queue"
             );
         }
-        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

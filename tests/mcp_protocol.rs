@@ -1,3 +1,5 @@
+mod common;
+
 use gaebu::pager::{HostStatus, Pager, WhoAmI};
 use gaebu::{Reason, Result};
 use serde_json::{Value, json};
@@ -26,10 +28,9 @@ fn exchange(messages: &[Value]) -> Vec<Value> {
         gaebu::model::now_ms(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let _cleanup = common::RemoveOnDrop(home.clone());
     let store = gaebu::store::Store::open(&home).unwrap();
-    let result = exchange_on(&store, &FakePager, messages);
-    std::fs::remove_dir_all(&home).unwrap();
-    result
+    exchange_on(&store, &FakePager, messages)
 }
 
 fn exchange_on(store: &gaebu::store::Store, pager: &dyn Pager, messages: &[Value]) -> Vec<Value> {
@@ -117,6 +118,7 @@ fn mcp_parse_error_then_next_line_recovers() {
         std::process::id(),
         gaebu::model::now_ms()
     ));
+    let _cleanup = common::RemoveOnDrop(home.clone());
     let store = gaebu::store::Store::open(&home).unwrap();
     let mut out = Vec::new();
     gaebu::mcp::serve(
@@ -134,7 +136,6 @@ fn mcp_parse_error_then_next_line_recovers() {
     assert_eq!(values.len(), 2);
     assert_eq!(values[0]["error"]["code"], -32700);
     assert_eq!(values[1]["result"], json!({}));
-    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -184,6 +185,7 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
         std::process::id(),
         now_ms()
     ));
+    let _cleanup = common::RemoveOnDrop(home.clone());
     let store = gaebu::store::Store::open(&home).unwrap();
     store
         .transact(std::time::Duration::from_secs(1), |st| {
@@ -272,7 +274,6 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
     let refusal: Value =
         serde_json::from_str(reply[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(refusal["reason"], "cancelled");
-    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -302,6 +303,7 @@ fn escalation_withdraw_tool() {
         std::process::id(),
         now_ms()
     ));
+    let _cleanup = common::RemoveOnDrop(home.clone());
     let store = gaebu::store::Store::open(&home).unwrap();
     store
         .transact(std::time::Duration::from_secs(1), |st| {
@@ -420,5 +422,4 @@ fn escalation_withdraw_tool() {
         store.read().unwrap().escalations[&esc].status,
         EscalationStatus::Withdrawn
     );
-    let _ = std::fs::remove_dir_all(&home);
 }
