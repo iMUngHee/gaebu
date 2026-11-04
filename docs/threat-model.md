@@ -107,7 +107,11 @@ repository roots are outside v0.
 
 State mutation uses an OS file lock and durable replacement; reads can use the
 previous generation with a warning after corruption. Writes refuse corrupt
-current state. Per-session logs use their own locks. Those mechanisms coordinate
+current state. A state written by a newer schema is refused as unsupported,
+with no fallback and no repair over it. The schema-2 migration keeps the
+schema-1 original in `state.v1.json` and writes the previous generation as v2
+first, so a gaebu 0.1 binary fails closed rather than reading a stale v1 state.
+Per-session logs use their own locks. Those mechanisms coordinate
 cooperative writers and do not prevent a same-user process bypassing the engine.
 
 Leases are advisory reservations, not filesystem edit guards. Duty completion
@@ -125,3 +129,25 @@ is the length of one in-memory operation. Notices are delivered at least once:
 a notice leaves the outbox only after pager accepted it, so a crash between
 sending and bookkeeping can deliver it twice but never drops it silently.
 
+
+## Holds, sources and strength
+
+A hold, like every root directive, rests on a quote of the caller session's
+current user prompt. Any session bound in the target's team may set or lift a
+hold on any duty or bu of that team: the model has one human, and where they
+spoke does not change who they are. A peer that can forge prompts can forge a
+hold too (see the forgery section above).
+
+A duty's `source` is matched against the user prompts the hook recorded in the
+issuer's own session. The log keeps the last 50 user prompts and up to 4 KB of
+each, so an older or later-cut quote is refused. A source records which words
+a duty answers; it grants no authority.
+
+`strength` is the calling agent's own judgement of how directly the user's
+words named the action and target. Gaebu records it and shows inferred root
+authority as 가절월(추론); it does not verify the judgement or refuse inferred
+directives.
+
+Notices are an attention budget, not a delivery guarantee for every change:
+Record changes reach a member on its next card, not through pager. Dedupe
+compares text only while a notice is still queued.
