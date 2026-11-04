@@ -83,6 +83,14 @@ Or from a checkout: `scripts/install.sh` (macOS/Linux) or
 `scripts/install.ps1` (Windows). Both build a release binary into
 `~/.local/bin`.
 
+On Windows without the Visual Studio Build Tools (the MSVC linker), build with
+the GNU toolchain, which needs no external linker for gaebu's dependencies:
+
+```sh
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+cargo +stable-x86_64-pc-windows-gnu install --git https://github.com/iMUngHee/gaebu --locked
+```
+
 ### Upgrading from 0.1
 
 0.2 stores schema 2. The first command after the upgrade migrates
@@ -133,6 +141,14 @@ command = "gaebu hook codex"
 command = "gaebu"
 args = ["mcp"]
 ```
+
+Codex runs a newly added hook only after you trust it: open the interactive
+`codex`, which reports that hooks need review, and approve the three
+`gaebu hook codex` entries with `/hooks`. Until then `codex exec` skips them
+without a message. Trust is stored per machine in `~/.codex/config.toml`
+(`[hooks.state.*].trusted_hash`). On Windows, a hook that Codex starts through
+PowerShell must read its stdin as UTF-8, or non-ASCII prompts arrive garbled and
+root directives quoting them are refused.
 
 ## Everyday commands
 
