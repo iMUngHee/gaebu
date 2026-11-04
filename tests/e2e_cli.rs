@@ -665,3 +665,164 @@ fn source_from_other_session_refused() {
     assert_eq!(gaebu(&pager, &amend), 0);
     assert_eq!(store.read().unwrap().duties[&lint.id].source, lint.source);
 }
+
+fn mcp_board(store: &Store, pager: &FakePager, thread: &str) -> gaebu::card::BoardView {
+    let input = format!(
+        "{}\n",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"board","arguments":{},"_meta":{"threadId":thread}}})
+    );
+    let mut out = Vec::new();
+    gaebu::mcp::serve(&mut std::io::Cursor::new(input), &mut out, store, pager).unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// Stage of every duty in a board view.
+fn board_stages(v: &gaebu::card::BoardView) -> Vec<(String, gaebu::card::Stage)> {
+    let mut out: Vec<_> = v
+        .teams
+        .iter()
+        .flat_map(|t| &t.bus)
+        .flat_map(|b| &b.members)
+        .flat_map(|m| &m.duties)
+        .map(|d| (d.id.clone(), d.stage))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn board_and_card_agree_on_stage() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    let held = team_with_duty(&store, &pager);
+    pager.as_session("s-gapu");
+    let issue = [
+        "duty",
+        "issue",
+        "--to",
+        "nawi",
+        "--outcome",
+        "o",
+        "--scope",
+        "src/scope.rs",
+        "--rights",
+        "r",
+        "--done",
+        "d",
+    ];
+    assert_eq!(gaebu(&pager, &issue), 0);
+    assert_eq!(gaebu(&pager, &issue), 0);
+    assert_eq!(gaebu(&pager, &issue), 0);
+    let st = store.read().unwrap();
+    let mut ids: Vec<_> = st.duties.keys().filter(|d| **d != held).cloned().collect();
+    ids.sort();
+    drop(st);
+    user_says(&store, "s-gapu", "첫 소임은 멈춰 둬");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "hold",
+                &held,
+                "--until",
+                "확인 후",
+                "--evidence",
+                "첫 소임은 멈춰 둬"
+            ]
+        ),
+        0
+    );
+    pager.as_session("s-nawi");
+    assert_eq!(gaebu(&pager, &["duty", "accept", &ids[0]]), 0);
+    assert_eq!(
+        gaebu(&pager, &["escalate", "which file?", "--duty", &ids[0]]),
+        0
+    );
+    assert_eq!(gaebu(&pager, &["duty", "accept", &ids[2]]), 0);
+    for quiet in [false, true] {
+        if quiet {
+            // nawi's session goes quiet: accepted duties turn into 자리 빔.
+            store
+                .session("s-nawi")
+                .update_sighting(|s| s.last_seen = Some(gaebu::model::now_ms() - 3 * 3_600_000))
+                .unwrap();
+        }
+        let st = store.read().unwrap();
+        let now = gaebu::model::now_ms();
+        let nawi = st
+            .members
+            .values()
+            .find(|m| m.binding.alias == "nawi")
+            .unwrap();
+        let card = gaebu::card::build(&st, &nawi.id, now, store.last_seen("s-nawi")).unwrap();
+        let mut from_card: Vec<_> = card
+            .duties
+            .iter()
+            .map(|d| (d.id.clone(), d.stage))
+            .collect();
+        from_card.sort();
+        let cli = gaebu::card::board(&st, now, None, &|sid| store.last_seen(sid));
+        let mcp = mcp_board(&store, &pager, "s-gapu");
+        assert_eq!(board_stages(&cli), from_card, "quiet={quiet}");
+        assert_eq!(board_stages(&mcp), from_card, "quiet={quiet}");
+        use gaebu::card::Stage;
+        let worked = if quiet { Stage::Vacant } else { Stage::Working };
+        assert!(
+            from_card.contains(&(ids[2].clone(), worked)),
+            "{from_card:?}"
+        );
+        assert!(from_card.contains(&(held.clone(), Stage::Held)));
+        assert!(from_card.contains(&(ids[0].clone(), Stage::AwaitingAnswer)));
+        assert!(from_card.contains(&(ids[1].clone(), Stage::AwaitingAcceptance)));
+    }
+}
+
+#[test]
+fn board_since_detects_quiet_transition() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    team_with_duty(&store, &pager);
+    store
+        .session("s-nawi")
+        .update_sighting(|s| s.last_seen = Some(gaebu::model::now_ms()))
+        .unwrap();
+    let st = store.read().unwrap();
+    let before = gaebu::card::board(&st, gaebu::model::now_ms(), None, &|sid| {
+        store.last_seen(sid)
+    });
+    let again = gaebu::card::board(&st, gaebu::model::now_ms(), None, &|sid| {
+        store.last_seen(sid)
+    });
+    assert_eq!(before.token, again.token, "nothing changed: same token");
+    // No commit at all, only time: nawi falls quiet.
+    store
+        .session("s-nawi")
+        .update_sighting(|s| s.last_seen = Some(gaebu::model::now_ms() - 3 * 3_600_000))
+        .unwrap();
+    let st = store.read().unwrap();
+    let after = gaebu::card::board(&st, gaebu::model::now_ms(), None, &|sid| {
+        store.last_seen(sid)
+    });
+    assert_eq!(after.rev, before.rev);
+    assert_ne!(
+        after.token, before.token,
+        "a quiet transition must not read as unchanged"
+    );
+    let stages = board_stages(&after);
+    assert!(
+        stages.iter().all(|(_, s)| *s == gaebu::card::Stage::Vacant),
+        "{stages:?}"
+    );
+    // The CLI answers `unchanged` only for the current token.
+    assert_eq!(
+        gaebu(&pager, &["--json", "board", "--since", &before.token]),
+        0
+    );
+    assert_eq!(
+        gaebu(&pager, &["--json", "board", "--since", &after.token]),
+        0
+    );
+}

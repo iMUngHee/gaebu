@@ -44,9 +44,9 @@ enum Cmd {
     },
     /// Show the whole roster (명부).
     Board {
-        /// Print nothing but `unchanged` when the store rev is not newer.
+        /// Print nothing but `unchanged` when the board still has this token.
         #[arg(long)]
-        since: Option<u64>,
+        since: Option<String>,
     },
     /// Root directive: give 가절월 to a pager alias (quote the user's words).
     Appoint {
@@ -768,139 +768,28 @@ fn team_of(st: &State, actor: &Actor) -> Option<String> {
     st.members.get(&actor.member).map(|m| m.team.clone())
 }
 
-#[derive(Serialize)]
-struct BoardView {
-    rev: u64,
-    teams: Vec<BoardTeam>,
-    user_queue: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct BoardTeam {
-    id: String,
-    name: String,
-    status: String,
-    commander: String,
-    bus: Vec<BoardBu>,
-}
-
-#[derive(Serialize)]
-struct BoardBu {
-    id: String,
-    name: String,
-    status: String,
-    head: String,
-    parent: Option<String>,
-    members: Vec<BoardMember>,
-}
-
-#[derive(Serialize)]
-struct BoardMember {
-    id: String,
-    display: String,
-    alias: String,
-    title: String,
-    binding: String,
-    duties: Vec<String>,
-    leases: Vec<String>,
-}
-
-fn board_view(st: &State, now: u64) -> BoardView {
-    let teams = st
-        .teams
-        .values()
-        .map(|t| {
-            let bus = st
-                .bus
-                .values()
-                .filter(|b| b.team == t.id)
-                .map(|b| BoardBu {
-                    id: b.id.clone(),
-                    name: b.name.clone(),
-                    status: format!("{:?}", b.status).to_lowercase(),
-                    head: st
-                        .members
-                        .get(&b.head)
-                        .map(|m| card::display(st, m))
-                        .unwrap_or_default(),
-                    parent: b.parent.clone(),
-                    members: st
-                        .members
-                        .values()
-                        .filter(|m| m.bu == b.id && m.status == MemberStatus::Active)
-                        .map(|m| BoardMember {
-                            id: m.id.clone(),
-                            display: card::display(st, m),
-                            alias: m.binding.alias.clone(),
-                            title: m.title.clone(),
-                            binding: format!("{:?}", m.binding.state).to_lowercase(),
-                            duties: st
-                                .duties
-                                .values()
-                                .filter(|d| {
-                                    d.assignee == m.id
-                                        && !matches!(
-                                            d.status,
-                                            DutyStatus::Done
-                                                | DutyStatus::Cancelled
-                                                | DutyStatus::Declined
-                                        )
-                                })
-                                .map(|d| {
-                                    format!(
-                                        "{} [{}] {}",
-                                        d.id,
-                                        format!("{:?}", d.status).to_lowercase(),
-                                        d.outcome
-                                    )
-                                })
-                                .collect(),
-                            leases: st
-                                .leases
-                                .values()
-                                .filter(|l| l.holder == m.id && l.expires_at > now)
-                                .map(|l| l.key.clone())
-                                .collect(),
-                        })
-                        .collect(),
-                })
-                .collect();
-            BoardTeam {
-                id: t.id.clone(),
-                name: t.name.clone(),
-                status: format!("{:?}", t.status).to_lowercase(),
-                commander: st
-                    .members
-                    .get(&t.commander)
-                    .map(|m| format!("가절월을 받은 {}", card::display(st, m)))
-                    .unwrap_or_default(),
-                bus,
-            }
-        })
-        .collect();
-    let user_queue = st
-        .escalations
-        .values()
-        .filter(|e| e.to.is_none() && e.status == crate::model::EscalationStatus::Open)
-        .map(|e| format!("{}: {}", e.id, e.question))
-        .collect();
-    BoardView {
-        rev: st.rev,
-        teams,
-        user_queue,
-    }
-}
-
-fn print_board(v: &BoardView) {
+fn print_board(v: &card::BoardView) {
     println!("[개부 명부] rev {}", v.rev);
     for t in &v.teams {
         println!("팀 {} ({}) — {}", t.name, t.status, t.commander);
         for b in &t.bus {
-            println!("  {} [{}] 장: {}", b.name, b.status, b.head);
+            match &b.hold {
+                Some(until) => println!(
+                    "  {} [{}] 장: {} · 보류 — {until}",
+                    b.name, b.status, b.head
+                ),
+                None => println!("  {} [{}] 장: {}", b.name, b.status, b.head),
+            }
             for m in &b.members {
                 println!("    {} · {}", m.display, m.binding);
                 for d in &m.duties {
-                    println!("      소임 {d}");
+                    match &d.hold {
+                        Some(until) => println!(
+                            "      소임 {} [{}] {} — {until}",
+                            d.id, d.stage_label, d.outcome
+                        ),
+                        None => println!("      소임 {} [{}] {}", d.id, d.stage_label, d.outcome),
+                    }
                 }
                 for l in &m.leases {
                     println!("      점유 {l}");
@@ -1007,17 +896,18 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 eprintln!("gaebu: binding refresh skipped: {e}");
             }
             let st = store.read()?;
-            if let Some(s) = since
-                && st.rev <= s
-            {
+            let v = card::board(&st, now_ms(), None, &|sid| store.last_seen(sid));
+            if since.as_deref() == Some(v.token.as_str()) {
                 if json {
-                    println!("{}", serde_json::json!({"rev": st.rev, "unchanged": true}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"rev": v.rev, "token": v.token, "unchanged": true})
+                    );
                 } else {
-                    println!("unchanged (rev {})", st.rev);
+                    println!("unchanged (rev {})", v.rev);
                 }
                 return Ok(());
             }
-            let v = board_view(&st, now_ms());
             if json {
                 print_json(&v);
             } else {

@@ -207,10 +207,9 @@ fn call(
             return serde_json::to_value(card)
                 .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()));
         }
-        return Ok(json!({"rev":st.rev,"team":st.teams.get(&member.team),
-            "bus":st.bus.values().filter(|b| b.team == member.team).collect::<Vec<_>>(),
-            "members":st.members.values().filter(|m| m.team == member.team).collect::<Vec<_>>(),
-            "duties":st.duties.values().filter(|d| d.team == member.team).collect::<Vec<_>>() }));
+        let view = card::board(&st, now, Some(&member.team), &|sid| store.last_seen(sid));
+        return serde_json::to_value(view)
+            .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()));
     }
     let outcome = store.transact(crate::store::CLI_DEADLINE, |st| {
         ops::expire_leases(st, now);

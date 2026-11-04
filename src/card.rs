@@ -5,8 +5,8 @@
 //! Everything else is a `gaebu board` query away.
 
 use crate::model::{
-    BindingState, BuStatus, DutyStatus, EscalationStatus, Member, MemberStatus, Ms, State,
-    TeamStatus,
+    BindingState, BuStatus, Duty, DutyStatus, EscalationStatus, Member, MemberStatus, Ms, State,
+    Strength, TeamStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,14 +39,129 @@ pub struct Card {
     pub hash: String,
 }
 
+/// Where a duty stands, decided by the first matching row (plan gaebu-v0-2,
+/// Decision 11). The card, `gaebu board` and MCP `me`/`board` all read it
+/// from `duty_view`, so they never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// 1. Done, declined, cancelled, handed off, or its bu is cancelled.
+    Ended,
+    /// 2. A human hold covers it.
+    Held,
+    /// 3. Its assignee has an open escalation on it.
+    AwaitingAnswer,
+    /// 4. Proposed, not yet accepted.
+    AwaitingAcceptance,
+    /// 5. Blocked.
+    Blocked,
+    /// 6. Accepted, but the assignee's seat cannot answer (vacant, pending
+    ///    or quiet).
+    Vacant,
+    /// 7. Accepted and being worked.
+    Working,
+}
+
+impl Stage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Ended => "종료",
+            Stage::Held => "보류",
+            Stage::AwaitingAnswer => "답변 대기",
+            Stage::AwaitingAcceptance => "수락 대기",
+            Stage::Blocked => "막힘",
+            Stage::Vacant => "자리 빔",
+            Stage::Working => "진행",
+        }
+    }
+    /// Panel order: what needs a person first, ended last.
+    pub fn rank(self) -> u8 {
+        match self {
+            Stage::Held => 0,
+            Stage::AwaitingAnswer => 1,
+            Stage::AwaitingAcceptance => 2,
+            Stage::Blocked => 3,
+            Stage::Vacant => 4,
+            Stage::Working => 5,
+            Stage::Ended => 6,
+        }
+    }
+}
+
+/// The stage of `duty`; `assignee_seen` is the assignee session's last hook
+/// sighting, when known.
+pub fn stage(st: &State, duty: &Duty, now: Ms, assignee_seen: Option<Ms>) -> Stage {
+    if !matches!(
+        duty.status,
+        DutyStatus::Proposed | DutyStatus::Accepted | DutyStatus::Blocked
+    ) || crate::authz::bu_cancelled(st, &duty.bu)
+    {
+        return Stage::Ended;
+    }
+    if !crate::authz::holds(st, duty).is_empty() {
+        return Stage::Held;
+    }
+    if st.escalations.values().any(|e| {
+        e.status == EscalationStatus::Open
+            && e.from == duty.assignee
+            && e.duty.as_deref() == Some(&duty.id)
+    }) {
+        return Stage::AwaitingAnswer;
+    }
+    match duty.status {
+        DutyStatus::Proposed => Stage::AwaitingAcceptance,
+        DutyStatus::Blocked => Stage::Blocked,
+        _ => match st.members.get(&duty.assignee) {
+            Some(m) if binding_word(st, m, now, assignee_seen) == "bound" => Stage::Working,
+            _ => Stage::Vacant,
+        },
+    }
+}
+
+/// One duty as every view shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CardDuty {
+pub struct DutyView {
     pub id: String,
     pub status: String,
+    pub stage: Stage,
+    pub stage_label: String,
     pub outcome: String,
     pub scope: Vec<String>,
     pub done_criteria: String,
     pub decision_rights: String,
+    /// The effective hold's release condition, with `(+N)` more holds.
+    #[serde(default)]
+    pub hold: Option<String>,
+    /// The user's words this duty answers.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// The card's duty entries are duty views.
+pub type CardDuty = DutyView;
+
+pub fn duty_view(st: &State, duty: &Duty, now: Ms, assignee_seen: Option<Ms>) -> DutyView {
+    let stage = stage(st, duty, now, assignee_seen);
+    let holds = crate::authz::holds(st, duty);
+    let hold = holds.first().map(|h| {
+        if holds.len() > 1 {
+            format!("{} (+{})", h.until, holds.len() - 1)
+        } else {
+            h.until.clone()
+        }
+    });
+    DutyView {
+        id: duty.id.clone(),
+        status: status_word(duty.status).into(),
+        stage,
+        stage_label: stage.label().into(),
+        outcome: duty.outcome.clone(),
+        scope: duty.scope.clone(),
+        done_criteria: duty.done_criteria.clone(),
+        decision_rights: duty.decision_rights.clone(),
+        hold,
+        source: duty.source.as_ref().map(|s| s.quote.clone()),
+    }
 }
 
 /// Display name of a member: "<bu> 속관 <title> <alias>" or, for heads and
@@ -112,7 +227,7 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
     if team.commander == chain_commander(st, m)
         && let Some(first) = chain.get_mut(1)
     {
-        *first = format!("가절월을 받은 {first}");
+        *first = format!("{}을 받은 {first}", root_title(st, &team.commander));
     }
 
     let superior = m
@@ -121,25 +236,15 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
         .and_then(|s| st.members.get(s))
         .map(|s| display(st, s));
 
-    let duties: Vec<CardDuty> = st
+    let mut duties: Vec<CardDuty> = st
         .duties
         .values()
         .filter(|d| d.assignee == m.id)
-        .filter(|d| {
-            matches!(
-                d.status,
-                DutyStatus::Proposed | DutyStatus::Accepted | DutyStatus::Blocked
-            )
-        })
-        .map(|d| CardDuty {
-            id: d.id.clone(),
-            status: status_word(d.status).into(),
-            outcome: d.outcome.clone(),
-            scope: d.scope.clone(),
-            done_criteria: d.done_criteria.clone(),
-            decision_rights: d.decision_rights.clone(),
-        })
+        .map(|d| duty_view(st, d, now, last_seen))
+        .filter(|d| d.stage != Stage::Ended)
         .collect();
+    // Held duties first, so truncation never hides them.
+    duties.sort_by_key(|d| d.stage != Stage::Held);
 
     // Peers: same-bu members, the bu head, my direct subordinates.
     let mut peers: Vec<String> = st
@@ -245,6 +350,23 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
     Some(card)
 }
 
+/// "가절월", or "가절월(추론)" when the root grant came from inferred words.
+pub fn root_title(st: &State, commander: &str) -> &'static str {
+    let inferred = st.grants.values().any(|g| {
+        g.grantor.is_none()
+            && g.grantee == commander
+            && g.status == crate::model::GrantStatus::Active
+            && g.evidence
+                .as_ref()
+                .is_some_and(|e| e.strength == Strength::Inferred)
+    });
+    if inferred {
+        "가절월(추론)"
+    } else {
+        "가절월"
+    }
+}
+
 fn chain_commander(st: &State, m: &Member) -> String {
     let mut cur = m;
     let mut guard = 0;
@@ -290,6 +412,18 @@ fn render_body(c: &Card) -> String {
             clip(&c.escalations.join(" / "), 140)
         ));
     }
+    // Holds survive truncation like cancels: at most three lines and a count.
+    let held: Vec<_> = c.duties.iter().filter(|d| d.stage == Stage::Held).collect();
+    for d in held.iter().take(3) {
+        keep.push(format!(
+            "보류: 소임 {} — {}",
+            d.id,
+            clip(d.hold.as_deref().unwrap_or(""), 120)
+        ));
+    }
+    if held.len() > 3 {
+        keep.push(format!("보류 +{}", held.len() - 3));
+    }
     let mut extra: Vec<String> = Vec::new();
     if c.duties.is_empty() {
         extra.push("소임: 없음 (상관의 발령을 기다리거나 escalate)".into());
@@ -298,7 +432,7 @@ fn render_body(c: &Card) -> String {
         extra.push(format!(
             "소임 {} [{}]: {} | 범위 {}",
             d.id,
-            d.status,
+            d.stage_label,
             clip(&d.outcome, 80),
             clip(&d.scope.join(","), 60)
         ));
@@ -349,4 +483,137 @@ pub fn one_line(card: &Card) -> String {
         card.duties.len(),
         card.rev
     )
+}
+
+// ----- 명부 (board), shared by the CLI and MCP -----
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardView {
+    pub rev: u64,
+    /// sha256 prefix of this view without the token: `board --since` compares
+    /// it, so a stage that changes with time alone (quiet) is still noticed.
+    pub token: String,
+    pub teams: Vec<BoardTeam>,
+    pub user_queue: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardTeam {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub commander: String,
+    pub bus: Vec<BoardBu>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardBu {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub head: String,
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub hold: Option<String>,
+    pub members: Vec<BoardMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoardMember {
+    pub id: String,
+    pub display: String,
+    pub alias: String,
+    pub title: String,
+    pub binding: String,
+    /// Open duties in panel order (by stage).
+    pub duties: Vec<DutyView>,
+    pub leases: Vec<String>,
+}
+
+/// The roster of `teams` (all when `None`). `seen` gives a session's last
+/// hook sighting.
+pub fn board(
+    st: &State,
+    now: Ms,
+    team: Option<&str>,
+    seen: &dyn Fn(&str) -> Option<Ms>,
+) -> BoardView {
+    let seen_of = |m: &Member| m.binding.session_id.as_deref().and_then(seen);
+    let teams = st
+        .teams
+        .values()
+        .filter(|t| team.is_none_or(|id| t.id == id))
+        .map(|t| BoardTeam {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            status: format!("{:?}", t.status).to_lowercase(),
+            commander: st
+                .members
+                .get(&t.commander)
+                .map(|m| format!("{}을 받은 {}", root_title(st, &t.commander), display(st, m)))
+                .unwrap_or_default(),
+            bus: st
+                .bus
+                .values()
+                .filter(|b| b.team == t.id)
+                .map(|b| BoardBu {
+                    id: b.id.clone(),
+                    name: b.name.clone(),
+                    status: format!("{:?}", b.status).to_lowercase(),
+                    head: st
+                        .members
+                        .get(&b.head)
+                        .map(|m| display(st, m))
+                        .unwrap_or_default(),
+                    parent: b.parent.clone(),
+                    hold: b.hold.as_ref().map(|h| h.until.clone()),
+                    members: st
+                        .members
+                        .values()
+                        .filter(|m| m.bu == b.id && m.status == MemberStatus::Active)
+                        .map(|m| {
+                            let mut duties: Vec<DutyView> = st
+                                .duties
+                                .values()
+                                .filter(|d| d.assignee == m.id)
+                                .map(|d| duty_view(st, d, now, seen_of(m)))
+                                .filter(|d| d.stage != Stage::Ended)
+                                .collect();
+                            duties.sort_by_key(|d| d.stage.rank());
+                            BoardMember {
+                                id: m.id.clone(),
+                                display: display(st, m),
+                                alias: m.binding.alias.clone(),
+                                title: m.title.clone(),
+                                binding: binding_word(st, m, now, seen_of(m)),
+                                duties,
+                                leases: st
+                                    .leases
+                                    .values()
+                                    .filter(|l| l.holder == m.id && l.expires_at > now)
+                                    .map(|l| l.key.clone())
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    let user_queue = st
+        .escalations
+        .values()
+        .filter(|e| e.to.is_none() && e.status == EscalationStatus::Open)
+        .filter(|e| team.is_none_or(|id| e.team == id))
+        .map(|e| format!("{}: {}", e.id, e.question))
+        .collect();
+    let mut view = BoardView {
+        rev: st.rev,
+        token: String::new(),
+        teams,
+        user_queue,
+    };
+    let bytes = serde_json::to_vec(&view).unwrap_or_default();
+    view.token = format!("{:x}", Sha256::digest(&bytes))[..16].to_owned();
+    view
 }
