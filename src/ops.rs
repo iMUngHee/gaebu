@@ -21,7 +21,8 @@ pub struct Outcome {
 /// Give 가절월 to `alias`: creates the team, the root bu named after the
 /// commander's title, the commander member (pending binding) and the root
 /// grant (all verbs, scopes `**` and `res:**`). Idempotent on
-/// (session id, prompt sequence, action, target).
+/// (session id, prompt sequence, action, target). Explicit evidence for an
+/// alias that already commands an active team confirms that appointment.
 pub fn root_appoint(
     st: &mut State,
     now: Ms,
@@ -40,6 +41,63 @@ pub fn root_appoint(
                 action.team.clone(),
             ],
         ));
+    }
+    // The user later confirms, in words naming both the action and the
+    // target, a seat appointed from inferred words: the seat stays as it is
+    // and its root grant takes the explicit evidence. The inferred quote it
+    // replaces stays in the team record. Inferred words never downgrade.
+    if ev.strength == Strength::Explicit {
+        let seat = st
+            .members
+            .values()
+            .find(|m| {
+                m.status == MemberStatus::Active
+                    && m.binding.alias == alias
+                    && st
+                        .teams
+                        .get(&m.team)
+                        .is_some_and(|t| t.commander == m.id && t.status == TeamStatus::Active)
+            })
+            .map(|m| (m.id.clone(), m.team.clone()));
+        if let Some((mid, tid)) = seat {
+            if team.is_some_and(|n| n != st.teams[&tid].name) {
+                return refuse(Reason::Conflict, "alias already commands another team");
+            }
+            let Some(gid) = st
+                .grants
+                .values()
+                .find(|g| {
+                    g.grantor.is_none() && g.grantee == mid && g.status == GrantStatus::Active
+                })
+                .map(|g| g.id.clone())
+            else {
+                return refuse(Reason::NoGrant, "commander has no active root grant");
+            };
+            let old = st.grants[&gid].evidence.clone();
+            if old
+                .as_ref()
+                .is_some_and(|e| e.strength == Strength::Explicit)
+            {
+                return Ok(out("already appointed explicitly", vec![mid, tid]));
+            }
+            if let Some(o) = &old {
+                newer(ev, o.at)?;
+            }
+            if let Some(g) = st.grants.get_mut(&gid) {
+                g.evidence = Some(ev.clone());
+            }
+            root_done(st, now, ev, key, &tid);
+            let was = old.map(|o| o.quote).unwrap_or_default();
+            changed(
+                st,
+                now,
+                &mid,
+                std::slice::from_ref(&mid),
+                &format!("root appointment confirmed explicitly (was inferred: {was})"),
+                Notify::Record,
+            );
+            return Ok(out("appointment confirmed explicitly", vec![mid, tid]));
+        }
     }
     if alias.trim().is_empty()
         || st

@@ -467,6 +467,45 @@ fn hold_requires_user_evidence() {
 }
 
 #[test]
+fn explicit_words_later_confirm_an_inferred_appointment() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu")]);
+    let title = || {
+        let st = store.read().unwrap();
+        let cmdr = st.teams.values().next().unwrap().commander.clone();
+        gaebu::card::root_title(&st, &cmdr)
+    };
+    user_says(&store, "s-gapu", "너한테 가절월 줄게");
+    pager.as_session("s-gapu");
+    assert_eq!(
+        gaebu(&pager, &["appoint", "gapu", "--evidence", "가절월 줄게"]),
+        0
+    );
+    assert_eq!(title(), "가절월(추론)");
+    // A later prompt; evidence must be newer than the appointment's.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    user_says(&store, "s-gapu", "gapu에게 가절월을 준 것 맞아");
+    let confirm = [
+        "appoint",
+        "gapu",
+        "--evidence",
+        "gapu에게 가절월을 준 것 맞아",
+    ];
+    // Without --explicit it is the old refusal.
+    assert_eq!(gaebu(&pager, &confirm), 1);
+    assert_eq!(gaebu(&pager, &[&confirm[..], &["--explicit"]].concat()), 0);
+    assert_eq!(title(), "가절월");
+    let st = store.read().unwrap();
+    assert_eq!(st.teams.len(), 1);
+    assert!(
+        st.records
+            .iter()
+            .any(|r| r.text.contains("was inferred: 가절월 줄게")),
+        "the inferred quote stays in the team record"
+    );
+}
+
+#[test]
 fn root_ops_record_strength() {
     let (_g, _dir, store) = setup();
     let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi"), ("s-bepo", "bepo")]);

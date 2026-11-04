@@ -54,6 +54,10 @@ only from grants.
   `quote`, `at`, and `strength`. `strength` is `explicit` when the words name
   both the action and its target, `inferred` when the agent interpreted
   either ("가절월 줄게", "개부해라"). It is recorded and shown, never enforced.
+  When the user later confirms an inferred appointment in explicit words,
+  `appoint <alias> --explicit` replaces the root grant's evidence and keeps
+  the inferred quote in the team record; inferred words never replace
+  explicit ones.
   The root grant keeps the appointment's evidence; every other root directive
   keeps its own in its `root_actions` entry.
 - **Duty**: `intent`, `outcome`, `scope`, `decision_rights`, `escalate_on`,
