@@ -298,6 +298,99 @@ fn same_prompt_multi_target_idempotent() {
     assert_eq!(s.next_id, n);
 }
 #[test]
+fn scoped_verbs_cannot_be_delegated_over_no_scope() {
+    let (mut s, a, b, _) = setup();
+    for r in [
+        ops::bu_open(&mut s, 11, &a, &b.member, None, &[Verb::Assign], &[]),
+        ops::grant(&mut s, 11, &a, &b.member, &[Verb::Arbitrate], &[]),
+    ] {
+        let e = r.unwrap_err();
+        assert_eq!(e.reason, Reason::InvalidArgument);
+        assert!(e.message.contains("need a scope"), "{}", e.message);
+    }
+    // Verbs that also work unscoped still delegate without one.
+    ops::bu_open(
+        &mut s,
+        12,
+        &a,
+        &b.member,
+        None,
+        &[Verb::Open, Verb::Reassign],
+        &[],
+    )
+    .unwrap();
+}
+#[test]
+fn scope_refusals_say_what_is_allowed() {
+    let (mut s, a, b, c) = setup();
+    let msg = |r: Result<ops::Outcome, gaebu::Error>| {
+        let e = r.unwrap_err();
+        (e.reason, e.message)
+    };
+    // No accepted duty at all.
+    let (reason, text) = msg(ops::lease_acquire(
+        &mut s,
+        11,
+        &b,
+        "src/a",
+        LeaseMode::Exclusive,
+        None,
+        "w",
+    ));
+    assert_eq!(reason, Reason::OutOfScope);
+    assert!(text.contains("no accepted duty"), "{text}");
+    // A bare path is one file, not a directory.
+    let bare = DutySpec {
+        scope: vec!["src".into()],
+        ..spec()
+    };
+    let d = ops::duty_issue(&mut s, 12, &a, &b.member, bare)
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::duty_respond(&mut s, 13, &b, &d, Some(1), true, None).unwrap();
+    let (reason, text) = msg(ops::lease_acquire(
+        &mut s,
+        14,
+        &b,
+        "src/a.rs",
+        LeaseMode::Exclusive,
+        None,
+        "w",
+    ));
+    assert_eq!(reason, Reason::OutOfScope);
+    assert!(text.contains("src/a.rs not within src"), "{text}");
+    assert!(text.contains("its directory is `src/**`"), "{text}");
+    // A grant refusal names the verb and both sides.
+    ops::grant(&mut s, 15, &a, &b.member, &[Verb::Assign], &scope()).unwrap();
+    s.members.get_mut(&c.member).unwrap().superior = Some(b.member.clone());
+    let wide = DutySpec {
+        scope: vec!["docs/x.md".into()],
+        ..spec()
+    };
+    let (reason, text) = msg(ops::duty_issue(&mut s, 16, &b, &c.member, wide));
+    assert_eq!(reason, Reason::OutOfScope);
+    assert!(
+        text.contains("scope exceeds assign grant: docs/x.md not within src/**"),
+        "{text}"
+    );
+    // A malformed pattern says what the grammar is.
+    let glob = DutySpec {
+        scope: vec!["src/*.rs".into()],
+        ..spec()
+    };
+    let (reason, text) = msg(ops::duty_issue(&mut s, 17, &a, &b.member, glob));
+    assert_eq!(reason, Reason::InvalidScope);
+    assert!(text.contains("a directory as src/**"), "{text}");
+    // An unscoped duty is allowed, with a warning.
+    let none = DutySpec {
+        scope: vec![],
+        ..spec()
+    };
+    let out = ops::duty_issue(&mut s, 18, &a, &b.member, none).unwrap();
+    assert!(out.summary.contains("no scope"), "{}", out.summary);
+}
+#[test]
 fn explicit_reappoint_confirms_an_inferred_seat() {
     let explicit = |seq: u64| Evidence {
         strength: Strength::Explicit,

@@ -34,7 +34,14 @@ pub fn require(st: &State, member: &str, verb: Verb, scope: &[String]) -> Result
         .flat_map(|g| g.scope.iter().cloned())
         .collect();
     if !crate::scope::within(&scope, &parent)? {
-        return refuse(Reason::OutOfScope, "scope exceeds grant");
+        return refuse(
+            Reason::OutOfScope,
+            format!(
+                "scope exceeds {} grant: {}",
+                format!("{verb:?}").to_lowercase(),
+                crate::scope::explain(&scope, &parent)
+            ),
+        );
     }
     Ok(())
 }

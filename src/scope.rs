@@ -40,7 +40,14 @@ pub fn parse(raw: &str) -> Result<Pattern> {
         || (resource && name.contains('/'))
         || name.split('/').any(|part| matches!(part, "" | "." | ".."))
     {
-        return refuse(Reason::InvalidScope, format!("invalid scope: {raw}"));
+        return refuse(
+            Reason::InvalidScope,
+            format!(
+                "invalid scope: {raw} (use a project-relative path like src/a.rs, a \
+                 directory as src/**, a resource as res:<name>, or **; no globs, absolute \
+                 paths, ./ or backslashes)"
+            ),
+        );
     }
     let name = name.to_lowercase();
     Ok(if resource {
@@ -91,6 +98,49 @@ pub fn normalize_list(raw: &[String]) -> Result<Vec<String>> {
     raw.iter()
         .map(|item| parse(item).map(|pattern| pattern.as_string()))
         .collect()
+}
+
+/// Why `child` is not within `parent`, for a refusal: the requested patterns
+/// no parent pattern contains, what is allowed, and a hint when the allowed
+/// side names a bare path that was meant as a directory.
+pub fn explain(child: &[String], parent: &[String]) -> String {
+    let parse_all = |xs: &[String]| xs.iter().filter_map(|x| parse(x).ok()).collect::<Vec<_>>();
+    let (child, parent) = (parse_all(child), parse_all(parent));
+    let outside: Vec<&Pattern> = child
+        .iter()
+        .filter(|c| !parent.iter().any(|p| p.contains(c)))
+        .collect();
+    let list = |xs: &mut dyn Iterator<Item = &Pattern>| {
+        xs.map(Pattern::as_string).collect::<Vec<_>>().join(", ")
+    };
+    let allowed = if parent.is_empty() {
+        "nothing".to_owned()
+    } else {
+        list(&mut parent.iter())
+    };
+    let mut text = format!(
+        "{} not within {allowed}",
+        list(&mut outside.iter().copied())
+    );
+    let bare = parent.iter().find_map(|p| match p {
+        Pattern::Exact(dir)
+            if outside.iter().any(|c| match c {
+                Pattern::Exact(path) | Pattern::Dir(path) => path
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|tail| tail.starts_with('/')),
+                _ => false,
+            }) =>
+        {
+            Some(dir)
+        }
+        _ => None,
+    });
+    if let Some(dir) = bare {
+        text.push_str(&format!(
+            "; `{dir}` names one path, its directory is `{dir}/**`"
+        ));
+    }
+    text
 }
 
 /// True when every pattern in `child` is contained by some pattern in `parent`.
