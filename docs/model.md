@@ -64,7 +64,8 @@ only from grants.
   `sha256`, `quote`, `at`), matched against a prompt the hook recorded in the
   issuer's own session. Amending without a source keeps the one recorded.
 - **Hold**: a human stop on a duty or a bu: `evidence` (the user's words that
-  set it), `until` (the release condition, 1-120 characters) and `at`. Only
+  set it), `until` (the release condition, 1-120 characters on one line;
+  whitespace and control characters collapse) and `at`. Only
   root directives (`gaebu hold`, `gaebu release`) set or lift one. Holds are
   independent: a duty is held while its own hold or any hold on its bu or the
   bus above it remains. While held, its assignee cannot accept, finish, block,
@@ -83,7 +84,7 @@ only from grants.
   Only the asker withdraws one. After every committed change, an open
   escalation whose recipient can no longer answer (vacant, pending, dismissed,
   in a cancelled bu) moves to the asker's nearest live superior, or to the
-  user's queue.
+  user's queue when there is none or the asker itself can no longer act.
 - **Record**: `kind` (`decision`, `handoff`, `change`, `note`), `author`,
   `refs`, `text`.
 - **Outbox**: notices waiting to be delivered with `pager send <session_id>`.
@@ -122,8 +123,9 @@ interrupts them with a pager notice (Act); the rest wait for the next card
 | bu opened (to the new head) | |
 
 No notice goes to the actor's own session, to a recipient with no bound
-session, or when the same `text` is still queued for that session (also while
-a flush holds it). Once delivered, the same change raised again is a new
+session, or when the newest notice still queued for that session has the same
+`text` (also while a flush holds it), so a change that flips back and forth
+still arrives in order. Once delivered, the same change raised again is a new
 notice.
 
 ## Stage
@@ -195,8 +197,9 @@ display name, binding (`quiet` included), open duties as duty views in stage
 order, and live leases. MCP `board` returns the same view for the caller's
 team.
 
-`token` is a hash of the view itself, so it changes when a stage changes with
-time alone (a seat falling quiet) even though `rev` does not. `--since
+`token` is a hash of the view itself without `rev`, so it changes when a stage
+changes with time alone (a seat falling quiet) and stays when a commit changes
+nothing the board shows. `--since
 <token>` prints `{"rev": N, "token": "...", "unchanged": true}` when the board
 still has that token.
 

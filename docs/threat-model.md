@@ -138,6 +138,11 @@ hold on any duty or bu of that team: the model has one human, and where they
 spoke does not change who they are. A peer that can forge prompts can forge a
 hold too (see the forgery section above).
 
+A hold on a duty does not follow its brief: a superior that cancels a held duty
+and issues the same brief again starts an unheld duty. Only the rules ask
+agents not to do that. To stop a line of work whatever duties carry it, hold
+the bu.
+
 A duty's `source` is matched against the user prompts the hook recorded in the
 issuer's own session. The log keeps the last 50 user prompts and up to 4 KB of
 each, so an older or later-cut quote is refused. A source records which words
