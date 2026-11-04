@@ -260,6 +260,10 @@ pub struct Sighting {
     pub last_seen: Option<Ms>,
     pub last_card_hash: Option<String>,
     pub mod_heartbeat: Option<Ms>,
+    /// Last time the mod's prompt.compose hook added the card section, so it
+    /// reached the model. Never set where another plugin passes
+    /// prompt.compose on past the mod.
+    pub compose_heartbeat: Option<Ms>,
     pub pending_checked_at: Option<Ms>,
     pub pending_checked_rev: Option<u64>,
 }

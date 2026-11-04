@@ -289,11 +289,17 @@ fn run_budget(
         let Some(card) = card::build(&st, &member.id, now, sighting.last_seen) else {
             return Ok(None);
         };
-        let mod_active = tool == Tool::Claude
+        // The mod adds the full card to the system prompt from prompt.compose
+        // and stamps when it does. A mod that is alive is not enough: with
+        // managed settings, or in Team and Enterprise organizations,
+        // cc-plugin-sec-default passes prompt.compose on past it, the section
+        // never lands, no stamp arrives, and the cards are the hook's as
+        // without a mod.
+        let mod_composes = tool == Tool::Claude
             && sighting
-                .mod_heartbeat
+                .compose_heartbeat
                 .is_some_and(|t| now.saturating_sub(t) < 3_600_000);
-        let full = !mod_active
+        let full = !mod_composes
             && (tool == Tool::Codex
                 || event != "UserPromptSubmit"
                 || previous_hash.as_deref() != Some(&card.hash));

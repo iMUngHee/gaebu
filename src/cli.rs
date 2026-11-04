@@ -384,6 +384,10 @@ enum SessionCmd {
         session: String,
         #[arg(long = "mod")]
         mod_active: bool,
+        /// The mod's prompt.compose hook added its card section, so the hook
+        /// can shorten its own card.
+        #[arg(long)]
+        compose: bool,
     },
 }
 
@@ -1190,6 +1194,7 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
         Cmd::Session(SessionCmd::Heartbeat {
             session,
             mod_active,
+            compose,
         }) => {
             let store = open_store()?;
             let log = store.session(&session);
@@ -1201,6 +1206,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 s.last_seen = Some(now);
                 if mod_active {
                     s.mod_heartbeat = Some(now);
+                }
+                if compose {
+                    s.compose_heartbeat = Some(now);
                 }
             })?;
             if json {

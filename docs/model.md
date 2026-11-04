@@ -212,7 +212,7 @@ still has that token.
 ~/.gaebu/state.lock            OS lock, never deleted
 ~/.gaebu/sessions/<id>/events.jsonl    hook events: prompts, excluded prompts, Stop, mod heartbeats
 ~/.gaebu/sessions/<id>/composer.jsonl  composer-attested prompt hashes (Claude mod)
-~/.gaebu/sessions/<id>/sighting.json   last seen, last injected card hash, mod heartbeat
+~/.gaebu/sessions/<id>/sighting.json   last seen, last injected card hash, mod and compose heartbeats
 ~/.gaebu/capture.on                    dev switch: save raw hook stdin under capture/
 ```
 

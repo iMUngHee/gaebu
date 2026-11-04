@@ -295,3 +295,55 @@ test('old card-1/board-1 values are discarded', async ($, on) => {
   expect((await ui.find({ type: 'Text' }))?.text).toMatch(/비어 있습니다/)
   await ui.unmount()
 })
+
+test('prompt.compose stamps the hook only with the card in, at most every ten minutes', async ($, on) => {
+  const calls: string[][] = []
+  let now = 1_000_000
+  let id = 's-1'
+  let isMember = false
+  on('session.id', () => ({ value: id }))
+  on('command.register', () => ({ value: { command: 'gaebu' } }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: now }))
+  on('ui.status', () => ({ value: undefined }))
+  on('process.run', (_, e) => {
+    const argv = (e as { argv: string[] }).argv
+    calls.push(argv)
+    return isMember || !argv.includes('me') ? defaultRun(argv) : ran('', 1)
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('prompt.submit', (_, e) => e)
+  on('prompt.compose', () => ({ sections: [] }))
+  const stamps = (session: string) =>
+    calls.filter(a => a.join(' ').includes(`session heartbeat --session ${session} --compose`)).length
+  const request = {
+    model: 'm',
+    promptModel: 'm',
+    surfaces: [],
+    tools: [],
+    outputStyle: null,
+    traits: [],
+  } as const
+
+  // No seat, no section: nothing reached the model, so nothing is stamped.
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect((await $.prompt.compose(request)).sections.length).toBe(0)
+  expect(stamps('s-1')).toBe(0)
+
+  isMember = true
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const first = await $.prompt.compose(request)
+  expect(first.sections.some(s => s.id === 'gaebu:card')).toBe(true)
+  await $.prompt.compose(request)
+  expect(stamps('s-1')).toBe(1)
+  now += 600_000
+  await $.prompt.compose(request)
+  expect(stamps('s-1')).toBe(2)
+
+  // /clear starts a new session id, which gets its own stamp at once.
+  id = 's-2'
+  await $.prompt.submit({ text: 'x', origin: { kind: 'unclassified' } } as never)
+  await $.prompt.compose(request)
+  expect(stamps('s-2')).toBe(1)
+})
+
