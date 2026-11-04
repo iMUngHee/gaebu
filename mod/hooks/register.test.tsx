@@ -347,3 +347,56 @@ test('prompt.compose stamps the hook only with the card in, at most every ten mi
   expect(stamps('s-2')).toBe(1)
 })
 
+const BAND = {
+  hasSurvey: false,
+  isWorking: false,
+  maxRows: 6,
+  bodyColumns: 100,
+  scroll: { offset: 0, bodyRows: 6 },
+  view: {},
+}
+
+/** A rendered tree as text: a Button by its label, a Box as a line. */
+function textOf(tree: unknown): string {
+  if (tree === null || tree === undefined || typeof tree === 'boolean') return ''
+  if (typeof tree === 'string' || typeof tree === 'number') return String(tree)
+  if (Array.isArray(tree)) return tree.map(textOf).join('')
+  const node = tree as { type?: string; children?: unknown; props?: { children?: unknown; label?: string } }
+  if (node.type === 'Button') return node.props?.label ?? ''
+  const children = textOf(node.children ?? node.props?.children)
+  return node.type === 'Box' ? `${children}\n` : children
+}
+
+async function bandText($: Parameters<TestBody>[0], props = BAND): Promise<string> {
+  const tree = await $.ui.render({ component: 'AbovePrompt', surface: 'terminal', requestId: 'band', props })
+  return textOf(tree).replace(/\n+/g, '\n').trim()
+}
+
+test('the band shows my seat and what waits, or that I hold none', async ($, on) => {
+  let isMember = false
+  const opened: string[] = []
+  mountedWith(on, {
+    run: argv => (isMember || !argv.includes('me') ? defaultRun(argv) : ran('', 1)),
+  })
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true as const } }
+  })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return Text({ children: ['below'] })
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await bandText($)).toBe('⚑ 개부 자리 없음\nbelow')
+
+  isMember = true
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await bandText($)).toBe('⚑ 좌장군부 속관 주부 bepo  소임 1 · 대기 1\nbelow')
+  // A survey owns the space above the prompt.
+  expect(await bandText($, { ...BAND, hasSurvey: true })).toBe('below')
+  // The name is the way into /gaebu.
+  const band = await $.ui.mount({ plugin: 'gaebu', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  await band.press({ key: 'open-gaebu' })
+  expect(opened).toEqual(['gaebu-board'])
+  await band.unmount()
+})

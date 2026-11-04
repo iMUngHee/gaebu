@@ -115,14 +115,14 @@ Register the MCP server (optional; the CLI covers everything):
 
 The mod in `mod/` adds the card as a system prompt section, records
 composer-stamped prompts as stronger evidence, and shows a roster pane
-(`/gaebu`) and a status line. While its `prompt.compose` hook reports adding
-the section, the shell hook sends only a one-line card. On a machine with
-managed settings, or in Team and Enterprise organizations,
-`cc-plugin-sec-default` passes `prompt.compose` on past installed plugins, so
-the section never lands and the shell hook sends its cards as it does without
-the mod. Load it with `claude --plugin-dir mod` or through
-`CLAUDE_CODE_PLUGIN_DIRS`, or install it from this repository's marketplace:
-`/plugin install gaebu --marketplace iMUngHee/gaebu`.
+(`/gaebu`), a band line above the prompt and a status line. While its
+`prompt.compose` hook reports adding the section, the shell hook sends only a
+one-line card. On a machine with managed settings, or in Team and Enterprise
+organizations, `cc-plugin-sec-default` passes `prompt.compose` on past
+installed plugins, so the section never lands and the shell hook sends its
+cards as it does without the mod. Load it with `claude --plugin-dir mod` or
+through `CLAUDE_CODE_PLUGIN_DIRS`, or install it from this repository's
+marketplace: `/plugin install gaebu --marketplace iMUngHee/gaebu`.
 
 ### Codex CLI
 
