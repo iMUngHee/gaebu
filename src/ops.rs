@@ -627,7 +627,61 @@ pub fn bu_open(
     Ok(out("bu opened", vec![bid]))
 }
 
-/// Close a bu with no open duties or leases left.
+/// A new subordinate unit and the existing seats to organize under its head.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BuFormSpec {
+    pub head: String,
+    pub members: Vec<String>,
+    pub name: Option<String>,
+    pub verbs: Vec<Verb>,
+    pub scope: Vec<String>,
+}
+
+/// Form a unit with checked head promotion, grants and worker moves. A failed
+/// step leaves the entire input state unchanged, including ids and notices.
+/// Existing duties retain their original unit and human holds.
+pub fn bu_form(st: &mut State, now: Ms, actor: &Actor, spec: &BuFormSpec) -> Result<Outcome> {
+    authz::check_actor(st, actor)?;
+    let head = find_member(st, &spec.head)?.id.clone();
+    let mut seen = std::collections::BTreeSet::from([head.clone()]);
+    let mut members = Vec::with_capacity(spec.members.len());
+    for target in &spec.members {
+        let member = find_member(st, target)?.id.clone();
+        if !seen.insert(member.clone()) {
+            return refuse(
+                Reason::InvalidArgument,
+                "workers must be distinct seats and cannot include the head",
+            );
+        }
+        members.push(member);
+    }
+    let mut draft = st.clone();
+    let opened = bu_open(
+        &mut draft,
+        now,
+        actor,
+        &head,
+        spec.name.as_deref(),
+        &spec.verbs,
+        &spec.scope,
+    )?;
+    let bu = &opened.ids[0];
+    for member in &members {
+        member_move(&mut draft, now, actor, member, bu)?;
+    }
+    *st = draft;
+    Ok(out(
+        &format!(
+            "bu formed; {} workers moved; original duty origins preserved",
+            members.len()
+        ),
+        opened.ids,
+    ))
+}
+
+/// Close a clean subordinate bu and return its active seats to the parent bu.
+/// Preserve the command and grant chains; only the former head reports to the
+/// parent head. Repeating this recovers seats stranded by older closed bus.
 pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outcome> {
     let a = authz::check_actor(st, actor)?.clone();
     let b = st
@@ -639,6 +693,22 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         return refuse(Reason::NoGrant, "not a subordinate bu");
     }
     authz::require(st, &a.id, Verb::Open, &[])?;
+    if b.status == BuStatus::Cancelled {
+        return refuse(Reason::Cancelled, "cancel is sticky");
+    }
+    let parent_id = b
+        .parent
+        .as_deref()
+        .ok_or_else(|| Error::new(Reason::NoGrant, "root bu cannot be closed"))?;
+    let parent = st
+        .bus
+        .get(parent_id)
+        .filter(|parent| parent.team == a.team)
+        .cloned()
+        .ok_or_else(|| Error::new(Reason::NotFound, "parent bu not found"))?;
+    if authz::bu_cancelled(st, &parent.id) {
+        return refuse(Reason::Cancelled, "parent bu is not open");
+    }
     if st
         .bus
         .values()
@@ -654,17 +724,29 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
     {
         return refuse(Reason::Conflict, "open duties, leases or child bus remain");
     }
-    if b.status == BuStatus::Cancelled {
-        return refuse(Reason::Cancelled, "cancel is sticky");
-    }
+    let returned: Vec<_> = st
+        .members
+        .values_mut()
+        .filter(|member| member.bu == bu && member.status == MemberStatus::Active)
+        .map(|member| {
+            member.bu = parent.id.clone();
+            if member.id == b.head {
+                member.superior = Some(parent.head.clone());
+            }
+            member.id.clone()
+        })
+        .collect();
     st.bus.get_mut(bu).unwrap().status = BuStatus::Closed;
+    if returned.is_empty() && b.status == BuStatus::Closed {
+        return Ok(out("already closed", vec![bu.into()]));
+    }
     changed(
         st,
         now,
         &a.id,
-        &[b.head],
-        &format!("bu {bu} closed"),
-        Notify::Record,
+        &returned,
+        &format!("bu {bu} closed; active members returned to {}", parent.id),
+        Notify::Act,
     );
     Ok(out("bu closed", vec![bu.into()]))
 }
@@ -997,6 +1079,7 @@ pub fn duty_issue(
             updated_at: now,
             hold: None,
             source,
+            schedule_ref: None,
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);

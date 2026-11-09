@@ -58,7 +58,10 @@ fn mcp_initialize_list_call_roundtrip() {
     ]);
     assert_eq!(out.len(), 4);
     assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 12);
+    assert_eq!(
+        out[1]["result"]["tools"].as_array().unwrap().len(),
+        14 + gaebu::schedule::tools().len()
+    );
     assert_eq!(out[2]["result"]["isError"], true);
     assert_eq!(out[3], json!({"jsonrpc":"2.0","id":"p","result":{}}));
 }
@@ -237,6 +240,45 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
     let result: Value =
         serde_json::from_str(reply[3]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let duty = result["ids"][0].as_str().unwrap();
+    let detail = exchange_on(
+        &store,
+        &SessionPager,
+        &[
+            json!({"jsonrpc":"2.0","id":"detail","method":"tools/call","params":{"name":"duty_get","arguments":{"duty":duty}}}),
+        ],
+    );
+    assert_eq!(detail[0]["result"]["isError"], false, "{}", detail[0]);
+    let brief: Value =
+        serde_json::from_str(detail[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(brief["intent"], "verify MCP");
+    assert_eq!(brief["version"], 1);
+    assert_eq!(brief["escalate_on"], json!([]));
+    let caller = gaebu::identity::Caller {
+        session_id: "commander-session".into(),
+        tool: Some(Tool::Claude),
+        source: gaebu::identity::Source::PagerHost,
+    };
+    gaebu::schedule::register(&store, &caller, &home.join("schedule.md"), true).unwrap();
+    let root_bu = store
+        .read()
+        .unwrap()
+        .teams
+        .values()
+        .next()
+        .unwrap()
+        .root_bu
+        .clone();
+    let mapped = exchange_on(
+        &store,
+        &SessionPager,
+        &[
+            json!({"jsonrpc":"2.0","id":"mapped","method":"tools/call","params":{"name":"schedule_add","arguments":{"title":"mapped work","scope":["src/**"],"owner_bu":root_bu,"priority":0,"pm_ref":{"task":"FLOW","item":"flow-item","plan":".agents/plans/flow.md"}}}}),
+        ],
+    );
+    assert_eq!(mapped[0]["result"]["isError"], false, "{}", mapped[0]);
+    let mapped: Value =
+        serde_json::from_str(mapped[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mapped["item"]["pm_ref"]["item"], "flow-item");
     let reply = exchange_on(
         &store,
         &SessionPager,
@@ -369,7 +411,9 @@ fn escalation_withdraw_tool() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 14 + gaebu::schedule::tools().len());
+    assert!(names.iter().any(|n| n == "duty_get"));
+    assert!(names.iter().any(|n| n == "bu_form"));
     assert!(names.iter().any(|n| n == "escalation_withdraw"));
     assert!(!names.iter().any(|n| n == "hold" || n == "release"));
     assert_eq!(reply[1]["result"]["isError"], false, "{}", reply[1]);

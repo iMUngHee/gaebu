@@ -112,6 +112,7 @@ fn fixture() -> State {
             updated_at: 0,
             hold: None,
             source: None,
+            schedule_ref: None,
         },
     );
     st.leases.insert(
@@ -129,6 +130,46 @@ fn fixture() -> State {
         },
     );
     st
+}
+
+#[test]
+fn duty_view_preserves_the_full_contract_after_context_loss() {
+    let mut st = fixture();
+    let duty = st.duties.get_mut("d-1").unwrap();
+    duty.plan_ref = Some(".agents/plans/hook-adapter.md".into());
+    duty.exec_root = Some("checkout/hooks".into());
+    duty.note = Some("waiting for shared interface decision".into());
+    let view = card::duty_view(&st, &st.duties["d-1"], 1_000, Some(1_000));
+    let value = serde_json::to_value(view).unwrap();
+    assert_eq!(value["intent"], "hooks must never block a prompt");
+    assert_eq!(value["plan_ref"], ".agents/plans/hook-adapter.md");
+    assert_eq!(value["exec_root"], "checkout/hooks");
+    assert_eq!(value["note"], "waiting for shared interface decision");
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["escalate_on"][0], "changing public signatures");
+    assert_eq!(value["origin_bu"], "좌장군부");
+}
+
+#[test]
+fn commander_card_does_not_wait_for_a_nonexistent_superior() {
+    let st = fixture();
+    let text = card::render(&card::build(&st, "m-1", 1_000, Some(1_000)).unwrap());
+    assert!(!text.contains("상관의 발령을 기다리거나"), "{text}");
+    assert!(text.contains("배정") || text.contains("지휘"));
+}
+
+#[test]
+fn board_orders_parent_before_child_independent_of_allocated_ids() {
+    let mut st = fixture();
+    let mut root = st.bus.remove("b-1").unwrap();
+    root.id = "b-z".into();
+    st.bus.insert("b-z".into(), root);
+    st.bus.get_mut("b-2").unwrap().parent = Some("b-z".into());
+    st.teams.get_mut("t-1").unwrap().root_bu = "b-z".into();
+    st.members.get_mut("m-1").unwrap().bu = "b-z".into();
+    let board = card::board(&st, 1_000, None, &|_| Some(1_000));
+    assert_eq!(board.teams[0].bus[0].id, "b-z");
+    assert_eq!(board.teams[0].bus[1].parent.as_deref(), Some("b-z"));
 }
 
 #[test]

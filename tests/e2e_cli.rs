@@ -142,6 +142,279 @@ fn setup() -> (std::sync::MutexGuard<'static, ()>, tempdir::Dir, Store) {
 }
 
 #[test]
+fn full_duty_read_survives_completion_and_cannot_cross_team_or_write_state() {
+    use gaebu::model::now_ms;
+    use gaebu::ops::{self, SeedSpec};
+    let (_guard, _dir, store) = setup();
+    let pager = FakePager::new(&[
+        ("s-boss", "boss"),
+        ("s-worker", "worker"),
+        ("s-other", "other"),
+    ]);
+    for (name, boss, session, members) in [
+        (
+            "one",
+            "boss",
+            "s-boss",
+            vec![("worker".into(), Some("s-worker".into()), Some(Tool::Codex))],
+        ),
+        ("two", "other", "s-other", vec![]),
+    ] {
+        store
+            .transact(std::time::Duration::from_secs(5), |st| {
+                ops::dev_seed(
+                    st,
+                    now_ms(),
+                    &SeedSpec {
+                        team: name.into(),
+                        project: "fixture".into(),
+                        commander_alias: boss.into(),
+                        commander_session: Some(session.into()),
+                        commander_tool: Some(Tool::Codex),
+                        members,
+                    },
+                )
+            })
+            .unwrap();
+    }
+    pager.as_session("s-boss");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "duty",
+                "issue",
+                "--to",
+                "worker",
+                "--outcome",
+                "complete contract",
+                "--scope",
+                "src/**",
+                "--done",
+                "verified result"
+            ]
+        ),
+        0
+    );
+    let duty = store.read().unwrap().duties.keys().next().unwrap().clone();
+    pager.as_session("s-worker");
+    assert_eq!(gaebu(&pager, &["duty", "accept", &duty]), 0);
+    assert_eq!(
+        gaebu(&pager, &["duty", "done", &duty, "--note", "evidence"]),
+        0
+    );
+    let revision = store.read().unwrap().rev;
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["--json", "duty", "show", &duty, "--session", "s-worker"]
+        ),
+        0
+    );
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["--json", "duty", "show", &duty, "--session", "s-other"]
+        ),
+        1
+    );
+    assert_eq!(store.read().unwrap().rev, revision);
+}
+
+#[test]
+fn delegated_schedule_nested_team_hold_and_review_work_through_cli() {
+    use gaebu::model::now_ms;
+    use gaebu::ops::{self, SeedSpec};
+    let (_guard, dir, store) = setup();
+    let pager = FakePager::new(&[
+        ("boss-session", "boss"),
+        ("master-session", "master"),
+        ("worker-session", "worker"),
+        ("manager-session", "manager"),
+    ]);
+    store
+        .transact(std::time::Duration::from_secs(5), |st| {
+            ops::dev_seed(
+                st,
+                now_ms(),
+                &SeedSpec {
+                    team: "nested-flow".into(),
+                    project: "fixture".into(),
+                    commander_alias: "boss".into(),
+                    commander_session: Some("boss-session".into()),
+                    commander_tool: Some(Tool::Codex),
+                    members: ["master", "worker", "manager"]
+                        .into_iter()
+                        .map(|alias| {
+                            (
+                                alias.into(),
+                                Some(format!("{alias}-session")),
+                                Some(Tool::Codex),
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .unwrap();
+    pager.as_session("boss-session");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "bu",
+                "form",
+                "--head",
+                "master",
+                "--members",
+                "worker",
+                "--verbs",
+                "assign,amend,cancel,reassign,open",
+                "--scope",
+                "src/**"
+            ]
+        ),
+        0
+    );
+    let st = store.read().unwrap();
+    let master = st
+        .members
+        .values()
+        .find(|m| m.binding.alias == "master")
+        .unwrap()
+        .clone();
+    let project = dir.0.join("schedule.md");
+    assert_eq!(
+        gaebu(&pager, &["schedule", "init", project.to_str().unwrap()]),
+        0
+    );
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["schedule", "manager", "manager", "--scope", "src/**"]
+        ),
+        0
+    );
+    pager.as_session("manager-session");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule",
+                "add",
+                "--title",
+                "reviewed work",
+                "--scope",
+                "src/**",
+                "--owner-bu",
+                &master.bu
+            ]
+        ),
+        0
+    );
+    let st = store.read().unwrap();
+    let joined = gaebu::schedule::view(&store, &st, &master.team).unwrap();
+    let item = joined["items"][0]["id"].as_str().unwrap().to_owned();
+    let spec = serde_json::json!({"intent":"full CLI flow","outcome":"verified work","scope":["src/**"],"decision_rights":"implementation","escalate_on":[],"done_criteria":"review evidence"}).to_string();
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule", "dispatch", &item, "--key", "core", "--to", "worker", "--spec", &spec
+            ]
+        ),
+        1,
+        "a sibling manager cannot command the task master's worker"
+    );
+    pager.as_session("master-session");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule", "dispatch", &item, "--key", "core", "--to", "worker", "--spec", &spec
+            ]
+        ),
+        0
+    );
+    let duty = store.read().unwrap().duties.keys().next().unwrap().clone();
+    pager.as_session("boss-session");
+    user_says(&store, "boss-session", "이 과업 잠깐 멈춰");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule",
+                "hold",
+                &item,
+                "--until",
+                "검토 후",
+                "--evidence",
+                "이 과업 잠깐 멈춰"
+            ]
+        ),
+        0
+    );
+    pager.as_session("worker-session");
+    assert_eq!(gaebu(&pager, &["duty", "accept", &duty]), 1);
+    assert_eq!(
+        store.read().unwrap().duties[&duty].status,
+        DutyStatus::Proposed
+    );
+    pager.as_session("boss-session");
+    user_says(&store, "boss-session", "이 과업 재개해");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["schedule", "release", &item, "--evidence", "이 과업 재개해"]
+        ),
+        0
+    );
+    pager.as_session("worker-session");
+    assert_eq!(gaebu(&pager, &["duty", "accept", &duty]), 0);
+    assert_eq!(
+        gaebu(&pager, &["duty", "done", &duty, "--note", "tested result"]),
+        0
+    );
+    let st = store.read().unwrap();
+    let joined = gaebu::schedule::view(&store, &st, &master.team).unwrap();
+    assert_eq!(joined["items"][0]["stage"], "review");
+    pager.as_session("manager-session");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["schedule", "complete", &item, "--evidence", "review"]
+        ),
+        1
+    );
+    pager.as_session("master-session");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule",
+                "complete",
+                &item,
+                "--evidence",
+                "tests and integration reviewed"
+            ]
+        ),
+        0
+    );
+    let st = store.read().unwrap();
+    assert_eq!(
+        gaebu::schedule::view(&store, &st, &master.team).unwrap()["items"][0]["stage"],
+        "complete"
+    );
+    let mut card = gaebu::card::build(&st, &master.id, now_ms(), Some(now_ms())).unwrap();
+    gaebu::card::enrich(&store, &st, &mut card);
+    assert_eq!(
+        card.schedule.as_ref().unwrap()["viewer"]["runtime_id"],
+        st.runtime_id
+    );
+    assert!(gaebu::card::render(&card).lines().count() <= 12);
+}
+
+#[test]
 fn natural_language_appointment_to_delegation() {
     let (_g, _dir, store) = setup();
     let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);

@@ -2,6 +2,8 @@
 //! `pager` CLI (`whoami`, `who`, `send`). A trait so tests use a fake.
 
 use crate::error::{Error, Reason, Result};
+use crate::model::{RecordKind, now_ms};
+use crate::store::{self, Store};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -163,3 +165,90 @@ pub fn parse_who(text: &str) -> Vec<(String, HostStatus)> {
         })
         .collect()
 }
+
+/// Deliver pending notices through pager and drop the delivered ones.
+/// Failures stay queued for the next call.
+pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
+    // Claim a batch under the lock (so concurrent CLI/MCP calls do not send
+    // the same notice), send outside the lock, then drop what was delivered.
+    // A notice leaves the outbox only after pager accepted it: a crash after
+    // the claim leaves a stale claim that the next flush retries, so delivery
+    // is at least once rather than at most once.
+    let now = now_ms();
+    let Ok(batch) = store.transact(store::CLI_DEADLINE, |st| {
+        let mut batch = Vec::new();
+        for n in st.outbox.iter_mut() {
+            if batch.len() >= MAX_NOTICES_PER_FLUSH {
+                break;
+            }
+            let stale = n
+                .claimed_at
+                .is_none_or(|t| now.saturating_sub(t) >= crate::model::NOTICE_CLAIM_MS);
+            if stale {
+                n.claimed_at = Some(now);
+                batch.push(n.clone());
+            }
+        }
+        Ok(batch)
+    }) else {
+        return;
+    };
+    if batch.is_empty() {
+        return;
+    }
+    let mut delivered = Vec::new();
+    let mut failed = Vec::new();
+    for n in &batch {
+        match pager.send(&n.to_session, &n.body) {
+            Ok(()) => delivered.push(n.id.clone()),
+            Err(e) => {
+                eprintln!("gaebu: notice {} not delivered: {e}", n.id);
+                failed.push(n.id.clone());
+            }
+        }
+    }
+    let result = store.transact(store::CLI_DEADLINE, |st| {
+        let now = now_ms();
+        st.outbox.retain(|n| !delivered.contains(&n.id));
+        let mut given_up = Vec::new();
+        for n in st.outbox.iter_mut() {
+            if failed.contains(&n.id) {
+                n.claimed_at = None;
+                n.attempts += 1;
+                if n.attempts >= MAX_NOTICE_ATTEMPTS {
+                    given_up.push(n.clone());
+                }
+            }
+        }
+        st.outbox.retain(|n| !given_up.iter().any(|g| g.id == n.id));
+        for n in given_up {
+            // Give up, but leave a trace in the team record.
+            if let Some(team) = st.members.get(&n.to_member).map(|m| m.team.clone()) {
+                let id = st.mint("r");
+                st.records.push(crate::model::Record {
+                    id,
+                    team,
+                    kind: RecordKind::Note,
+                    author: n.to_member.clone(),
+                    refs: vec![n.id.clone()],
+                    text: format!(
+                        "undelivered notice after {} attempts: {}",
+                        n.attempts, n.body
+                    ),
+                    at: now,
+                });
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        // Delivered notices may be sent again by a later flush (their claim
+        // goes stale); failed ones stay claimed until then. Nothing is lost.
+        eprintln!("gaebu: outbox bookkeeping deferred: {e}");
+    }
+}
+
+/// Notices sent per call, so a backlog never stalls a command for long.
+const MAX_NOTICES_PER_FLUSH: usize = 10;
+/// Attempts before a notice is dropped into the team record.
+const MAX_NOTICE_ATTEMPTS: u32 = 10;

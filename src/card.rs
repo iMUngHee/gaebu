@@ -35,6 +35,8 @@ pub struct Card {
     pub escalations: Vec<String>,
     pub cancels: Vec<String>,
     pub norms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<serde_json::Value>,
     /// sha256 of the text form; used to decide full vs one-line injection.
     pub hash: String,
 }
@@ -135,6 +137,15 @@ pub struct DutyView {
     /// The user's words this duty answers.
     #[serde(default)]
     pub source: Option<String>,
+    pub intent: String,
+    pub escalate_on: Vec<String>,
+    pub plan_ref: Option<String>,
+    pub exec_root: Option<String>,
+    pub version: u64,
+    pub note: Option<String>,
+    pub issuer: String,
+    pub assignee: String,
+    pub origin_bu: String,
 }
 
 /// The card's duty entries are duty views.
@@ -161,7 +172,37 @@ pub fn duty_view(st: &State, duty: &Duty, now: Ms, assignee_seen: Option<Ms>) ->
         decision_rights: duty.decision_rights.clone(),
         hold,
         source: duty.source.as_ref().map(|s| s.quote.clone()),
+        intent: duty.intent.clone(),
+        escalate_on: duty.escalate_on.clone(),
+        plan_ref: duty.plan_ref.clone(),
+        exec_root: duty.exec_root.clone(),
+        version: duty.version,
+        note: duty.note.clone(),
+        issuer: duty.issuer.clone(),
+        assignee: duty.assignee.clone(),
+        origin_bu: st
+            .bus
+            .get(&duty.bu)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| duty.bu.clone()),
     }
+}
+
+/// Full contracts, including ended duties, remain recoverable by team members.
+pub fn full_duty<'a>(st: &'a State, session: &str, duty: &str) -> crate::Result<&'a Duty> {
+    let member = crate::authz::member_for_session(st, session)
+        .ok_or_else(|| crate::Error::new(crate::Reason::NotMember, "session has no active seat"))?;
+    let duty = st
+        .duties
+        .get(duty)
+        .ok_or_else(|| crate::Error::new(crate::Reason::NotFound, "duty not found"))?;
+    if member.team != duty.team {
+        return Err(crate::Error::new(
+            crate::Reason::NoGrant,
+            "duty belongs to another team",
+        ));
+    }
+    Ok(duty)
 }
 
 /// Display name of a member: "<bu> 속관 <title> <alias>" or, for heads and
@@ -176,7 +217,7 @@ pub fn display(st: &State, m: &Member) -> String {
     }
 }
 
-fn status_word(s: DutyStatus) -> &'static str {
+pub(crate) fn status_word(s: DutyStatus) -> &'static str {
     match s {
         DutyStatus::Proposed => "proposed",
         DutyStatus::Accepted => "accepted",
@@ -343,11 +384,58 @@ pub fn build(st: &State, member: &str, now: Ms, last_seen: Option<Ms>) -> Option
         escalations,
         cancels,
         norms,
+        schedule: None,
         hash: String::new(),
     };
     let text = render_body(&card);
     card.hash = format!("{:x}", Sha256::digest(text.as_bytes()));
     Some(card)
+}
+
+/// Attach the canonical Schedule observation outside the pure card projection.
+/// Query failures remain explicit rather than looking like idle workers.
+pub fn enrich(store: &crate::store::Store, st: &State, card: &mut Card) {
+    let Some(member) = st.members.get(&card.member) else {
+        return;
+    };
+    let Some(registration) = st.schedules.get(&member.team) else {
+        return;
+    };
+    let mut view = crate::schedule::view(store, st, &member.team).unwrap_or_else(|e| {
+        serde_json::json!({"registered": true, "state": "error", "error": e.message, "reason": e.reason})
+    });
+    let manager = registration
+        .manager
+        .as_deref()
+        .unwrap_or(&st.teams[&member.team].commander);
+    view["role"] = if member.id == manager || member.id == st.teams[&member.team].commander {
+        "manager".into()
+    } else if st
+        .bus
+        .values()
+        .any(|b| b.head == member.id && b.status == BuStatus::Open)
+    {
+        "master".into()
+    } else {
+        "worker".into()
+    };
+    view["member"] = member.id.clone().into();
+    view["viewer"] = serde_json::json!({
+        "runtime_id": st.runtime_id,
+        "team": member.team,
+        "id": member.id,
+    });
+    view["alias"] = member.binding.alias.clone().into();
+    view["mode"] = if manager == st.teams[&member.team].commander {
+        "combined"
+    } else {
+        "separate"
+    }
+    .into();
+    let snapshot = view.to_string();
+    card.schedule = Some(view);
+    let semantic = format!("{}{}", render_body(card), snapshot);
+    card.hash = format!("{:x}", Sha256::digest(semantic.as_bytes()));
 }
 
 /// "가절월", or "가절월(추론)" when the root grant came from inferred words.
@@ -425,8 +513,43 @@ fn render_body(c: &Card) -> String {
         keep.push(format!("보류 +{}", held.len() - 3));
     }
     let mut extra: Vec<String> = Vec::new();
+    if let Some(schedule) = &c.schedule {
+        if let Some(error) = schedule.get("error").and_then(|v| {
+            v.as_str()
+                .or_else(|| v.get("message").and_then(|m| m.as_str()))
+        }) {
+            extra.push(format!(
+                "일정: 확인 실패 — {} (gaebu schedule show)",
+                clip(error, 90)
+            ));
+        } else if schedule["role"] == "manager" {
+            if let Some(counts) = schedule.get("counts").and_then(|v| v.as_object()) {
+                let count = |key: &str| counts.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                extra.push(format!(
+                    "일정: 배정 가능 {} · 검수 {} · 막힘 {} · 자리 비움 {}",
+                    count("ready"),
+                    count("review"),
+                    count("blocked"),
+                    count("vacant")
+                ));
+            } else {
+                extra.push("일정: 관측 미확인 (gaebu schedule show로 복구)".into());
+            }
+            if let Some(next) = schedule.get("next_action").and_then(|v| v.as_str()) {
+                extra.push(format!("다음 판단: {}", clip(next, 120)));
+            }
+        } else {
+            extra.push("일정: 담당 과업과 전체 계약을 gaebu schedule show로 확인한다.".into());
+        }
+    }
     if c.duties.is_empty() {
-        extra.push("소임: 없음 (상관의 발령을 기다리거나 escalate)".into());
+        extra.push(if c.superior.is_none() {
+            "소임: 없음 (산하 과업의 배정·검수·막힘을 확인한다.)".into()
+        } else if c.schedule.is_some() {
+            "소임: 없음 (Schedule의 담당 과업과 다음 행동을 확인한다.)".into()
+        } else {
+            "소임: 없음 (상관의 발령을 기다리거나 escalate)".into()
+        });
     }
     for d in c.duties.iter().take(3) {
         extra.push(format!(
@@ -505,6 +628,8 @@ pub struct BoardTeam {
     pub status: String,
     pub commander: String,
     pub bus: Vec<BoardBu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -514,6 +639,7 @@ pub struct BoardBu {
     pub status: String,
     pub head: String,
     pub parent: Option<String>,
+    pub depth: usize,
     #[serde(default)]
     pub hold: Option<String>,
     pub members: Vec<BoardMember>,
@@ -540,7 +666,7 @@ pub fn board(
     seen: &dyn Fn(&str) -> Option<Ms>,
 ) -> BoardView {
     let seen_of = |m: &Member| m.binding.session_id.as_deref().and_then(seen);
-    let teams = st
+    let mut teams: Vec<BoardTeam> = st
         .teams
         .values()
         .filter(|t| team.is_none_or(|id| t.id == id))
@@ -553,6 +679,7 @@ pub fn board(
                 .get(&t.commander)
                 .map(|m| format!("{}을 받은 {}", root_title(st, &t.commander), display(st, m)))
                 .unwrap_or_default(),
+            schedule: None,
             bus: st
                 .bus
                 .values()
@@ -567,6 +694,7 @@ pub fn board(
                         .map(|m| display(st, m))
                         .unwrap_or_default(),
                     parent: b.parent.clone(),
+                    depth: 0,
                     hold: b.hold.as_ref().map(|h| h.until.clone()),
                     members: st
                         .members
@@ -601,6 +729,24 @@ pub fn board(
                 .collect(),
         })
         .collect();
+    for team in &mut teams {
+        let mut paths = std::collections::BTreeMap::new();
+        for bu in &mut team.bus {
+            let mut path = vec![bu.id.clone()];
+            let mut parent = bu.parent.as_ref();
+            while let Some(id) = parent {
+                if path.contains(id) || path.len() > st.bus.len() {
+                    break;
+                }
+                path.push(id.clone());
+                parent = st.bus.get(id).and_then(|b| b.parent.as_ref());
+            }
+            bu.depth = path.len().saturating_sub(1);
+            path.reverse();
+            paths.insert(bu.id.clone(), path);
+        }
+        team.bus.sort_by_key(|bu| paths[&bu.id].clone());
+    }
     let user_queue = st
         .escalations
         .values()
@@ -616,9 +762,26 @@ pub fn board(
     };
     // Hash what is shown, not the revision: commits that change nothing on
     // the board keep the token.
+    refresh_board_token(&mut view);
+    view
+}
+
+pub fn enrich_board(store: &crate::store::Store, st: &State, view: &mut BoardView) {
+    for team in &mut view.teams {
+        if st.schedules.contains_key(&team.id) {
+            team.schedule = Some(crate::schedule::view(store, st, &team.id).unwrap_or_else(|e| {
+                serde_json::json!({"registered": true, "state": "error", "error": e.message, "reason": e.reason})
+            }));
+        }
+    }
+    refresh_board_token(view);
+}
+
+fn refresh_board_token(view: &mut BoardView) {
+    let rev = view.rev;
     view.rev = 0;
+    view.token.clear();
     let bytes = serde_json::to_vec(&view).unwrap_or_default();
     view.token = format!("{:x}", Sha256::digest(&bytes))[..16].to_owned();
-    view.rev = st.rev;
-    view
+    view.rev = rev;
 }

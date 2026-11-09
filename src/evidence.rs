@@ -7,7 +7,8 @@
 
 use crate::error::{Reason, Result, refuse};
 use crate::model::{Attest, Evidence, Ms};
-use crate::store::{ComposerRecord, EventKind, SessionEvent};
+use crate::ops::DutySpec;
+use crate::store::{ComposerRecord, EventKind, SessionEvent, Store};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,4 +226,13 @@ pub fn recorded_source(
         quote,
         at: e.at,
     })
+}
+
+/// Resolve a duty's source quote against the caller's own session log.
+pub fn attach_source(store: &Store, session_id: &str, spec: &mut DutySpec) -> Result<()> {
+    if let Some(quote) = &spec.source_quote {
+        let events = store.session(session_id).events()?;
+        spec.source = Some(recorded_source(session_id, &events, quote)?);
+    }
+    Ok(())
 }

@@ -41,6 +41,13 @@ reconstructed from history.
 Titles (승상, 대도독, 좌장군, 주부, ...) are display only. Authority comes from
 grants, and grants only narrow as they go down the tree.
 
+Scheduling can stay with the commander or be delegated to a separate manager.
+A canonical project `schedule.md` keeps unassigned work, dependencies, operational
+priority and review acceptance between PM items and individual duties. Task
+masters retain command of their workers; changing the scheduler does not add a
+second superior. Units form a real parent/child tree and can be closed and reused.
+See [schedules and nested units](docs/schedules.md) for setup and recovery.
+
 ## How it flows
 
 1. The user tells a session in plain words, for example "너한테 가절월 줄게.
@@ -91,13 +98,14 @@ rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
 cargo +stable-x86_64-pc-windows-gnu install --git https://github.com/iMUngHee/gaebu --locked
 ```
 
-### Upgrading from 0.1
+### Upgrading from 0.1 or 0.2
 
-0.2 stores schema 2. The first command after the upgrade migrates
-`~/.gaebu/state.json` and keeps the 0.1 original in `~/.gaebu/state.v1.json`.
-A 0.1 binary cannot read schema 2 and fails closed, so install the new binary
-first, then restart the Claude Code and Codex sessions that run `gaebu mcp`.
-See [docs/model.md](docs/model.md#schema-2-migration).
+0.3 stores schema 3. The first write migrates `~/.gaebu/state.json`, keeping
+the original in `state.v1.json` or `state.v2.json` without replacing an existing
+backup. The current and previous generations become schema 3 so older binaries
+cannot fall back and bypass Schedule execution checks. Install the new binary
+and restart sessions running `gaebu mcp` before continuing coordinated work.
+See [the migration contract](docs/model.md#schema-3-migration).
 
 ### Claude Code
 
@@ -160,6 +168,8 @@ root directives quoting them are refused.
 ```sh
 gaebu me                         # my card and duties
 gaebu board                      # the whole roster
+gaebu schedule show              # operational queue, review and next decisions
+gaebu duty show d-12              # full contract, including completed work
 gaebu bu open --head nuzu --verbs assign,open --scope 'src/**'
 gaebu duty issue --to bepo --outcome "hook adapter" --scope src/hook.rs \
   --rights "internals are yours" --escalate-on "public signature" --done "cargo test"
@@ -175,7 +185,8 @@ machine-readable output.
 
 ## State
 
-Everything lives under `~/.gaebu` (override with `GAEBU_HOME`). The state is
+Runtime organization lives under `~/.gaebu` (override with `GAEBU_HOME`). Project
+Schedules remain at their registered canonical paths. The runtime state is
 one JSON file replaced atomically under an OS lock, plus small per-session
 event logs. Gaebu has no daemon and makes no network calls. It talks to other
 sessions only through `pager send`.

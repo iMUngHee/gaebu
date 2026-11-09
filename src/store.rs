@@ -27,6 +27,8 @@ use std::{
     time::Instant,
 };
 
+pub const GLOBAL_MARKERS: &str = "_global";
+
 pub const CLI_DEADLINE: Duration = Duration::from_secs(5);
 pub const HOOK_DEADLINE: Duration = Duration::from_secs(1);
 pub const SESSION_LOCK_DEADLINE: Duration = Duration::from_millis(500);
@@ -77,7 +79,7 @@ impl Store {
     /// Lock-free read of the current state (falls back to `state.prev.json`
     /// with a warning on stderr when `state.json` does not parse). A missing
     /// file is an empty `State::default()`.
-    /// A schema-1 file is migrated in memory only. A newer schema is refused
+    /// A legacy file is migrated in memory only. A newer schema is refused
     /// without falling back.
     pub fn read(&self) -> Result<State> {
         match read_state(&self.home.join("state.json")) {
@@ -89,6 +91,28 @@ impl Store {
                     .state)
             }
             Err(err) => Err(err),
+        }
+    }
+
+    /// Read the current generation only. Recovery snapshots cannot prove that
+    /// a dispatch never existed in the authoritative runtime.
+    pub fn read_current(&self) -> Result<State> {
+        read_state(&self.home.join("state.json"))?
+            .map(|loaded| loaded.state)
+            .ok_or_else(|| Error::new(Reason::NotFound, "current runtime state is missing"))
+    }
+
+    /// A fresh install is empty; an existing runtime whose current generation
+    /// disappeared or became corrupt is unavailable, not a healthy old snapshot.
+    pub fn read_view(&self) -> Result<State> {
+        match self.read_current() {
+            Err(error)
+                if error.reason == Reason::NotFound
+                    && !self.home.join("state.prev.json").exists() =>
+            {
+                Ok(State::default())
+            }
+            result => result,
         }
     }
 
@@ -115,16 +139,17 @@ impl Store {
         clean_tmp(&self.home)?;
         ensure_budget(deadline)?;
         let path = self.home.join("state.json");
-        let (mut state, v1) = match read_state(&path)? {
-            Some(loaded) => (loaded.state, loaded.v1_bytes),
+        let (mut state, legacy) = match read_state(&path)? {
+            Some(loaded) => (loaded.state, loaded.legacy_bytes),
             None => (State::default(), None),
         };
         ensure_budget(deadline)?;
-        if let Some(original) = v1 {
+        if let Some((version, original)) = legacy {
             // Its own commit, before `f`: a failure here leaves the v1 file
             // as it was and runs no user change.
-            self.publish_migration(&mut state, &original, deadline)?;
+            self.publish_migration(&mut state, version, &original, deadline)?;
         }
+        initialize_runtime_id(&mut state);
         crate::ops::expire_leases(&mut state, crate::model::now_ms());
         let result = f(&mut state)?;
         crate::ops::reroute_escalations(&mut state, crate::model::now_ms());
@@ -157,8 +182,10 @@ impl Store {
         let loaded = read_state(&self.home.join("state.prev.json"))?
             .ok_or_else(|| Error::new(Reason::StoreCorrupt, "previous state missing"))?;
         let mut state = loaded.state;
-        match loaded.v1_bytes {
-            Some(original) => self.publish_migration(&mut state, &original, deadline),
+        match loaded.legacy_bytes {
+            Some((version, original)) => {
+                self.publish_migration(&mut state, version, &original, deadline)
+            }
             None => replace(
                 &self.home.join("state.json"),
                 &serde_json::to_vec(&state).map_err(write_error)?,
@@ -166,22 +193,20 @@ impl Store {
         }
     }
 
-    /// Publish a state migrated from schema 1 under the held state lock:
-    /// keep the original once in `state.v1.json`, then write the v2 bytes to
-    /// `state.prev.json` and only then to `state.json`. An interruption at any
-    /// point leaves `state.json` at schema 1, so the next run repeats this, and
-    /// an older binary never finds a schema-1 generation to fall back to once
-    /// `state.json` is v2.
+    /// Preserve each legacy generation once, then publish current-schema prev
+    /// before current state so older binaries cannot recover past new guards.
     fn publish_migration(
         &self,
         state: &mut State,
+        version: u32,
         original: &[u8],
         deadline: Instant,
     ) -> Result<()> {
-        let backup = self.home.join("state.v1.json");
+        let backup = self.home.join(format!("state.v{version}.json"));
         if !backup.exists() {
             replace_until(&backup, original, deadline)?;
         }
+        initialize_runtime_id(state);
         state.rev = state
             .rev
             .checked_add(1)
@@ -425,8 +450,8 @@ fn corrupt_error(e: impl std::fmt::Display) -> Error {
 
 struct Loaded {
     state: State,
-    /// The original bytes when the file was schema 1 (migrated in `state`).
-    v1_bytes: Option<Vec<u8>>,
+    /// Original legacy bytes and their schema before the in-memory migration.
+    legacy_bytes: Option<(u32, Vec<u8>)>,
 }
 
 /// Decide the schema before parsing the whole state, so a newer format that
@@ -443,18 +468,21 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
     };
     let probe: Probe = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
     match probe.schema_version {
-        1 => {
-            // Schema 1 is schema 2 without the fields that default.
+        version @ (1 | 2) => {
+            // Legacy additions default; schema 1 also needs notice/evidence normalization.
             let mut state: State = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
-            migrate_v1(&mut state);
+            if version == 1 {
+                migrate_v1(&mut state);
+            }
+            state.schema_version = crate::model::SCHEMA_VERSION;
             Ok(Some(Loaded {
                 state,
-                v1_bytes: Some(bytes),
+                legacy_bytes: Some((version, bytes)),
             }))
         }
         crate::model::SCHEMA_VERSION => Ok(Some(Loaded {
             state: serde_json::from_slice(&bytes).map_err(corrupt_error)?,
-            v1_bytes: None,
+            legacy_bytes: None,
         })),
         v => Err(Error::new(
             Reason::StoreUnsupported,
@@ -463,7 +491,7 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
     }
 }
 
-/// Bring a schema-1 state to schema 2: one open escalation per asker and
+/// Normalize legacy commitments: one open escalation per asker and
 /// duty (the newest wins), and a dedupe key for every queued notice.
 fn migrate_v1(state: &mut State) {
     use crate::model::EscalationStatus;
@@ -517,7 +545,7 @@ fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         .collect()
 }
 
-fn lock(dir: &Path, name: &str, deadline: Duration) -> Result<File> {
+pub(crate) fn lock(dir: &Path, name: &str, deadline: Duration) -> Result<File> {
     fs::create_dir_all(dir).map_err(write_error)?;
     let file = OpenOptions::new()
         .create(true)
@@ -544,6 +572,20 @@ fn lock(dir: &Path, name: &str, deadline: Duration) -> Result<File> {
 }
 
 static TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn initialize_runtime_id(state: &mut State) {
+    if state.runtime_id.is_empty() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        state.runtime_id = format!(
+            "rt-{}-{nanos:x}-{}",
+            std::process::id(),
+            TMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+    }
+}
 fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     replace_until(path, bytes, Instant::now() + Duration::from_secs(1))
 }
@@ -559,7 +601,7 @@ fn ensure_budget(deadline: Instant) -> Result<()> {
     }
 }
 
-fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
+pub(crate) fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
     ensure_budget(deadline)?;
     let tmp = path.with_file_name(format!(
         "{}.tmp-{}-{}",

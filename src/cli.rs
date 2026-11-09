@@ -5,9 +5,7 @@ use crate::card;
 use crate::error::{Error, Reason, Result};
 use crate::evidence;
 use crate::identity::{self, Caller};
-use crate::model::{
-    Actor, DutyStatus, LeaseMode, MemberStatus, RecordKind, State, Tool, Verb, now_ms,
-};
+use crate::model::{Actor, DutyStatus, LeaseMode, RecordKind, State, Tool, Verb, now_ms};
 use crate::ops::{self, DutySpec, Outcome, SeedSpec};
 use crate::pager::{CliPager, Pager};
 use crate::store::{self, ComposerRecord, EventKind, Store};
@@ -149,6 +147,9 @@ enum Cmd {
     /// Duties (소임).
     #[command(subcommand)]
     Duty(DutyCmd),
+    /// Canonical project schedules and operational work distribution.
+    #[command(subcommand)]
+    Schedule(crate::schedule::ScheduleCmd),
     /// Leases.
     #[command(subcommand)]
     Lease(LeaseCmd),
@@ -193,6 +194,19 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum BuCmd {
+    /// Atomically form a subordinate unit with its existing workers.
+    Form {
+        #[arg(long)]
+        head: String,
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        verbs: Vec<VerbArg>,
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+    },
     /// 개부: open a bu headed by a member below you.
     Open {
         #[arg(long)]
@@ -283,17 +297,16 @@ impl SpecArgs {
     }
 }
 
-/// Resolve a duty's source quote against the caller's own session log.
-pub fn attach_source(store: &Store, session_id: &str, spec: &mut DutySpec) -> Result<()> {
-    if let Some(quote) = &spec.source_quote {
-        let events = store.session(session_id).events()?;
-        spec.source = Some(evidence::recorded_source(session_id, &events, quote)?);
-    }
-    Ok(())
-}
+pub use crate::evidence::attach_source;
 
 #[derive(Subcommand)]
 enum DutyCmd {
+    /// Read the complete contract, even after completion, without changing state.
+    Show {
+        duty: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Issue a duty to a member below you.
     Issue {
         #[arg(long)]
@@ -554,10 +567,9 @@ fn member_op(
     // A state change must not proceed on bindings it could not refresh.
     identity::refresh_bindings(store, pager)?;
     let now = now_ms();
-    let out = store.transact(store::CLI_DEADLINE, |st| {
+    let out = crate::schedule::transaction(store, &caller, |st, actor| {
         ops::expire_leases(st, now);
-        let actor = identity::actor(st, &caller)?;
-        f(st, now, &actor)
+        f(st, now, actor)
     })?;
     print_outcome(json, &out);
     flush_outbox(store, pager);
@@ -621,154 +633,16 @@ fn root_op(
 
 /// Session-log name for markers left by hooks that could not identify their
 /// session; they invalidate pending evidence everywhere.
-pub const GLOBAL_MARKERS: &str = "_global";
+pub use crate::store::GLOBAL_MARKERS;
 
-/// Deliver pending notices through pager and drop the delivered ones.
-/// Failures stay queued for the next call.
-pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
-    // Claim a batch under the lock (so concurrent CLI/MCP calls do not send
-    // the same notice), send outside the lock, then drop what was delivered.
-    // A notice leaves the outbox only after pager accepted it: a crash after
-    // the claim leaves a stale claim that the next flush retries, so delivery
-    // is at least once rather than at most once.
-    let now = now_ms();
-    let Ok(batch) = store.transact(store::CLI_DEADLINE, |st| {
-        let mut batch = Vec::new();
-        for n in st.outbox.iter_mut() {
-            if batch.len() >= MAX_NOTICES_PER_FLUSH {
-                break;
-            }
-            let stale = n
-                .claimed_at
-                .is_none_or(|t| now.saturating_sub(t) >= crate::model::NOTICE_CLAIM_MS);
-            if stale {
-                n.claimed_at = Some(now);
-                batch.push(n.clone());
-            }
-        }
-        Ok(batch)
-    }) else {
-        return;
-    };
-    if batch.is_empty() {
-        return;
-    }
-    let mut delivered = Vec::new();
-    let mut failed = Vec::new();
-    for n in &batch {
-        match pager.send(&n.to_session, &n.body) {
-            Ok(()) => delivered.push(n.id.clone()),
-            Err(e) => {
-                eprintln!("gaebu: notice {} not delivered: {e}", n.id);
-                failed.push(n.id.clone());
-            }
-        }
-    }
-    let result = store.transact(store::CLI_DEADLINE, |st| {
-        let now = now_ms();
-        st.outbox.retain(|n| !delivered.contains(&n.id));
-        let mut given_up = Vec::new();
-        for n in st.outbox.iter_mut() {
-            if failed.contains(&n.id) {
-                n.claimed_at = None;
-                n.attempts += 1;
-                if n.attempts >= MAX_NOTICE_ATTEMPTS {
-                    given_up.push(n.clone());
-                }
-            }
-        }
-        st.outbox.retain(|n| !given_up.iter().any(|g| g.id == n.id));
-        for n in given_up {
-            // Give up, but leave a trace in the team record.
-            if let Some(team) = st.members.get(&n.to_member).map(|m| m.team.clone()) {
-                let id = st.mint("r");
-                st.records.push(crate::model::Record {
-                    id,
-                    team,
-                    kind: RecordKind::Note,
-                    author: n.to_member.clone(),
-                    refs: vec![n.id.clone()],
-                    text: format!(
-                        "undelivered notice after {} attempts: {}",
-                        n.attempts, n.body
-                    ),
-                    at: now,
-                });
-            }
-        }
-        Ok(())
-    });
-    if let Err(e) = result {
-        // Delivered notices may be sent again by a later flush (their claim
-        // goes stale); failed ones stay claimed until then. Nothing is lost.
-        eprintln!("gaebu: outbox bookkeeping deferred: {e}");
-    }
-}
-
-/// Notices sent per call, so a backlog never stalls a command for long.
-const MAX_NOTICES_PER_FLUSH: usize = 10;
-/// Attempts before a notice is dropped into the team record.
-const MAX_NOTICE_ATTEMPTS: u32 = 10;
+pub use crate::pager::flush_outbox;
 
 /// Lease minutes to ms, capped at the 8 h maximum ops enforces anyway.
 fn ttl_ms(minutes: Option<u64>) -> Option<u64> {
     minutes.map(|m| m.min(8 * 60).saturating_mul(60_000))
 }
 
-/// Resolve a member reference: id (`m-3`), pager alias, or title, among
-/// active members (the caller's team first).
-pub fn resolve_member(st: &State, team: Option<&str>, reference: &str) -> Result<String> {
-    if let Some(m) = st.members.get(reference) {
-        return Ok(m.id.clone());
-    }
-    let active = || {
-        st.members
-            .values()
-            .filter(|m| m.status == MemberStatus::Active)
-    };
-    let pick = |hits: Vec<&crate::model::Member>| -> Option<String> {
-        let in_team: Vec<_> = hits
-            .iter()
-            .filter(|m| team.map(|t| m.team == t).unwrap_or(true))
-            .collect();
-        if in_team.len() == 1 {
-            Some(in_team[0].id.clone())
-        } else if hits.len() == 1 {
-            Some(hits[0].id.clone())
-        } else {
-            None
-        }
-    };
-    if let Some(id) = pick(active().filter(|m| m.binding.alias == reference).collect()) {
-        return Ok(id);
-    }
-    if let Some(id) = pick(active().filter(|m| m.title == reference).collect()) {
-        return Ok(id);
-    }
-    Err(Error::new(
-        Reason::NotFound,
-        format!("no single active member matches '{reference}'"),
-    ))
-}
-
-/// Resolve a bu reference: id (`b-2`) or name.
-pub fn resolve_bu(st: &State, team: Option<&str>, reference: &str) -> Result<String> {
-    if st.bus.contains_key(reference) {
-        return Ok(reference.to_string());
-    }
-    let hits: Vec<_> = st
-        .bus
-        .values()
-        .filter(|b| b.name == reference && team.map(|t| b.team == t).unwrap_or(true))
-        .collect();
-    match hits.as_slice() {
-        [one] => Ok(one.id.clone()),
-        _ => Err(Error::new(
-            Reason::NotFound,
-            format!("no single bu matches '{reference}'"),
-        )),
-    }
-}
+pub use crate::authz::{resolve_bu, resolve_member};
 
 fn team_of(st: &State, actor: &Actor) -> Option<String> {
     st.members.get(&actor.member).map(|m| m.team.clone())
@@ -779,26 +653,30 @@ fn print_board(v: &card::BoardView) {
     for t in &v.teams {
         println!("팀 {} ({}) — {}", t.name, t.status, t.commander);
         for b in &t.bus {
+            let indent = "  ".repeat(b.depth + 1);
             match &b.hold {
                 Some(until) => println!(
-                    "  {} [{}] 장: {} · 보류 — {until}",
+                    "{indent}{} [{}] 장: {} · 보류 — {until}",
                     b.name, b.status, b.head
                 ),
-                None => println!("  {} [{}] 장: {}", b.name, b.status, b.head),
+                None => println!("{indent}{} [{}] 장: {}", b.name, b.status, b.head),
             }
             for m in &b.members {
-                println!("    {} · {}", m.display, m.binding);
+                println!("{indent}  {} · {}", m.display, m.binding);
                 for d in &m.duties {
                     match &d.hold {
                         Some(until) => println!(
-                            "      소임 {} [{}] {} — {until}",
+                            "{indent}    소임 {} [{}] {} — {until}",
                             d.id, d.stage_label, d.outcome
                         ),
-                        None => println!("      소임 {} [{}] {}", d.id, d.stage_label, d.outcome),
+                        None => println!(
+                            "{indent}    소임 {} [{}] {}",
+                            d.id, d.stage_label, d.outcome
+                        ),
                     }
                 }
                 for l in &m.leases {
-                    println!("      점유 {l}");
+                    println!("{indent}    점유 {l}");
                 }
             }
         }
@@ -862,7 +740,7 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 Some(s) => s,
                 None => identity::from_pager(pager)?.session_id,
             };
-            let st = store.read()?;
+            let st = store.read_view()?;
             let member = crate::authz::member_for_session(&st, &session_id)
                 .ok_or_else(|| {
                     Error::new(Reason::NotMember, "this session holds no seat in any team")
@@ -874,8 +752,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 .sighting()
                 .ok()
                 .and_then(|s| s.last_seen);
-            let c = card::build(&st, &member, now_ms(), last_seen)
+            let mut c = card::build(&st, &member, now_ms(), last_seen)
                 .ok_or_else(|| Error::new(Reason::NotMember, "member is not active"))?;
+            card::enrich(&store, &st, &mut c);
             if json {
                 print_json(&c);
             } else if text_only {
@@ -901,8 +780,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             if let Err(e) = identity::refresh_bindings(&store, pager) {
                 eprintln!("gaebu: binding refresh skipped: {e}");
             }
-            let st = store.read()?;
-            let v = card::board(&st, now_ms(), None, &|sid| store.last_seen(sid));
+            let st = store.read_view()?;
+            let mut v = card::board(&st, now_ms(), None, &|sid| store.last_seen(sid));
+            card::enrich_board(&store, &st, &mut v);
             if since.as_deref() == Some(v.token.as_str()) {
                 if json {
                     println!(
@@ -1018,6 +898,27 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             member_op(&store, pager, json, |st, now, actor| {
                 let team = team_of(st, actor);
                 match b {
+                    BuCmd::Form {
+                        head,
+                        members,
+                        name,
+                        verbs,
+                        scope,
+                    } => {
+                        let verbs = verbs.into_iter().map(Into::into).collect();
+                        ops::bu_form(
+                            st,
+                            now,
+                            actor,
+                            &ops::BuFormSpec {
+                                head,
+                                members,
+                                name,
+                                verbs,
+                                scope,
+                            },
+                        )
+                    }
                     BuCmd::Open {
                         head,
                         name,
@@ -1083,11 +984,44 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 ops::title_set(st, now, actor, &m, &title)
             })
         }
+        Cmd::Schedule(cmd) => crate::schedule::run_cli(cmd, json, pager),
+        Cmd::Duty(DutyCmd::Show { duty, session }) => {
+            let store = open_store()?;
+            let session = match session {
+                Some(s) => s,
+                None => identity::from_pager(pager)?.session_id,
+            };
+            let state = store.read_view()?;
+            let duty = card::full_duty(&state, &session, &duty)?;
+            if json {
+                print_json(duty);
+            } else {
+                println!(
+                    "{} [{}] {}\n의도: {}\n범위: {}\n결정권: {}\n완료 기준: {}\n계획: {}\n작업 위치: {}\n버전: {}\n메모: {}",
+                    duty.id,
+                    card::status_word(duty.status),
+                    duty.outcome,
+                    duty.intent,
+                    duty.scope.join(", "),
+                    duty.decision_rights,
+                    duty.done_criteria,
+                    duty.plan_ref.as_deref().unwrap_or("—"),
+                    duty.exec_root.as_deref().unwrap_or("—"),
+                    duty.version,
+                    duty.note.as_deref().unwrap_or("—")
+                );
+            }
+            Ok(())
+        }
         Cmd::Duty(d) => {
             let store = open_store()?;
             member_op(&store, pager, json, |st, now, actor| {
                 let team = team_of(st, actor);
                 match d {
+                    DutyCmd::Show { .. } => Err(Error::new(
+                        Reason::InvalidArgument,
+                        "duty show is read-only",
+                    )),
                     DutyCmd::Issue { to, spec } => {
                         let m = resolve_member(st, team.as_deref(), &to)?;
                         let mut spec = spec.spec();

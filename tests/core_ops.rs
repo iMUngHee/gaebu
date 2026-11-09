@@ -1088,6 +1088,401 @@ fn superior_closes_only_clean_subordinate_bu() {
     assert_eq!(s.bus[&bu].status, BuStatus::Closed);
 }
 
+#[test]
+fn bu_close_returns_active_seats_without_rewriting_authority_or_duty_origin() {
+    let (mut s, a, b, c) = setup();
+    let parent = s_bu(&a, &s);
+    let bu = ops::bu_open(
+        &mut s,
+        11,
+        &a,
+        &b.member,
+        None,
+        &[Verb::Assign, Verb::Open],
+        &scope(),
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
+    ops::grant(&mut s, 13, &b, &c.member, &[Verb::Assign], &scope()).unwrap();
+    let duty = accept(&mut s, &b, &c);
+    ops::duty_progress(&mut s, 22, &c, &duty, DutyStatus::Done, None).unwrap();
+    ops::root_hold(&mut s, 23, &hev("root-session", 1), &duty, "keep history").unwrap();
+    ops::root_hold(&mut s, 24, &hev("root-session", 2), &bu, "unit history").unwrap();
+    let prior_duty = s.duties[&duty].clone();
+    let prior_grants = s.grants.clone();
+    let prior_binding = s.members[&c.member].binding.clone();
+    let effective_grants: Vec<_> = authz::effective_grants(&s, &c.member)
+        .iter()
+        .map(|g| g.id.clone())
+        .collect();
+    s.outbox.clear();
+
+    ops::bu_close(&mut s, 25, &a, &bu).unwrap();
+
+    assert_eq!(s.bus[&bu].status, BuStatus::Closed);
+    assert_eq!(s.members[&b.member].bu, parent);
+    assert_eq!(s.members[&c.member].bu, parent);
+    assert_eq!(
+        s.members[&b.member].superior.as_deref(),
+        Some(a.member.as_str())
+    );
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(b.member.as_str())
+    );
+    assert!(authz::check_actor(&s, &b).is_ok());
+    assert!(authz::check_actor(&s, &c).is_ok());
+    assert_eq!(s.members[&c.member].binding, prior_binding);
+    assert_eq!(s.grants, prior_grants);
+    assert_eq!(s.duties[&duty], prior_duty);
+    assert!(s.bus[&bu].hold.is_some());
+    assert_eq!(
+        authz::effective_grants(&s, &c.member)
+            .iter()
+            .map(|g| g.id.clone())
+            .collect::<Vec<_>>(),
+        effective_grants
+    );
+    let recipients: std::collections::BTreeSet<_> =
+        s.outbox.iter().map(|n| n.to_member.as_str()).collect();
+    assert_eq!(recipients, [b.member.as_str(), c.member.as_str()].into());
+}
+
+#[test]
+fn bu_close_recovers_members_left_in_a_legacy_closed_unit() {
+    let (mut s, a, b, c) = setup();
+    let parent = s_bu(&a, &s);
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
+    s.bus.get_mut(&bu).unwrap().status = BuStatus::Closed;
+    s.outbox.clear();
+
+    assert_eq!(
+        ops::bu_close(&mut s, 13, &a, &bu).unwrap().summary,
+        "bu closed"
+    );
+
+    assert_eq!(s.members[&b.member].bu, parent);
+    assert_eq!(s.members[&c.member].bu, parent);
+    assert!(authz::check_actor(&s, &b).is_ok());
+    assert!(authz::check_actor(&s, &c).is_ok());
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(b.member.as_str())
+    );
+    let recipients: std::collections::BTreeSet<_> =
+        s.outbox.iter().map(|n| n.to_member.as_str()).collect();
+    assert_eq!(recipients, [b.member.as_str(), c.member.as_str()].into());
+}
+
+#[test]
+fn bu_close_refuses_a_non_live_parent_without_mutation() {
+    let (mut s, a, b, c) = setup();
+    let parent = ops::bu_open(&mut s, 11, &a, &b.member, None, &[Verb::Open], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &parent).unwrap();
+    let child = ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.bus.get_mut(&parent).unwrap().status = BuStatus::Closed;
+    let before = s.clone();
+
+    assert_eq!(
+        ops::bu_close(&mut s, 14, &a, &child).unwrap_err().reason,
+        Reason::Cancelled
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
+fn bu_close_keeps_root_and_cancelled_units_terminal() {
+    let (mut s, a, b, _) = setup();
+    let root = s_bu(&a, &s);
+    let before = s.clone();
+    assert_eq!(
+        ops::bu_close(&mut s, 11, &a, &root).unwrap_err().reason,
+        Reason::NoGrant
+    );
+    assert_eq!(s, before);
+    let bu = ops::bu_open(&mut s, 12, &a, &b.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::bu_cancel(&mut s, 13, &a, &bu, "human cancelled").unwrap();
+    let cancelled = s.clone();
+    assert_eq!(
+        ops::bu_close(&mut s, 14, &a, &bu).unwrap_err().reason,
+        Reason::Cancelled
+    );
+    assert_eq!(s, cancelled);
+}
+
+#[test]
+fn bu_close_does_not_return_dismissed_seats_or_change_pending_binding() {
+    let (mut s, a, b, _) = setup();
+    let root = s_bu(&a, &s);
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    let pending = ops::member_add(&mut s, 12, &a, &bu, "pending-worker", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    let dismissed = ops::member_add(&mut s, 13, &a, &bu, "dismissed-worker", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::root_dismiss(&mut s, 15, &ev(15), "dismissed-worker").unwrap();
+    let pending_binding = s.members[&pending].binding.clone();
+    let dismissed_seat = s.members[&dismissed].clone();
+    ops::bu_close(&mut s, 16, &a, &bu).unwrap();
+
+    assert_eq!(s.members[&pending].bu, root);
+    assert_eq!(s.members[&pending].binding, pending_binding);
+    assert_eq!(s.members[&dismissed], dismissed_seat);
+    let after_close = s.clone();
+    assert_eq!(
+        ops::bu_close(&mut s, 17, &a, &bu).unwrap().summary,
+        "already closed"
+    );
+    assert_eq!(s, after_close);
+}
+
+#[test]
+fn bu_close_sets_former_head_superior_to_the_parent_head() {
+    let (mut s, a, b, c) = setup();
+    let first = ops::bu_open(
+        &mut s,
+        11,
+        &a,
+        &b.member,
+        None,
+        &[Verb::Open, Verb::Assign],
+        &scope(),
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &first).unwrap();
+    ops::bu_close(&mut s, 13, &a, &first).unwrap();
+    let second = ops::bu_open(&mut s, 14, &b, &c.member, None, &[], &[])
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(b.member.as_str())
+    );
+
+    ops::bu_close(&mut s, 15, &a, &second).unwrap();
+
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(a.member.as_str())
+    );
+    assert_eq!(s.members[&c.member].bu, s_bu(&a, &s));
+    assert!(authz::check_actor(&s, &c).is_ok());
+}
+
+#[test]
+fn bu_form_organizes_selected_workers_without_moving_existing_duties() {
+    let (mut s, a, b, c) = setup();
+    let parent = s_bu(&a, &s);
+    let duty = accept(&mut s, &a, &c);
+    ops::root_hold(&mut s, 22, &hev("root-session", 1), &duty, "original stop").unwrap();
+    let prior_duty = s.duties[&duty].clone();
+    s.outbox.clear();
+
+    let result = ops::bu_form(
+        &mut s,
+        23,
+        &a,
+        &ops::BuFormSpec {
+            head: "child".into(),
+            members: vec!["other".into()],
+            name: Some("Delivery unit".into()),
+            verbs: vec![Verb::Assign, Verb::Open],
+            scope: scope(),
+        },
+    )
+    .unwrap();
+    let bu = &result.ids[0];
+
+    assert_eq!(s.bus[bu].name, "Delivery unit");
+    assert_eq!(s.bus[bu].parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(s.bus[bu].head, b.member);
+    assert_eq!(s.members[&b.member].bu, *bu);
+    assert_eq!(s.members[&c.member].bu, *bu);
+    assert_eq!(
+        s.members[&c.member].superior.as_deref(),
+        Some(b.member.as_str())
+    );
+    assert_eq!(s.duties[&duty], prior_duty);
+    assert!(
+        authz::holds(&s, &s.duties[&duty])
+            .iter()
+            .any(|h| h.until == "original stop")
+    );
+    assert!(authz::require(&s, &b.member, Verb::Assign, &scope()).is_ok());
+    assert_eq!(
+        authz::require(&s, &b.member, Verb::Assign, &["docs/**".into()])
+            .unwrap_err()
+            .reason,
+        Reason::OutOfScope
+    );
+    ops::duty_issue(&mut s, 24, &b, &c.member, spec()).unwrap();
+    assert!(result.summary.contains("origin"), "{}", result.summary);
+}
+
+#[test]
+fn bu_form_rolls_back_created_unit_grants_ids_and_notices_on_failure() {
+    let (mut s, a, b, c) = setup();
+    ops::bu_open(&mut s, 11, &a, &c.member, None, &[], &[]).unwrap();
+    let before = s.clone();
+
+    assert_eq!(
+        ops::bu_form(
+            &mut s,
+            12,
+            &a,
+            &ops::BuFormSpec {
+                head: b.member,
+                members: vec![c.member],
+                verbs: vec![Verb::Assign],
+                scope: scope(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .reason,
+        Reason::Conflict
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
+fn bu_form_rejects_duplicate_aliases_and_head_in_worker_list() {
+    let (mut s, a, b, c) = setup();
+    for members in [vec!["other".into(), c.member], vec!["child".into()]] {
+        let before = s.clone();
+        assert_eq!(
+            ops::bu_form(
+                &mut s,
+                11,
+                &a,
+                &ops::BuFormSpec {
+                    head: b.member.clone(),
+                    members,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .reason,
+            Reason::InvalidArgument
+        );
+        assert_eq!(s, before);
+    }
+}
+
+#[test]
+fn bu_form_requires_reassign_for_workers_and_cannot_widen_delegated_scope() {
+    let (mut s, a, b, c) = setup();
+    ops::grant(
+        &mut s,
+        11,
+        &a,
+        &b.member,
+        &[Verb::Assign, Verb::Open],
+        &scope(),
+    )
+    .unwrap();
+    s.members.get_mut(&c.member).unwrap().superior = Some(b.member.clone());
+    let parent = s_bu(&a, &s);
+    let worker = ops::member_add(&mut s, 12, &a, &parent, "fourth", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.members.get_mut(&worker).unwrap().superior = Some(b.member.clone());
+    let before = s.clone();
+
+    assert_eq!(
+        ops::bu_form(
+            &mut s,
+            13,
+            &b,
+            &ops::BuFormSpec {
+                head: c.member.clone(),
+                members: vec![worker],
+                verbs: vec![Verb::Assign],
+                scope: scope(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .reason,
+        Reason::NoGrant
+    );
+    assert_eq!(s, before);
+    assert_eq!(
+        ops::bu_form(
+            &mut s,
+            14,
+            &b,
+            &ops::BuFormSpec {
+                head: c.member,
+                verbs: vec![Verb::Assign],
+                scope: vec!["docs/**".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .reason,
+        Reason::OutOfScope
+    );
+    assert_eq!(s, before);
+}
+
+#[test]
+fn bu_form_reuses_closed_head_and_workers_with_same_grants_and_seats() {
+    let (mut s, a, b, c) = setup();
+    let bu = ops::bu_open(&mut s, 11, &a, &b.member, None, &[Verb::Assign], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
+    let grants = s.grants.clone();
+    ops::bu_close(&mut s, 13, &a, &bu).unwrap();
+
+    let formed = ops::bu_form(
+        &mut s,
+        14,
+        &a,
+        &ops::BuFormSpec {
+            head: b.member.clone(),
+            members: vec![c.member.clone()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert_ne!(formed.ids[0], bu);
+    assert_eq!(s.members[&b.member].bu, formed.ids[0]);
+    assert_eq!(s.members[&c.member].bu, formed.ids[0]);
+    assert_eq!(s.grants, grants);
+    assert!(authz::check_actor(&s, &b).is_ok());
+    assert!(authz::require(&s, &b.member, Verb::Assign, &scope()).is_ok());
+    ops::duty_issue(&mut s, 15, &b, &c.member, spec()).unwrap();
+}
+
 // ----- human holds (plan gaebu-v0-2, Decisions 2, 5–7) -----
 
 /// Root evidence quoted in `session`'s current prompt.
@@ -1732,7 +2127,7 @@ fn notice_classification_matrix() {
             |s, a, _, _, bu| {
                 ops::bu_close(s, 40, a, bu).unwrap();
             },
-            false,
+            true,
         ),
         (
             "bu_cancel",

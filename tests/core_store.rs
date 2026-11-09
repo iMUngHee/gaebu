@@ -392,14 +392,97 @@ fn legacy_sighting_defaults_pending_throttle_fields() {
 // ----- schema v2 migration (plan gaebu-v0-2, Decisions 12–12d) -----
 
 const V1: &str = include_str!("fixtures/state-v1.json");
-const FUTURE: &str = r#"{"schema_version":3,"teams":"a newer shape this model cannot parse"}"#;
+const FUTURE: &str = r#"{"schema_version":4,"teams":"a newer shape this model cannot parse"}"#;
 
 fn json(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
-/// The fixture migrated by a real transaction, as v2 bytes.
-fn v2_bytes() -> Vec<u8> {
+#[test]
+fn schema_two_migrates_with_original_backup_and_current_previous_generation() {
+    let home = Home::new();
+    let mut legacy = serde_json::to_value(State::default()).unwrap();
+    legacy["schema_version"] = 2.into();
+    legacy.as_object_mut().unwrap().remove("runtime_id");
+    legacy.as_object_mut().unwrap().remove("schedules");
+    let original = serde_json::to_vec(&legacy).unwrap();
+    fs::write(home.0.join("state.json"), &original).unwrap();
+    home.store()
+        .transact(Duration::from_secs(5), |_| Ok(()))
+        .unwrap();
+    let current = json(&home.0.join("state.json"));
+    assert_eq!(current["schema_version"], 3);
+    assert!(!current["runtime_id"].as_str().unwrap().is_empty());
+    assert_eq!(fs::read(home.0.join("state.v2.json")).unwrap(), original);
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 3);
+    assert_eq!(current["schedules"], serde_json::json!({}));
+}
+
+#[test]
+fn runtime_origin_is_stable_after_commit_and_distinct_between_stores() {
+    let one = Home::new();
+    let two = Home::new();
+    for home in [&one, &two] {
+        home.store()
+            .transact(Duration::from_secs(5), |_| Ok(()))
+            .unwrap();
+    }
+    let origin = json(&one.0.join("state.json"))["runtime_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!origin.is_empty());
+    one.store()
+        .transact(Duration::from_secs(5), |_| Ok(()))
+        .unwrap();
+    assert_eq!(json(&one.0.join("state.json"))["runtime_id"], origin);
+    assert_ne!(json(&two.0.join("state.json"))["runtime_id"], origin);
+}
+
+#[test]
+fn authoritative_read_never_uses_previous_generation_to_prove_absence() {
+    let home = Home::new();
+    assert_eq!(
+        home.store().read_current().unwrap_err().reason,
+        Reason::NotFound
+    );
+    for _ in 0..2 {
+        home.store()
+            .transact(Duration::from_secs(5), |_| Ok(()))
+            .unwrap();
+    }
+    let previous = home.store().read().unwrap();
+    fs::write(home.0.join("state.json"), "{").unwrap();
+    assert_eq!(home.store().read().unwrap().runtime_id, previous.runtime_id);
+    assert_eq!(
+        home.store().read_current().unwrap_err().reason,
+        Reason::StoreCorrupt
+    );
+}
+
+#[test]
+fn view_reads_distinguish_first_use_from_corrupt_or_missing_runtime() {
+    let home = Home::new();
+    assert_eq!(home.store().read_view().unwrap(), State::default());
+    for _ in 0..2 {
+        home.store()
+            .transact(Duration::from_secs(5), |_| Ok(()))
+            .unwrap();
+    }
+    fs::write(home.0.join("state.json"), "{").unwrap();
+    assert_eq!(
+        home.store().read_view().unwrap_err().reason,
+        Reason::StoreCorrupt
+    );
+    fs::remove_file(home.0.join("state.json")).unwrap();
+    assert_eq!(
+        home.store().read_view().unwrap_err().reason,
+        Reason::NotFound
+    );
+}
+
+/// The fixture migrated by a real transaction, as current-schema bytes.
+fn current_bytes() -> Vec<u8> {
     let home = Home::new();
     fs::write(home.0.join("state.json"), V1).unwrap();
     home.store()
@@ -409,14 +492,14 @@ fn v2_bytes() -> Vec<u8> {
 }
 
 #[test]
-fn v1_fixture_migrates_to_v2() {
+fn v1_fixture_migrates_to_current() {
     let home = Home::new();
     fs::write(home.0.join("state.json"), V1).unwrap();
     home.store()
         .transact(Duration::from_secs(5), |_| Ok(()))
         .unwrap();
     let st = json(&home.0.join("state.json"));
-    assert_eq!(st["schema_version"], 2);
+    assert_eq!(st["schema_version"], gaebu::model::SCHEMA_VERSION);
     assert_eq!(st["grants"]["g-4"]["evidence"]["strength"], "inferred");
     assert_eq!(st["escalations"]["e-21"]["status"], "superseded");
     assert_eq!(st["escalations"]["e-21"]["superseded_by"], "e-22");
@@ -444,7 +527,7 @@ fn v1_fixture_migrates_to_v2() {
 }
 
 #[test]
-fn migration_keeps_v1_backup_and_v2_prev() {
+fn migration_keeps_v1_backup_and_current_prev() {
     let home = Home::new();
     let store = home.store();
     fs::write(home.0.join("state.json"), V1).unwrap();
@@ -453,7 +536,10 @@ fn migration_keeps_v1_backup_and_v2_prev() {
         fs::read(home.0.join("state.v1.json")).unwrap(),
         V1.as_bytes()
     );
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    assert_eq!(
+        json(&home.0.join("state.prev.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
     // A second schema-1 file (restored by hand) migrates again but never
     // replaces the first original.
     let other = V1.replacen("\"rev\": ", "\"rev\": 9", 1);
@@ -463,14 +549,17 @@ fn migration_keeps_v1_backup_and_v2_prev() {
         fs::read(home.0.join("state.v1.json")).unwrap(),
         V1.as_bytes()
     );
-    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
+    assert_eq!(
+        json(&home.0.join("state.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
 }
 
 #[test]
 fn future_schema_refused_without_fallback() {
     let home = Home::new();
     let store = home.store();
-    fs::write(home.0.join("state.prev.json"), v2_bytes()).unwrap();
+    fs::write(home.0.join("state.prev.json"), current_bytes()).unwrap();
     fs::write(home.0.join("state.json"), FUTURE).unwrap();
     assert_eq!(store.read().unwrap_err().reason, Reason::StoreUnsupported);
     let err = store
@@ -485,11 +574,11 @@ fn future_schema_refused_without_fallback() {
 
 #[test]
 fn migration_resumes_after_partial_write() {
-    // Interrupted after the backup and the v2 prev, before state.json.
+    // Interrupted after the backup and the current-schema prev, before state.json.
     let home = Home::new();
     let store = home.store();
     fs::write(home.0.join("state.v1.json"), V1).unwrap();
-    fs::write(home.0.join("state.prev.json"), v2_bytes()).unwrap();
+    fs::write(home.0.join("state.prev.json"), current_bytes()).unwrap();
     fs::write(home.0.join("state.json"), V1).unwrap();
     let v1_rev = serde_json::from_str::<serde_json::Value>(V1).unwrap()["rev"]
         .as_u64()
@@ -504,13 +593,16 @@ fn migration_resumes_after_partial_write() {
         .unwrap();
     assert_eq!(calls.get(), 1);
     let st = json(&home.0.join("state.json"));
-    assert_eq!(st["schema_version"], 2);
+    assert_eq!(st["schema_version"], gaebu::model::SCHEMA_VERSION);
     assert_eq!(
         st["rev"],
         v1_rev + 2,
         "one migration commit, one user commit"
     );
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    assert_eq!(
+        json(&home.0.join("state.prev.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
     assert_eq!(
         fs::read(home.0.join("state.v1.json")).unwrap(),
         V1.as_bytes()
@@ -539,7 +631,7 @@ fn failed_migration_skips_user_change() {
 #[test]
 fn repair_refuses_unsupported_state() {
     let home = Home::new();
-    let prev = v2_bytes();
+    let prev = current_bytes();
     fs::write(home.0.join("state.prev.json"), &prev).unwrap();
     fs::write(home.0.join("state.json"), FUTURE).unwrap();
     let err = home.store().repair().unwrap_err();
@@ -557,20 +649,29 @@ fn repair_from_v1_prev_migrates_consistently() {
     fs::write(home.0.join("state.json"), "{").unwrap();
     fs::write(home.0.join("state.prev.json"), V1).unwrap();
     home.store().repair().unwrap();
-    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 2);
+    assert_eq!(
+        json(&home.0.join("state.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
+    assert_eq!(
+        json(&home.0.join("state.prev.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
     assert_eq!(
         fs::read(home.0.join("state.v1.json")).unwrap(),
         V1.as_bytes()
     );
-    // Interrupted after prev ← v2: the next repair finishes from the v2 prev.
+    // Interrupted after prev ← current schema: the next repair finishes from the current-schema prev.
     let home = Home::new();
-    let prev = v2_bytes();
+    let prev = current_bytes();
     fs::write(home.0.join("state.json"), "{").unwrap();
     fs::write(home.0.join("state.prev.json"), &prev).unwrap();
     fs::write(home.0.join("state.v1.json"), V1).unwrap();
     home.store().repair().unwrap();
-    assert_eq!(json(&home.0.join("state.json"))["schema_version"], 2);
+    assert_eq!(
+        json(&home.0.join("state.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
     assert_eq!(fs::read(home.0.join("state.prev.json")).unwrap(), prev);
     assert_eq!(
         fs::read(home.0.join("state.v1.json")).unwrap(),
