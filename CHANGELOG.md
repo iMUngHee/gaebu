@@ -9,6 +9,46 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.3.0 — 2026-11-10
+
+### Added
+
+- A canonical project `schedule.md` between PM references and individual
+  duties. `schedule init`/`attach`, CLI/MCP item updates and commander or
+  delegated-manager mode retain backlog, dependencies, ownership and explicit
+  task-master review. PM references stay separate from PM lifecycle updates.
+  See [the Schedule guide](docs/schedules.md). (ff4e7fb)
+- Immutable dispatch manifests, stable retry tokens, reconciliation and
+  authoritative-absence abandonment prevent duplicate duties and stale-token
+  replay. Schedule holds and cancellation are checked when accepting or
+  executing linked duties and taking or renewing leases. (ff4e7fb)
+- `bu form` and MCP `bu_form` atomically create a nested unit, move selected
+  members and attenuate grants. Closing a clean unit returns seats to its
+  parent for reuse while preserving historical duty origin. Parent-first
+  Board output, full `duty show`/`duty_get` and role-specific summaries support
+  recovery after context loss. (ff4e7fb)
+
+### Changed
+
+- The native mod is an operations desk: attention queue, selected inspector,
+  nested organization and full contract reader. Wide panes split; narrow panes
+  stack. Keyboard navigation, stale/unknown recovery, completed-duty detail,
+  Korean wrapping and the prompt band share the same CLI facts. (424b337)
+
+### Upgrading
+
+Runtime schema is now 3. The first write keeps the exact legacy original in
+`state.v1.json` or `state.v2.json` and publishes schema 3 to current and previous
+generations. A 0.1/0.2 binary cannot read this state. Upgrade the binary and
+restart resident MCP processes before continuing coordinated work. Existing
+team and superior links remain; a separate scheduler is optional. (ff4e7fb)
+
+Unknown free-form Schedule files are refused without overwrite; there is no
+automatic conversion of an unseen legacy format. Cross-machine copies retain
+foreign origins rather than guessing local numeric identities. Windows GNU
+and the installed native mod engine were tested; other platform and physical
+terminal checks are listed in [PLATFORMS.md](PLATFORMS.md).
+
 ## 0.2.2 — 2026-11-04
 
 ### Changed
