@@ -1,5 +1,49 @@
 # Verification snapshot
 
+## 0.3.0 scheduling and nested units — 2026-11-10
+
+Checked on Windows with Rust 1.99.1, `x86_64-pc-windows-gnu`, and Claude
+Code 2.1.317. These results describe this feature; older checkpoints below
+retain their original deployment and acceptance limits.
+
+| Criterion | Evidence |
+| --- | --- |
+| Canonical project artifact | Markdown prose/Korean/CRLF round-trip, strict fields and IDs, dependency cycles, stale-revision refusal and unchanged prior-file assertions in `schedule_flow`. Unknown legacy prose is refused without overwrite. |
+| Optional manager | Actual CLI/MCP processes switched commander/delegated mode without changing superior links; a manager's attempt to command a sibling worker returned `no_grant`. |
+| Assignment and acceptance | Actual worker `Done` left work in `review` and its successor in `dependency_wait`; task-master signoff produced `complete` and `ready`. Unassigned backlog survived fresh processes. |
+| Dispatch and recovery | Same-key retry reused its token and duty. Thread and real two-child-process races, reservation-only recovery, tombstones, foreign origins and missing/corrupt-current refusal have persistent regressions. |
+| Holds and immutable contracts | A real current-prompt CLI hold blocked MCP acceptance with `held`. Separate field/origin corruption fixtures assert refusal and byte-identical authoritative state. Runtime semantic amendments cannot bypass the manifest. |
+| Direct task-master execution | Real MCP calls refused Schedule ownership alone with `out_of_scope`; an ordinary accepted duty from the actual superior allowed the lease; holding it refused new use. A persistent test also covers proposed duties and lease renewal/release. |
+| Nested units | Atomic form failure preserves state/IDs/notices; scoped grants attenuate. Actual close/reform reused seats and preserved command links. Tests cover legacy closed seats, cancellation, holds and historical duty origin. |
+| Context and PM mapping | Ended-duty CLI/MCP reads recover full contracts, source, plan and execution root. Cards remain at most 12 lines. PM references are stored metadata, explicitly unresolved; this release does not resolve or write the PM lifecycle. |
+| Native operations UI | `claude plugin test mod`: 25 passed, 0 failed. The installed renderer produced 26 native terminal element trees over 13 states at 80x24 and 160x50. A 117-cell Pane stacks and a 118-cell Pane splits even within a wider viewport. Keyboard routes, selected-row window, completed detail, long Korean, stale/partial/unknown and dispatch-recovery attention are asserted. |
+| Schema compatibility | Schema 1/2 original backups, schema 3 current/previous generations, stable runtime origins, future-schema refusal and strict current-state absence reads are tested. Older readers must be replaced before using coordinated work. |
+| Rust checks | Strict clippy passed; nextest ran 224 tests, all passed, with 3 helper entry points skipped. Doctests ran successfully with 0 examples. Format/whitespace checks and a release build passed. |
+| Independent checks | Fresh design review approved the revised lifecycle contracts. Goal verification exercised real CLI/MCP flows and native engine evidence; it found and verified the corrected dependency projection. Pre-commit review reported 6 passed, 0 failed and a change-size warning, addressed by separate core/UI/release commits. |
+
+The first targeted safety mutation pass found 9 surviving mutations among 54.
+Four new tests isolate runtime manifest fields, foreign dispatch origins,
+canonical hash corruption and direct-master leases. The final scoped rerun
+tested all 54 selected safety mutants and caught all 54. The selection covers
+runtime origin, prerequisite readiness, linked-duty guards, immutable duty
+matching and strict view reads; it is not a claim that every possible mutation
+in this feature was tested.
+
+```text
+cargo mutants --in-diff <fresh Rust diff> --test-tool nextest \
+  --re '(matching_origin|dependencies_ready|guard_duty|duty_matches|Store::read_view)' \
+  -j 2 --timeout 90 --output <scratch output>
+54 mutants tested in 6m: 54 caught
+```
+
+The native UI evidence is an installed-engine element tree, style properties
+and exercised handlers, not a raster screenshot or physical-terminal test.
+`claude plugin validate mod` passes with existing missing-author/catalog-icon
+warnings. Physical terminal fonts/themes/focus, manual user operation and
+Linux/macOS remain pending in [PLATFORMS.md](../PLATFORMS.md). Global binary,
+hook, MCP and mod deployment was not part of this checkout change. The unseen
+free-form Schedule on another computer has not been imported or converted.
+
 ## 0.2.0 (plan `gaebu-v0-2`)
 
 Checked on 2026-11-04 on Windows with `stable-x86_64-pc-windows-gnu`, branch
