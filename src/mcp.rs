@@ -102,9 +102,11 @@ fn tools() -> Vec<Value> {
     let string = json!({"type":"string"});
     let strings = json!({"type":"array","items":{"type":"string"}});
     let version = json!({"type":"integer","minimum":1});
-    [
+    let mut list: Vec<Value> = [
         ("me", "Read your current position card", json!({}), vec![]),
         ("board", "Read your team's command tree", json!({}), vec![]),
+        ("duty_get", "Read the complete duty contract, including completed work", json!({"duty":string}), vec!["duty"]),
+        ("bu_form", "Atomically form a subordinate unit with workers and scoped grants", json!({"spec":{"type":"object","properties":{"head":string,"members":strings,"name":{"type":["string","null"]},"verbs":strings,"scope":strings},"required":["head","members","verbs","scope"],"additionalProperties":false}}), vec!["spec"]),
         ("duty_issue", "Issue an outcome brief to a subordinate", json!({"assignee":string,"spec":{"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":{"type":"string","description":"The user's words this duty answers, quoted from a prompt in your own session"}},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false}}), vec!["assignee","spec"]),
         ("duty_accept", "Accept your duty", json!({"duty":string,"version":version}), vec!["duty"]),
         ("duty_decline", "Decline your duty with a reason", json!({"duty":string,"version":version,"note":string}), vec!["duty","note"]),
@@ -118,7 +120,9 @@ fn tools() -> Vec<Value> {
     ].into_iter().map(|(name, description, properties, required)| json!({
         "name":name,"description":description,
         "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}
-    })).collect()
+    })).collect();
+    list.extend(crate::schedule::tools());
+    list
 }
 
 fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -149,14 +153,27 @@ fn call(
         .ok_or_else(|| Error::new(Reason::InvalidArgument, "arguments must be an object"))?;
     for (key, value) in object {
         let property = &schema["inputSchema"]["properties"][key];
-        let valid = match property["type"].as_str() {
-            Some("string") => value.is_string(),
-            Some("integer") => value.as_u64().is_some_and(|n| n > 0),
-            Some("object") => value.is_object(),
-            Some("array") => value
+        let matches_type = |kind: &str| match kind {
+            "null" => value.is_null(),
+            "string" => value.is_string(),
+            "integer" => value.as_u64().is_some_and(|n| {
+                property["minimum"]
+                    .as_u64()
+                    .is_none_or(|minimum| n >= minimum)
+            }),
+            "boolean" => value.is_boolean(),
+            "object" => value.is_object(),
+            "array" => value
                 .as_array()
                 .is_some_and(|a| a.iter().all(Value::is_string)),
             _ => false,
+        };
+        let valid = if let Some(kind) = property["type"].as_str() {
+            matches_type(kind)
+        } else {
+            property["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().filter_map(Value::as_str).any(matches_type))
         };
         if !valid {
             return Err(Error::new(
@@ -170,17 +187,20 @@ fn call(
         .into_iter()
         .flatten()
     {
-        required(args, key.as_str().unwrap_or("")).or_else(|e| {
-            if key == "spec" && args["spec"].is_object() {
-                Ok("")
-            } else {
-                Err(e)
-            }
-        })?;
+        let key = key.as_str().unwrap_or("");
+        if !object.contains_key(key)
+            || args[key].is_null()
+            || args[key].as_str().is_some_and(str::is_empty)
+        {
+            return Err(Error::new(
+                Reason::InvalidArgument,
+                format!("missing argument {key}"),
+            ));
+        }
     }
     let caller = identity::for_mcp(pager, store, thread)?;
     if let Err(e) = identity::refresh_bindings(store, pager) {
-        if name != "me" && name != "board" {
+        if !matches!(name, "me" | "board" | "duty_get" | "schedule_show") {
             return Err(Error::new(
                 Reason::Busy,
                 format!("binding refresh failed: {e}"),
@@ -189,8 +209,19 @@ fn call(
         eprintln!("gaebu: MCP binding refresh: {e}");
     }
     let now = model::now_ms();
-    if name == "me" || name == "board" {
-        let st = store.read()?;
+    if name.starts_with("schedule_") {
+        return crate::schedule::call(store, pager, &caller, name, args);
+    }
+    if matches!(name, "me" | "board" | "duty_get") {
+        let st = store.read_view()?;
+        if name == "duty_get" {
+            return serde_json::to_value(card::full_duty(
+                &st,
+                &caller.session_id,
+                required(args, "duty")?,
+            )?)
+            .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()));
+        }
         let member = st
             .members
             .values()
@@ -202,29 +233,35 @@ fn call(
             .ok_or_else(|| Error::new(Reason::NotMember, "session has no member"))?;
         if name == "me" {
             let seen = store.session(&caller.session_id).sighting()?.last_seen;
-            let card = card::build(&st, &member.id, now, seen)
+            let mut card = card::build(&st, &member.id, now, seen)
                 .ok_or_else(|| Error::new(Reason::NotMember, "no card"))?;
+            card::enrich(store, &st, &mut card);
             return serde_json::to_value(card)
                 .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()));
         }
-        let view = card::board(&st, now, Some(&member.team), &|sid| store.last_seen(sid));
+        let mut view = card::board(&st, now, Some(&member.team), &|sid| store.last_seen(sid));
+        card::enrich_board(store, &st, &mut view);
         return serde_json::to_value(view)
             .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()));
     }
-    let outcome = store.transact(crate::store::CLI_DEADLINE, |st| {
+    let outcome = crate::schedule::transaction(store, &caller, |st, actor| {
         ops::expire_leases(st, now);
-        let actor = identity::actor(st, &caller)?;
         match name {
+            "bu_form" => {
+                let spec = serde_json::from_value(args["spec"].clone())
+                    .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
+                ops::bu_form(st, now, actor, &spec)
+            }
             "duty_issue" => {
                 let mut spec = serde_json::from_value(args["spec"].clone())
                     .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
-                crate::cli::attach_source(store, &actor.session_id, &mut spec)?;
-                ops::duty_issue(st, now, &actor, required(args, "assignee")?, spec)
+                crate::evidence::attach_source(store, &actor.session_id, &mut spec)?;
+                ops::duty_issue(st, now, actor, required(args, "assignee")?, spec)
             }
             "duty_accept" | "duty_decline" => ops::duty_respond(
                 st,
                 now,
-                &actor,
+                actor,
                 required(args, "duty")?,
                 args["version"].as_u64(),
                 name == "duty_accept",
@@ -233,7 +270,7 @@ fn call(
             "duty_done" => ops::duty_progress(
                 st,
                 now,
-                &actor,
+                actor,
                 required(args, "duty")?,
                 model::DutyStatus::Done,
                 args["note"].as_str(),
@@ -247,32 +284,32 @@ fn call(
                 ops::lease_acquire(
                     st,
                     now,
-                    &actor,
+                    actor,
                     required(args, "key")?,
                     mode,
                     args["ttl_ms"].as_u64(),
                     args["reason"].as_str().unwrap_or(""),
                 )
             }
-            "lease_release" => ops::lease_release(st, now, &actor, required(args, "lease")?),
+            "lease_release" => ops::lease_release(st, now, actor, required(args, "lease")?),
             "escalate" => ops::escalate(
                 st,
                 now,
-                &actor,
+                actor,
                 args["duty"].as_str(),
                 required(args, "question")?,
             ),
             "escalation_answer" => ops::escalation_answer(
                 st,
                 now,
-                &actor,
+                actor,
                 required(args, "escalation")?,
                 required(args, "answer")?,
             ),
             "escalation_withdraw" => ops::escalation_withdraw(
                 st,
                 now,
-                &actor,
+                actor,
                 required(args, "escalation")?,
                 args["note"].as_str(),
             ),
@@ -283,11 +320,11 @@ fn call(
                 let refs: Vec<String> =
                     serde_json::from_value(args.get("refs").cloned().unwrap_or(json!([])))
                         .map_err(|e| Error::new(Reason::InvalidArgument, e.to_string()))?;
-                ops::record_add(st, now, &actor, kind, &refs, required(args, "text")?)
+                ops::record_add(st, now, actor, kind, &refs, required(args, "text")?)
             }
             _ => Err(Error::new(Reason::InvalidArgument, "unknown tool")),
         }
     })?;
-    crate::cli::flush_outbox(store, pager);
+    crate::pager::flush_outbox(store, pager);
     Ok(json!(outcome))
 }

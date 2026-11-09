@@ -67,6 +67,22 @@ the evidence window; that residual risk is accepted for cooperative processes.
 
 ## Deliberate local forgery is outside the model
 
+Project Schedules have the same cooperative-process boundary. The registered
+canonical file and runtime state are separate stores with Schedule-before-State
+locking. A committed dispatch manifest plus token makes runtime materialization
+recoverable and idempotent; it is not a two-file atomic commit. Live execution
+rechecks the manifest, current authority and human stops. Unknown runtime origin,
+corrupt current state and previous-generation recovery data cannot prove a token
+absent. Explicit abandonment leaves a tombstone that rejects delayed replay.
+
+Use CLI/MCP writers for active Schedule changes. Direct edits bypass the file
+lock, revision checks, authority and human-evidence path. Separate computers
+editing independent copies are not coordinated by local OS locks. A copied
+Schedule's member and unit references carry their runtime/team origin and remain
+unresolved until explicitly assigned locally; matching numeric IDs alone grant
+nothing. Existing free-form documents without the recognized schema are refused
+without overwrite.
+
 A process with the same user's filesystem and execution access can forge hook
 stdin, write or alter Gaebu files, invoke the composer-record CLI itself, inject
 host messaging socket content, or use terminal send-keys to imitate typed input.

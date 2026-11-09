@@ -143,6 +143,19 @@ questions, new clues and automated feedback do not lift it [13].
 
 ## Sources and verification
 
+The operational Schedule sits between PM definitions and runtime duties. Follow
+[the Schedule contract](schedules.md) when choosing work, delegating scheduling,
+forming nested units, recovering a dispatch or reviewing a result. A scheduling
+manager routes work to task masters; it does not acquire another command chain.
+The assigned unit's head dispatches its own workers and accepts integrated work.
+Worker completion is a claim awaiting that acceptance. Query the full duty after
+context loss instead of guessing its plan, execution root or escalation rules.
+
+The Schedule's registered path is its canonical source across local worktrees.
+Unknown runtime origin and missing observations are not idle capacity. Human
+holds remain sticky, and moving a member does not change an existing duty's
+original unit or erase its holds.
+
 URLs below were opened on 2026-11-04. The observed title, publication date and
 specific supporting claim are recorded here so the source mapping remains
 reviewable; the integration verification report should reference this inventory.

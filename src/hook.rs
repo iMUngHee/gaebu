@@ -213,7 +213,7 @@ fn run_budget(
         if remaining().is_zero() {
             return Err(Error::new(Reason::Busy, "hook budget exhausted"));
         }
-        let mut st = store.read()?;
+        let mut st = store.read_view()?;
         member_known = st.members.values().any(|m| {
             m.status == model::MemberStatus::Active
                 && m.binding.state == model::BindingState::Bound
@@ -273,7 +273,7 @@ fn run_budget(
                 if remaining().is_zero() {
                     return Err(Error::new(Reason::Busy, "hook budget exhausted"));
                 }
-                st = store.read()?;
+                st = store.read_view()?;
             }
         }
         let Some(member) = st.members.values().find(|m| {
@@ -286,9 +286,10 @@ fn run_budget(
         if remaining().is_zero() {
             return Err(Error::new(Reason::Busy, "hook budget exhausted"));
         }
-        let Some(card) = card::build(&st, &member.id, now, sighting.last_seen) else {
+        let Some(mut card) = card::build(&st, &member.id, now, sighting.last_seen) else {
             return Ok(None);
         };
+        card::enrich(store, &st, &mut card);
         // The mod adds the full card to the system prompt from prompt.compose
         // and stamps when it does. A mod that is alive is not enough: with
         // managed settings, or in Team and Enterprise organizations,

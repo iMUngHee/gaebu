@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod model;
 pub mod ops;
 pub mod pager;
+pub mod schedule;
 pub mod scope;
 pub mod store;
 pub mod titles;

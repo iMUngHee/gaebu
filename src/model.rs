@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub type Ms = u64;
 
@@ -18,6 +18,12 @@ pub struct State {
     pub rev: u64,
     /// Id allocator; ids are `<prefix>-<n>`.
     pub next_id: u64,
+    /// Stable identity of this local runtime, initialized on its first commit.
+    #[serde(default)]
+    pub runtime_id: String,
+    /// Registered canonical project schedules, keyed by runtime team id.
+    #[serde(default)]
+    pub schedules: BTreeMap<String, ScheduleRegistration>,
     pub teams: BTreeMap<String, Team>,
     pub bus: BTreeMap<String, Bu>,
     pub members: BTreeMap<String, Member>,
@@ -38,6 +44,8 @@ impl Default for State {
             schema_version: SCHEMA_VERSION,
             rev: 0,
             next_id: 1,
+            runtime_id: String::new(),
+            schedules: BTreeMap::new(),
             teams: BTreeMap::new(),
             bus: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -82,6 +90,23 @@ pub struct Team {
     pub status: TeamStatus,
     pub created_at: Ms,
     pub cancelled_at: Option<Ms>,
+}
+
+/// Local authority and source binding; artifact names never confer a grant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduleRegistration {
+    pub schedule_id: String,
+    pub path: String,
+    pub manager: Option<String>,
+}
+
+/// An immutable dispatch in the project's canonical Schedule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduleRef {
+    pub schedule_id: String,
+    pub item_id: String,
+    pub dispatch_token: String,
+    pub manifest_hash: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +334,8 @@ pub struct Duty {
     pub hold: Option<Hold>,
     #[serde(default)]
     pub source: Option<Source>,
+    #[serde(default)]
+    pub schedule_ref: Option<ScheduleRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

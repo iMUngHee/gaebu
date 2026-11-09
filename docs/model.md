@@ -1,10 +1,10 @@
 # Gaebu data model
 
 This is the contract for what Gaebu stores and prints. The Rust types in
-`src/model.rs` and `src/card.rs` are its source of truth; this page explains
+`src/model.rs`, `src/schedule.rs` and `src/card.rs` are its source of truth; this page explains
 them. The JSON in `~/.gaebu/state.json` is exactly their serde form, with
-`schema_version: 2`. A schema-1 file is migrated on first use (see
-[Schema 2 migration](#schema-2-migration)).
+`schema_version: 3`. A schema-1 or schema-2 file is migrated on first write (see
+[Schema 3 migration](#schema-3-migration)).
 
 ## Vocabulary
 
@@ -28,6 +28,8 @@ only from grants.
 
 ## Entities
 
+- **Runtime origin**: a stable `runtime_id`, initialized on the first committed write, qualifies local organization references and prevents another machine's numeric IDs from matching accidentally. Empty fresh reads remain empty.
+- **Schedule registration**: `State.schedules[team]` records a canonical absolute project artifact path, its immutable Schedule ID and optional manager member. No manager means the commander retains scheduling. Registration is local authority; the file cannot create grants. See [Schedule operations](schedules.md).
 - **Team**: one commander and everyone under them. `project` is a label that
   scopes are relative to. `root_bu` is the commander's own bu (승상부 by
   default). `status` is `active` or `cancelled`.
@@ -66,7 +68,7 @@ only from grants.
   `version` for optimistic concurrency, an optional `hold`, and an optional
   `source`: the user's words the duty answers (`session_id`, `prompt_seq`,
   `sha256`, `quote`, `at`), matched against a prompt the hook recorded in the
-  issuer's own session. Amending without a source keeps the one recorded.
+  issuer's own session. Amending without a source keeps the one recorded. A linked duty also has an optional `schedule_ref` containing Schedule/item identity, dispatch token and immutable manifest hash; manifest-changing amendment is refused.
 - **Hold**: a human stop on a duty or a bu: `evidence` (the user's words that
   set it), `until` (the release condition, 1-120 characters on one line;
   whitespace and control characters collapse) and `at`. Only
@@ -177,7 +179,7 @@ and exits 1.
 
 ## Card JSON
 
-`gaebu me --json` prints a Card with exactly these fields:
+`gaebu me --json` prints the following Card fields; `schedule` is omitted for unregistered teams:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -190,13 +192,14 @@ and exits 1.
 | `binding` | string | `pending`, `bound`, `quiet` or `vacant` |
 | `chain` | string[] | 대협 → commander → ... → me; the commander reads "가절월(추론)을 받은 …" when the root grant's evidence is inferred |
 | `superior` | string or null | superior's display name |
-| `duties` | object[] | open duties, held first: `id`, `status`, `stage`, `stage_label`, `outcome`, `scope`, `done_criteria`, `decision_rights`, `hold` (release condition, `(+N)` more), `source` (quote) |
+| `duties` | object[] | open duties, held first: `id`, `status`, `stage`, `stage_label`, `outcome`, `scope`, `done_criteria`, `decision_rights`, `hold` (release condition, `(+N)` more), `source` (quote), full intent/escalation/plan/execution-root/version/note/issuer/assignee and original-unit fields |
 | `peers` | string[] | same-bu members, the bu head, direct subordinates, holders of leases overlapping my duties |
 | `leases` | string[] | my live leases |
 | `escalations` | string[] | open escalations I raised or must answer |
 | `cancels` | string[] | cancelled team, bu or duties that affect me |
 | `norms` | string[] | one or two behaviour reminders (see `docs/protocol.md`) |
-| `hash` | string | sha256 of the card text, used to decide full or one-line injection |
+| `schedule` | object, optional | canonical Schedule observation, qualified viewer identity, role, management counts and next judgment; errors are explicit |
+| `hash` | string | sha256 of the card's semantic content, including its Schedule observation when registered |
 
 The text form (`gaebu me --card`, also what hooks inject) is at most 12 lines.
 Cancels, open escalations and up to three `보류: 소임 <id> — <until>` lines
@@ -208,7 +211,7 @@ survive truncation; more holds collapse into `보류 +N`.
 Each team lists its bus (with any `hold`), and each bu lists its members with
 display name, binding (`quiet` included), open duties as duty views in stage
 order, and live leases. MCP `board` returns the same view for the caller's
-team.
+team. Units are parent-first with `parent` and `depth`, so clients do not flatten the hierarchy. Registered teams include their derived `schedule` view. `duty show` and MCP `duty_get` read complete contracts, including ended duties, within the requesting member's team.
 
 `token` is a hash of the view itself without `rev`, so it changes when a stage
 changes with time alone (a seat falling quiet) and stays when a commit changes
@@ -222,6 +225,9 @@ still has that token.
 ~/.gaebu/state.json            whole state, replaced atomically under state.lock
 ~/.gaebu/state.prev.json       previous generation
 ~/.gaebu/state.v1.json         the schema-1 original, kept once by the migration
+~/.gaebu/state.v2.json         the schema-2 original, kept once by the migration
+<project>/schedule.md          canonical operational work and review evidence
+<project>/schedule.md.lock     sidecar OS lock, never deleted
 ~/.gaebu/state.lock            OS lock, never deleted
 ~/.gaebu/sessions/<id>/events.jsonl    hook events: prompts, excluded prompts, Stop, mod heartbeats
 ~/.gaebu/sessions/<id>/composer.jsonl  composer-attested prompt hashes (Claude mod)
@@ -231,28 +237,28 @@ still has that token.
 
 `GAEBU_HOME` overrides `~/.gaebu`.
 
-## Schema 2 migration
+## Schema 3 migration
 
-The first transaction (or `gaebu repair`) that finds `schema_version: 1`
-migrates it in its own commit, before any change it was asked to make:
+The first write or repair of schema 1/2 backs up the exact original bytes to
+`state.v1.json` or `state.v2.json` without replacing a previous backup. Migration
+publishes schema 3 to `state.prev.json` and then `state.json` before running the
+requested operation. A crash repeats the migration safely; older binaries cannot
+fall back to an older generation and ignore Schedule guards.
 
-1. If `state.v1.json` does not exist, the original bytes are written there.
-   An existing backup is never replaced.
-2. The v2 state is written to `state.prev.json`, then to `state.json`. An
-   interruption at any point leaves `state.json` at schema 1, so the next run
-   repeats the migration; once `state.json` is v2, no schema-1 generation is
-   left for an older binary to fall back to.
-3. Migration fills `strength: inferred` on existing evidence, keeps each
-   notice's `body`, attempts and claim and derives its `text`, and keeps only
-   the newest open escalation per asker and duty (the rest become
-   `superseded`).
+Schema 1 still receives evidence strength, notice deduplication and escalation
+normalization. Both legacy schemas gain default Schedule fields and a stable
+runtime origin. The requesting operation runs only after migration commits.
 
-The schema is read before the rest of the file, so a newer schema is
-`store_unsupported` even when this model cannot parse it, and neither reads
-nor `gaebu repair` fall back from it or overwrite it. A gaebu 0.1 binary
-reports a v2 file as corrupt and finds no v1 generation to fall back to, so it
-fails closed. Install the new binary, restart sessions that run `gaebu mcp`,
-and the next command migrates.
+The schema probe precedes full decoding. Future schemas return
+`store_unsupported` and never fall back or get overwritten by repair. Install the
+new binary and restart resident MCP processes before coordinated work resumes.
+
+Diagnostic `Store::read` retains its previous-generation recovery behavior.
+Current-state absence proofs use `read_current` and never use recovery data.
+CLI/MCP/hook views use `read_view`: a genuinely fresh store is empty, while a
+corrupt or missing current generation in an existing runtime is unavailable, so
+the UI can retain a visibly stale observation instead of displaying healthy old
+counts. `gaebu repair` remains the explicit recovery path.
 
 ## Rejected concepts
 

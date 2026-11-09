@@ -3,7 +3,7 @@
 //! dismissed, the grantor's own authorizing grant is (recursively) valid and
 //! the team is not cancelled.
 
-use crate::error::{Reason, Result, refuse};
+use crate::error::{Error, Reason, Result, refuse};
 use crate::model::{
     Actor, BindingState, BuStatus, Duty, Grant, GrantStatus, Hold, Member, MemberStatus, State,
     TeamStatus, Verb,
@@ -215,4 +215,59 @@ fn valid_grant(st: &State, g: &Grant, seen: &mut BTreeSet<String>) -> bool {
     })();
     seen.remove(&g.id);
     result
+}
+
+/// Resolve a member reference: id (`m-3`), pager alias, or title, among
+/// active members (the caller's team first).
+pub fn resolve_member(st: &State, team: Option<&str>, reference: &str) -> Result<String> {
+    if let Some(m) = st.members.get(reference) {
+        return Ok(m.id.clone());
+    }
+    let active = || {
+        st.members
+            .values()
+            .filter(|m| m.status == MemberStatus::Active)
+    };
+    let pick = |hits: Vec<&crate::model::Member>| -> Option<String> {
+        let in_team: Vec<_> = hits
+            .iter()
+            .filter(|m| team.map(|t| m.team == t).unwrap_or(true))
+            .collect();
+        if in_team.len() == 1 {
+            Some(in_team[0].id.clone())
+        } else if hits.len() == 1 {
+            Some(hits[0].id.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(id) = pick(active().filter(|m| m.binding.alias == reference).collect()) {
+        return Ok(id);
+    }
+    if let Some(id) = pick(active().filter(|m| m.title == reference).collect()) {
+        return Ok(id);
+    }
+    Err(Error::new(
+        Reason::NotFound,
+        format!("no single active member matches '{reference}'"),
+    ))
+}
+
+/// Resolve a bu reference: id (`b-2`) or name.
+pub fn resolve_bu(st: &State, team: Option<&str>, reference: &str) -> Result<String> {
+    if st.bus.contains_key(reference) {
+        return Ok(reference.to_string());
+    }
+    let hits: Vec<_> = st
+        .bus
+        .values()
+        .filter(|b| b.name == reference && team.map(|t| b.team == t).unwrap_or(true))
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(one.id.clone()),
+        _ => Err(Error::new(
+            Reason::NotFound,
+            format!("no single bu matches '{reference}'"),
+        )),
+    }
 }
