@@ -5,6 +5,7 @@ Apply these rules when Gaebu records place your session in a team, or when the h
 - Restore your superior, accepted duties, grant, scope and collaborators from your position card and current Gaebu records after a context reset.
 - Read the team's registered canonical Schedule before choosing its next work, and recover full duty contracts with `duty show` or `duty_get` after context loss.
 - Keep scheduling with the commander or an explicitly delegated manager while task masters retain command of their own workers.
+- Use 황문시랑 as the display title for a separate scheduling and liaison coordinator; retain the commander's title when the roles are combined.
 - Update the canonical Schedule through CLI/MCP and preserve PM lifecycle and runtime duty status in their own sources.
 - Treat worker completion as awaiting task-master review, and release dependent work only after explicit Schedule acceptance.
 - Recover an uncertain dispatch by its existing token instead of creating replacement work because a session is quiet or a response was lost.
