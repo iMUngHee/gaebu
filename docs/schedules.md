@@ -8,10 +8,14 @@ Gaebu's local runtime owns command authority, sessions, duties and leases.
 ## Start with the commander, delegate when useful
 
 The commander manages scheduling by default. A separate manager is optional;
-changing it does not change anyone's superior or move existing duties.
+changing it does not change anyone's superior or move existing duties. The
+separate scheduling and liaison coordinator uses the display title 황문시랑.
+The commander retains its title when scheduling is combined. Display titles
+never grant authority; set the title explicitly when appointing the coordinator.
 
 ```sh
 gaebu schedule init /absolute/project/schedule.md
+gaebu title coordinator 황문시랑
 gaebu schedule manager coordinator --scope 'src/**'
 gaebu schedule manager commander
 ```
