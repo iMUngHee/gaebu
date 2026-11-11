@@ -67,9 +67,9 @@ pub fn for_mcp(p: &dyn Pager, store: &Store, thread_id: Option<&str>) -> Result<
             )
         })?;
         if sighting.tool != Some(Tool::Codex)
-            || !sighting
+            || sighting
                 .last_seen
-                .is_some_and(|seen| now_ms().saturating_sub(seen) <= 7_200_000)
+                .is_none_or(|seen| now_ms().saturating_sub(seen) > 7_200_000)
         {
             return Err(Error::new(
                 Reason::UnresolvedCaller,
