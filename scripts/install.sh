@@ -7,6 +7,11 @@ cargo build --release --locked --manifest-path "$root/Cargo.toml"
 mkdir -p "$bin"
 exe="gaebu"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exe="gaebu.exe" ;; esac
-cp "$root/target/release/$exe" "$bin/$exe"
+# Replace by rename, never in place: macOS caches a binary's code signature per
+# inode and kills the upgraded binary (SIGKILL) when cp rewrites the old file.
+tmp="$bin/.$exe.new.$$"
+trap 'rm -f "$tmp"' EXIT
+cp "$root/target/release/$exe" "$tmp"
+mv -f "$tmp" "$bin/$exe"
 echo "installed $bin/$exe"
 "$bin/$exe" --version
