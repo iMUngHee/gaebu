@@ -1,5 +1,26 @@
 # Platform verification
 
+## Linux
+
+0.4.0 storage changes, 2026-11-13: Linux 7.2.15-1-omarchy, x86_64,
+Btrfs, Rust 1.99.0. `cargo fmt --check`, strict clippy and `cargo test`
+pass (292 passed, 0 failed, 3 helper entry points ignored). Native mod tests
+pass 26 of 26; plugin validation passes with the existing missing-author and
+catalog-icon warnings.
+
+An isolated CLI process flow exercised Schedule acceptance and retirement,
+the unit-close guard and explicit transfer, runtime compaction, archived duty
+detail, and registration move. MCP tests recover full archived contracts and
+invoke compaction. These checks do not install a global binary or modify a
+live team's state.
+
+Debug fixtures on this host: 76 items (43 complete, 1 cancelled, 32 open)
+leave 4,191 bytes of tombstone overhead; `show --all` over 2,000 archived items
+takes about 98 ms. The 10,000-entry runtime fixture measures about 0.43 ms
+for boundary-check/append and 71 ms for locked lookup. These are synthetic
+local observations, not production latency guarantees. Unix file/directory
+sync ordering is reviewed in code; physical power-loss persistence is untested.
+
 ## Windows
 
 Development host: Windows, Rust 1.99.1, `x86_64-pc-windows-gnu`;
@@ -21,9 +42,11 @@ SIGKILL on its stale code-signature cache.
 
 ## Pending checks
 
-- Linux: run fmt, strict clippy, the complete Rust suite and migration,
-  multi-process Schedule lock/recovery tests on the native filesystem.
-- Linux: run the mod's native engine tests.
+- macOS and Windows: run the 0.4.0 archive, migration, repair, locking and
+  native mod tests. Prior release checks below do not cover these changes.
+- Windows: directory fsync is unavailable through the portable standard-library
+  path; storage retains file-sync/rename guarantees. Verify the new archive
+  behavior on a native Windows filesystem.
 - Linux and macOS: inspect narrow/wide, short-height, no-color, long Korean
   and ambiguous-width presentation.
 - User terminal themes and a live multi-session project: exercise the operations

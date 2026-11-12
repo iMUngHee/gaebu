@@ -98,14 +98,23 @@ rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
 cargo +stable-x86_64-pc-windows-gnu install --git https://github.com/iMUngHee/gaebu --locked
 ```
 
-### Upgrading from 0.1 or 0.2
+### Upgrading to 0.4
 
-0.3 stores schema 3. The first write migrates `~/.gaebu/state.json`, keeping
-the original in `state.v1.json` or `state.v2.json` without replacing an existing
-backup. The current and previous generations become schema 3 so older binaries
-cannot fall back and bypass Schedule execution checks. Install the new binary
+0.4 stores schema 4. The first write migrates `~/.gaebu/state.json`, keeping
+the original in `state.v1.json`, `state.v2.json`, or `state.v3.json` without
+replacing an existing backup. Current and previous generations become schema 4
+so older binaries cannot fall back and discard archive commit boundaries. Install the new binary
 and restart sessions running `gaebu mcp` before continuing coordinated work.
-See [the migration contract](docs/model.md#schema-3-migration).
+See [the migration contract](docs/model.md#schema-4-migration).
+
+Finished Schedule items retire to a JSONL sidecar. Keep it beside the Schedule
+when backing up or moving the file; `schedule move <path>` updates a missing
+file's registration after the move. Default `schedule show` and cards omit full
+dispatch contracts and finished work; use `schedule show <item>` for the full
+contract or `schedule show --all` for history. Cancelled items with live duties
+remain visible for cleanup. `gaebu compact` archives old terminal runtime
+history while preserving `duty show`/`duty_get`. Older binaries refuse both
+schema 4 state and Schedules containing retirement tombstones.
 
 ### Claude Code
 
