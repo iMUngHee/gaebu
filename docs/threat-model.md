@@ -140,8 +140,9 @@ boundaries. Per-session logs use their own locks. Those mechanisms coordinate
 cooperative writers and do not prevent a same-user process bypassing the engine.
 
 Runtime archives are committed byte prefixes, protected by `state.lock` for
-append, truncation and full duty lookup. Before append, missing/short committed
-prefixes and missing boundary newlines fail closed; typed parsing is deferred
+append, truncation and archived duty lookup. Hot duty reads use the caller's
+snapshot and its team authorization without the global lock. Before append,
+missing/short committed prefixes and missing boundary newlines fail closed; typed parsing is deferred
 to lookup. Lookup validates the whole committed duty prefix and rejects
 malformed entries, while ignoring uncommitted suffixes. This detects accidental
 truncation and malformed JSON, not malicious edits to otherwise valid JSON.
@@ -151,8 +152,10 @@ only in the caller team's file and foreign IDs return `not_found`.
 On Unix, archive file sync precedes sync of its team directory, archive
 directory and home directory, then runtime state publication. Every successful
 state rename also syncs its parent, including the previous generation and
-Schedule saves. A sync error after rename may report failure after the state
-became visible; it does not promise rollback. Both visible generations remain
+Schedule saves. Session-log replacements retain file sync and rename without
+parent-directory sync, keeping this extra I/O outside prompt hooks. A sync error
+after rename may report failure after the state became visible; it does not
+promise rollback. Both visible generations remain
 safe because archive data was synced first. Windows retains file sync and
 rename, without portable directory-fsync durability. Process tests exercise
 publication failure, retries and lock races; they do not prove physical

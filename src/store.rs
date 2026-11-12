@@ -188,9 +188,10 @@ impl Store {
             Some((version, original)) => {
                 self.publish_migration(&mut state, version, &original, deadline)
             }
-            None => replace(
+            None => replace_until(
                 &self.home.join("state.json"),
                 &serde_json::to_vec(&state).map_err(write_error)?,
+                deadline,
             ),
         }
     }
@@ -589,7 +590,7 @@ fn initialize_runtime_id(state: &mut State) {
     }
 }
 fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    replace_until(path, bytes, Instant::now() + Duration::from_secs(1))
+    replace_file_until(path, bytes, Instant::now() + Duration::from_secs(1))
 }
 
 fn ensure_budget(deadline: Instant) -> Result<()> {
@@ -604,6 +605,11 @@ fn ensure_budget(deadline: Instant) -> Result<()> {
 }
 
 pub(crate) fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
+    replace_file_until(path, bytes, deadline)?;
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn replace_file_until(path: &Path, bytes: &[u8], deadline: Instant) -> Result<()> {
     ensure_budget(deadline)?;
     let tmp = path.with_file_name(format!(
         "{}.tmp-{}-{}",
@@ -625,7 +631,7 @@ pub(crate) fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Res
         loop {
             ensure_budget(deadline)?;
             match fs::rename(&tmp, path) {
-                Ok(()) => return sync_dir(path.parent().unwrap_or_else(|| Path::new("."))),
+                Ok(()) => return Ok(()),
                 Err(e)
                     if (e.kind() == io::ErrorKind::PermissionDenied
                         || cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
@@ -655,7 +661,14 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     // Windows has no portable directory-fsync API in std.
     #[cfg(not(unix))]
     let _ = path;
+    #[cfg(all(test, unix))]
+    SYNCED_DIRS.with_borrow_mut(|paths| paths.push(path.to_path_buf()));
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+std::thread_local! {
+    static SYNCED_DIRS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(all(test, unix))]
@@ -673,6 +686,30 @@ mod tests {
             sync_dir(&path).unwrap_err().reason,
             Reason::StoreWriteFailed
         );
+    }
+
+    #[test]
+    fn state_replacements_sync_parent_but_session_replacements_do_not() {
+        let home = std::env::temp_dir().join(format!(
+            "gaebu-sync-policy-{}-{}",
+            std::process::id(),
+            TMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = Store::open(&home).unwrap();
+        SYNCED_DIRS.with_borrow_mut(Vec::clear);
+        store.transact(CLI_DEADLINE, |_| Ok(())).unwrap();
+        store.transact(CLI_DEADLINE, |_| Ok(())).unwrap();
+        store.repair().unwrap();
+        let runtime = SYNCED_DIRS.replace(Vec::new());
+        let session = store.session("test");
+        session
+            .append(1, EventKind::UserPrompt, None, Some("prompt".into()), None)
+            .unwrap();
+        session.update_sighting(|s| s.last_seen = Some(1)).unwrap();
+        let sessions = SYNCED_DIRS.replace(Vec::new());
+        fs::remove_dir_all(&home).unwrap();
+        assert_eq!(runtime, vec![home; 4]);
+        assert!(sessions.is_empty());
     }
 }
 
