@@ -9,6 +9,25 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.3.1 — 2026-11-12
+
+### Changed
+
+- `appoint`, `assign`, `member add` and a seat rebind page the new seat at its
+  pager alias, so an idle session gets a prompt and its hook confirms the
+  binding without anyone typing to it. Before, such a seat stayed pending until
+  its session's next prompt. Only the seat is paged; its superior still reads
+  the change on the next card. A session that appoints itself is paged too. A
+  page still queued when the seat is confirmed or rebound again is dropped. See
+  [Notices](docs/model.md#notices). (4831ff3)
+
+### Upgrading
+
+State is unchanged and a 0.3.0 binary still reads it. The page goes to whoever
+holds the alias when it is sent: as before, a session that takes over an alias
+before the first confirmation can take the pending seat, and now does so on
+the page, not on its next prompt.
+
 ## 0.3.0 — 2026-11-10
 
 ### Added
