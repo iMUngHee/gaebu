@@ -281,6 +281,8 @@ operation. Explicit compaction uses a threshold of one and reports errors.
 Root operations and hooks do not trigger compaction. Neither path takes a
 Schedule lock inside `state.lock`.
 
+Explicit compaction checks the actor on entry only: like automatic compaction, it maintains history without changing live work or authority, while eligibility is rechecked under `state.lock`.
+
 Archive appends first check that the committed prefix exists, is long enough,
 and ends in a newline. They truncate only its uncommitted suffix, append full
 entities, and sync files and directory links before publishing boundaries
