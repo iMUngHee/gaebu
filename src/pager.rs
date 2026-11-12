@@ -29,8 +29,8 @@ pub trait Pager {
     fn whoami(&self, session: Option<&str>) -> Result<WhoAmI>;
     /// HOST column of `pager who` for `alias`; `Unknown` when absent.
     fn host_status(&self, alias: &str) -> Result<HostStatus>;
-    /// `pager send <session_id> <body>`.
-    fn send(&self, to_session: &str, body: &str) -> Result<()>;
+    /// `pager send <target> <body>`; the target is a session id or an alias.
+    fn send(&self, target: &str, body: &str) -> Result<()>;
 }
 
 /// Runs the real `pager` binary with a per-call timeout.
@@ -55,8 +55,8 @@ impl Pager for CliPager {
             .unwrap_or(HostStatus::Unknown))
     }
 
-    fn send(&self, to_session: &str, body: &str) -> Result<()> {
-        self.output(&["send", to_session, body]).map(|_| ())
+    fn send(&self, target: &str, body: &str) -> Result<()> {
+        self.output(&["send", target, body]).map(|_| ())
     }
 }
 
@@ -199,7 +199,7 @@ pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
     let mut delivered = Vec::new();
     let mut failed = Vec::new();
     for n in &batch {
-        match pager.send(&n.to_session, &n.body) {
+        match pager.send(&n.target, &n.body) {
             Ok(()) => delivered.push(n.id.clone()),
             Err(e) => {
                 eprintln!("gaebu: notice {} not delivered: {e}", n.id);

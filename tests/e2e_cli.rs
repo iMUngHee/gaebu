@@ -8,7 +8,7 @@ use gaebu::evidence;
 use gaebu::model::{BindingState, DutyStatus, Tool};
 use gaebu::pager::{HostStatus, Pager, WhoAmI};
 use gaebu::store::{EventKind, Store};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Mutex;
@@ -21,6 +21,11 @@ struct FakePager {
     current: RefCell<String>,
     aliases: HashMap<String, String>,
     sent: RefCell<Vec<(String, String)>>,
+    /// Makes every `send` fail, as when the target is not live.
+    refuse: Cell<bool>,
+    /// Per `send`: whether the stored state already held a pending seat with
+    /// the target as its alias.
+    pending_at_send: RefCell<Vec<bool>>,
 }
 
 impl FakePager {
@@ -32,6 +37,8 @@ impl FakePager {
                 .map(|(s, a)| (s.to_string(), a.to_string()))
                 .collect(),
             sent: RefCell::new(Vec::new()),
+            refuse: Cell::new(false),
+            pending_at_send: RefCell::new(Vec::new()),
         }
     }
     fn as_session(&self, s: &str) {
@@ -54,10 +61,24 @@ impl Pager for FakePager {
     fn host_status(&self, _alias: &str) -> Result<HostStatus> {
         Ok(HostStatus::Live)
     }
-    fn send(&self, to_session: &str, body: &str) -> Result<()> {
+    fn send(&self, target: &str, body: &str) -> Result<()> {
+        if self.refuse.get() {
+            return Err(gaebu::error::Error::new(
+                gaebu::Reason::PagerUnavailable,
+                "target not live",
+            ));
+        }
+        let stored = std::env::var_os("GAEBU_HOME")
+            .and_then(|home| Store::open(home).ok()?.read().ok())
+            .is_some_and(|st| {
+                st.members
+                    .values()
+                    .any(|m| m.binding.state == BindingState::Pending && m.binding.alias == target)
+            });
+        self.pending_at_send.borrow_mut().push(stored);
         self.sent
             .borrow_mut()
-            .push((to_session.to_string(), body.to_string()));
+            .push((target.to_string(), body.to_string()));
         Ok(())
     }
 }
@@ -130,6 +151,19 @@ fn session_start(store: &Store, pager: &FakePager, session: &str) {
     let mut stdin = input.as_bytes();
     let mut out = Vec::new();
     gaebu::hook::run(Tool::Codex, &mut stdin, &mut out, store, pager);
+}
+
+/// A prompt reaching `session`, as its `UserPromptSubmit` hook sees it.
+fn prompt_arrives(store: &Store, pager: &FakePager, session: &str, text: &str) {
+    let input = serde_json::json!({
+        "session_id": session,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": text,
+    })
+    .to_string();
+    let mut stdin = input.as_bytes();
+    let mut out = Vec::new();
+    gaebu::hook::run(Tool::Claude, &mut stdin, &mut out, store, pager);
 }
 
 fn setup() -> (std::sync::MutexGuard<'static, ()>, tempdir::Dir, Store) {
@@ -593,7 +627,7 @@ fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
                 st.outbox.push(gaebu::model::Notice {
                     id: id.into(),
                     to_member: "m-x".into(),
-                    to_session: format!("s-{id}"),
+                    target: format!("s-{id}"),
                     body: "b".into(),
                     text: "b".into(),
                     created_at: now,
@@ -622,6 +656,126 @@ fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
         .map(|n| n.id.clone())
         .collect();
     assert_eq!(left, vec!["n-fresh".to_string()]);
+}
+
+/// gapu is appointed and nawi assigned from gapu's session; nawi stays idle.
+fn appoint_gapu_then_assign_nawi(store: &Store, pager: &FakePager, between: impl FnOnce()) {
+    user_says(store, "s-gapu", "너한테 가절월 줄게. nawi를 속관으로 주마.");
+    pager.as_session("s-gapu");
+    let appoint = [
+        "appoint",
+        "gapu",
+        "--team",
+        "gaebu",
+        "--evidence",
+        "너한테 가절월 줄게",
+    ];
+    assert_eq!(gaebu(pager, &appoint), 0);
+    between();
+    let assign = [
+        "assign",
+        "nawi",
+        "--to",
+        "gapu",
+        "--evidence",
+        "nawi를 속관으로 주마",
+    ];
+    assert_eq!(gaebu(pager, &assign), 0);
+}
+
+#[test]
+fn assign_pages_pending_alias_then_poke_binds() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    appoint_gapu_then_assign_nawi(&store, &pager, || {
+        // nawi's session checked for a pending seat before it had one; the
+        // stamp from that check must not hide the seat assigned afterwards.
+        prompt_arrives(&store, &pager, "s-nawi", "unrelated work");
+        assert!(
+            store
+                .session("s-nawi")
+                .sighting()
+                .unwrap()
+                .pending_checked_rev
+                .is_some()
+        );
+    });
+    let nawi = |store: &Store| {
+        let st = store.read().unwrap();
+        st.members
+            .values()
+            .find(|m| m.binding.alias == "nawi")
+            .unwrap()
+            .binding
+            .clone()
+    };
+    assert_eq!(nawi(&store).state, BindingState::Pending);
+
+    // The page left through pager at the alias, after the seat was stored.
+    let at = pager
+        .sent
+        .borrow()
+        .iter()
+        .position(|(to, _)| to == "nawi")
+        .expect("the pending seat is paged at its alias");
+    assert!(pager.sent.borrow()[at].1.contains("(nawi) assigned"));
+    assert!(pager.pending_at_send.borrow()[at]);
+    assert!(store.read().unwrap().outbox.is_empty());
+
+    // pager delivers it as a poke prompt; that prompt's hook binds the seat.
+    prompt_arrives(
+        &store,
+        &pager,
+        "s-nawi",
+        "pager: new mail for nawi from gapu (claude session). [pager-poke]",
+    );
+    let bound = nawi(&store);
+    assert_eq!(bound.state, BindingState::Bound);
+    assert_eq!(bound.session_id.as_deref(), Some("s-nawi"));
+
+    // The poke is not the user's word: it cannot carry a root directive.
+    let last = store.session("s-nawi").events().unwrap().pop().unwrap();
+    assert_eq!(last.kind, EventKind::ExcludedPrompt);
+    pager.as_session("s-nawi");
+    assert_eq!(
+        gaebu(
+            &pager,
+            &["appoint", "nawi", "--evidence", "new mail for nawi"]
+        ),
+        1
+    );
+}
+
+#[test]
+fn undelivered_seat_notice_is_recorded() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu")]);
+    // nawi is not live: every send to it fails until the notice is given up.
+    appoint_gapu_then_assign_nawi(&store, &pager, || pager.refuse.set(true));
+    let st = store.read().unwrap();
+    let nawi = st
+        .members
+        .values()
+        .find(|m| m.binding.alias == "nawi")
+        .unwrap()
+        .clone();
+    assert_eq!(st.outbox.len(), 1);
+    assert_eq!(st.outbox[0].target, "nawi");
+    assert_eq!(st.outbox[0].attempts, 1);
+    for _ in 0..9 {
+        gaebu::cli::flush_outbox(&store, &pager);
+    }
+    let st = store.read().unwrap();
+    assert!(st.outbox.is_empty());
+    let note = st
+        .records
+        .iter()
+        .find(|r| r.text.starts_with("undelivered notice after 10 attempts"))
+        .expect("the given-up page leaves a team record");
+    assert_eq!(note.author, nawi.id);
+    assert_eq!(note.team, nawi.team);
+    assert!(note.text.contains("(nawi) assigned"), "{}", note.text);
+    assert_eq!(nawi.binding.state, BindingState::Pending);
 }
 
 // ----- holds and strength (plan gaebu-v0-2) -----

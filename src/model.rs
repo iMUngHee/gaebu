@@ -423,7 +423,10 @@ pub struct RootAction {
 pub struct Notice {
     pub id: String,
     pub to_member: String,
-    pub to_session: String,
+    /// What `pager send` is given: the recipient's session id, or the alias
+    /// of a seat no session has confirmed yet.
+    #[serde(rename = "to_session")]
+    pub target: String,
     pub body: String,
     /// `body` without its record id: the dedupe key (`notice_key`).
     #[serde(default)]
