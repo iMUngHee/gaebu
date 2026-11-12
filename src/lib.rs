@@ -10,6 +10,7 @@ mod archive;
 pub mod authz;
 pub mod card;
 pub mod cli;
+pub mod compact;
 pub mod error;
 pub mod evidence;
 pub mod hook;

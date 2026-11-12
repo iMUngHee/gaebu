@@ -367,6 +367,7 @@ fn escalation(duty: &str) -> Escalation {
         answer: None,
         created_at: 0,
         answered_at: None,
+        closed_at: None,
         superseded_by: None,
     }
 }

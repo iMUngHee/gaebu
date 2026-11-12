@@ -539,7 +539,9 @@ fn render_body(c: &Card) -> String {
                 extra.push(format!("다음 판단: {}", clip(next, 120)));
             }
         } else {
-            extra.push("일정: 담당 과업과 전체 계약을 gaebu schedule show로 확인한다.".into());
+            extra.push(
+                "일정: 담당 과업과 전체 계약을 gaebu schedule show <item>로 확인한다.".into(),
+            );
         }
     }
     if c.duties.is_empty() {

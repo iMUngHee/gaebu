@@ -1517,6 +1517,7 @@ pub fn escalate(
     if let Some(old) = &replaced {
         let e = st.escalations.get_mut(old).unwrap();
         e.status = EscalationStatus::Superseded;
+        e.closed_at = Some(now);
         e.superseded_by = Some(id.clone());
     }
     st.escalations.insert(
@@ -1532,6 +1533,7 @@ pub fn escalate(
             answer: None,
             created_at: now,
             answered_at: None,
+            closed_at: None,
             superseded_by: None,
         },
     );
@@ -1570,18 +1572,21 @@ pub fn escalation_withdraw(
     note: Option<&str>,
 ) -> Result<Outcome> {
     let a = authz::check_actor(st, actor)?.clone();
-    let e = st
-        .escalations
-        .get(escalation)
-        .cloned()
-        .ok_or_else(|| Error::new(Reason::NotFound, "escalation not found"))?;
+    let e = st.escalations.get(escalation).cloned().ok_or_else(|| {
+        Error::new(
+            Reason::NotFound,
+            "escalation not found; closed history may be in the archive",
+        )
+    })?;
     if e.from != a.id || e.team != a.team {
         return refuse(Reason::NoGrant, "only the asker may withdraw");
     }
     if e.status != EscalationStatus::Open {
         return refuse(Reason::Conflict, "escalation is not open");
     }
-    st.escalations.get_mut(escalation).unwrap().status = EscalationStatus::Withdrawn;
+    let closed = st.escalations.get_mut(escalation).unwrap();
+    closed.status = EscalationStatus::Withdrawn;
+    closed.closed_at = Some(now);
     let why = note
         .filter(|n| !n.trim().is_empty())
         .map(|n| format!(": {n}"))
@@ -1668,11 +1673,12 @@ pub fn escalation_answer(
     answer: &str,
 ) -> Result<Outcome> {
     let a = authz::check_actor(st, actor)?.clone();
-    let e = st
-        .escalations
-        .get(escalation)
-        .cloned()
-        .ok_or_else(|| Error::new(Reason::NotFound, "escalation not found"))?;
+    let e = st.escalations.get(escalation).cloned().ok_or_else(|| {
+        Error::new(
+            Reason::NotFound,
+            "escalation not found; closed history may be in the archive",
+        )
+    })?;
     if e.to.as_deref() != Some(&a.id) || e.team != a.team {
         return refuse(Reason::NoGrant, "not escalation recipient");
     }
@@ -1683,6 +1689,7 @@ pub fn escalation_answer(
     e.status = EscalationStatus::Answered;
     e.answer = Some(answer.into());
     e.answered_at = Some(now);
+    e.closed_at = Some(now);
     let from = e.from.clone();
     changed(
         st,
@@ -1855,9 +1862,12 @@ fn alias_member<'a>(st: &'a State, alias: &str) -> Result<&'a Member> {
         .ok_or_else(|| Error::new(Reason::NotFound, "alias not assigned"))
 }
 fn find_duty<'a>(st: &'a State, id: &str) -> Result<&'a Duty> {
-    st.duties
-        .get(id)
-        .ok_or_else(|| Error::new(Reason::NotFound, "duty not found"))
+    st.duties.get(id).ok_or_else(|| {
+        Error::new(
+            Reason::NotFound,
+            "duty not found; try duty show for archived contracts",
+        )
+    })
 }
 fn below(st: &State, a: &Member, m: &Member) -> Result<()> {
     if a.team != m.team || !authz::is_below(st, &a.id, &m.id) {
