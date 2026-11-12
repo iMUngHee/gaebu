@@ -51,6 +51,9 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).unwrap();
+        // Registration canonicalizes paths, including macOS temp-directory aliases
+        // and Windows verbatim prefixes; fixtures must use the same spelling.
+        let dir = fs::canonicalize(dir).unwrap();
         let store = Store::open(dir.join("runtime")).unwrap();
         store
             .transact(CLI_DEADLINE, |st| {
@@ -229,6 +232,40 @@ fn complete_retires() {
             .len(),
         1
     );
+}
+
+// Unix supports unprivileged directory symlinks; child processes isolate TMPDIR
+// from the other tests running concurrently in this process.
+#[cfg(unix)]
+#[test]
+fn aliased_temp_directory_preserves_read_observation_and_move_checks() {
+    let dir = std::env::temp_dir().join(format!(
+        "gaebu-aliased-temp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = common::RemoveOnDrop(dir.clone());
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let alias = dir.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    for name in [
+        "unrelated_op_document_reads",
+        "automatic_compaction_is_post_commit_and_does_not_parse_below_threshold",
+        "move_registration_checks_foreign_paths_and_old_path_errors",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env("TMPDIR", &alias)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name} with an aliased TMPDIR failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -995,7 +1032,7 @@ fn move_registration_checks_foreign_paths_and_old_path_errors() {
         .transact(CLI_DEADLINE, |st| {
             st.schedules.get_mut(&team).unwrap().path = f
                 .path
-                .join("not-a-directory")
+                .with_file_name("invalid\0path")
                 .to_string_lossy()
                 .into_owned();
             Ok(())
