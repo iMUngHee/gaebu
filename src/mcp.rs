@@ -105,6 +105,7 @@ fn tools() -> Vec<Value> {
     let mut list: Vec<Value> = [
         ("me", "Read your current position card", json!({}), vec![]),
         ("board", "Read your team's command tree", json!({}), vec![]),
+        ("compact", "Archive eligible terminal runtime history", json!({}), vec![]),
         ("duty_get", "Read the complete duty contract, including completed work", json!({"duty":string}), vec!["duty"]),
         ("bu_form", "Atomically form a subordinate unit with workers and scoped grants", json!({"spec":{"type":"object","properties":{"head":string,"members":strings,"name":{"type":["string","null"]},"verbs":strings,"scope":strings},"required":["head","members","verbs","scope"],"additionalProperties":false}}), vec!["spec"]),
         ("duty_issue", "Issue an outcome brief to a subordinate", json!({"assignee":string,"spec":{"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":{"type":"string","description":"The user's words this duty answers, quoted from a prompt in your own session"}},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false}}), vec!["assignee","spec"]),
@@ -211,6 +212,9 @@ fn call(
     let now = model::now_ms();
     if name.starts_with("schedule_") {
         return crate::schedule::call(store, pager, &caller, name, args);
+    }
+    if name == "compact" {
+        return crate::schedule::compact(store, &caller);
     }
     if matches!(name, "me" | "board" | "duty_get") {
         let st = store.read_view()?;

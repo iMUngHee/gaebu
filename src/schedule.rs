@@ -19,7 +19,7 @@ mod presentation;
 mod runtime;
 pub use commands::{ScheduleCmd, call, human_hold, reserve, run_cli, tools};
 pub use presentation::view;
-pub use runtime::{register, set_manager, transaction};
+pub use runtime::{compact, register, set_manager, transaction};
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 2_000;
@@ -360,10 +360,6 @@ fn nonempty(text: &str, field: &str) -> Result<()> {
 }
 
 fn validate(schedule: &Schedule) -> Result<()> {
-    validate_contents(schedule, MAX_ITEMS)
-}
-
-fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
     if schedule.schema_version != 1 {
         return Err(Error::new(
             Reason::StoreUnsupported,
@@ -371,7 +367,7 @@ fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
         ));
     }
     nonempty(&schedule.id, "schedule id")?;
-    if schedule.items.len() > max_items || schedule.next_item == 0 || schedule.next_dispatch == 0 {
+    if schedule.items.len() > MAX_ITEMS || schedule.next_item == 0 || schedule.next_dispatch == 0 {
         return Err(invalid("invalid schedule size or allocator"));
     }
     let mut ids = BTreeSet::new();
@@ -392,68 +388,11 @@ fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
         }
     }
     for item in &schedule.items {
-        let number = item_number(&item.id)?;
+        let (number, dispatch) = validate_item(item, &mut tokens)?;
         max_item = max_item.max(number);
+        max_dispatch = max_dispatch.max(dispatch);
         if !ids.insert(item.id.as_str()) {
             return Err(invalid("duplicate schedule item id"));
-        }
-        nonempty(&item.title, "title")?;
-        scope::normalize_list(&item.scope)?;
-        if let Some(pm) = &item.pm_ref {
-            nonempty(&pm.task, "PM task")?;
-            nonempty(&pm.item, "PM item")?;
-            if let Some(plan) = &pm.plan
-                && (plan.contains(['\\', ':', '*'])
-                    || plan.starts_with('/')
-                    || plan
-                        .split('/')
-                        .any(|part| part.is_empty() || part == "." || part == ".."))
-            {
-                return Err(invalid("PM plan must be a project-relative path"));
-            }
-        }
-        let mut keys = BTreeSet::new();
-        for dispatch in &item.dispatches {
-            nonempty(&dispatch.key, "dispatch key")?;
-            let number = dispatch
-                .token
-                .strip_prefix("x-")
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|n| *n > 0)
-                .ok_or_else(|| invalid("invalid dispatch token"))?;
-            max_dispatch = max_dispatch.max(number);
-            if !tokens.insert(dispatch.token.as_str()) {
-                return Err(invalid("duplicate dispatch token"));
-            }
-            if !keys.insert(dispatch.key.as_str()) && dispatch.predecessor.is_none() {
-                return Err(invalid("dispatch key replacement needs a predecessor"));
-            }
-            if let Some(previous) = &dispatch.predecessor {
-                let predecessor = item
-                    .dispatches
-                    .iter()
-                    .find(|d| &d.token == previous)
-                    .ok_or_else(|| invalid("dispatch predecessor missing"))?;
-                if predecessor.key != dispatch.key
-                    || predecessor.retired.is_none()
-                    || predecessor.token == dispatch.token
-                {
-                    return Err(invalid("dispatch predecessor is not retired"));
-                }
-            }
-            if dispatch.manifest_hash != manifest_hash(dispatch)? {
-                return Err(conflict("dispatch manifest hash does not match"));
-            }
-            scope::normalize_list(&dispatch.spec.scope)?;
-            if !scope::within(&dispatch.spec.scope, &item.scope)? {
-                return Err(Error::new(
-                    Reason::OutOfScope,
-                    "dispatch exceeds item scope",
-                ));
-            }
-        }
-        if let Some(completion) = &item.completion {
-            nonempty(&completion.evidence, "completion evidence")?;
         }
     }
     if schedule.next_item <= max_item || schedule.next_dispatch <= max_dispatch {
@@ -480,12 +419,9 @@ fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
     let mut pending = BTreeMap::new();
     let mut dependants: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (id, dependencies) in &nodes {
-        let mut seen = BTreeSet::new();
+        validate_dependencies(id, dependencies, &ids)?;
         let mut count = 0;
         for dependency in *dependencies {
-            if dependency == id || !ids.contains(dependency.as_str()) || !seen.insert(dependency) {
-                return Err(invalid("missing, repeated, or self dependency"));
-            }
             if !complete.contains(dependency.as_str()) {
                 count += 1;
                 dependants.entry(dependency).or_default().push(id);
@@ -513,6 +449,80 @@ fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
     }
     if completed != pending.len() {
         return Err(invalid("schedule dependency cycle"));
+    }
+    Ok(())
+}
+
+fn validate_item<'a>(item: &'a Item, tokens: &mut BTreeSet<&'a str>) -> Result<(u64, u64)> {
+    let number = item_number(&item.id)?;
+    let mut max_dispatch = 0;
+    nonempty(&item.title, "title")?;
+    scope::normalize_list(&item.scope)?;
+    if let Some(pm) = &item.pm_ref {
+        nonempty(&pm.task, "PM task")?;
+        nonempty(&pm.item, "PM item")?;
+        if let Some(plan) = &pm.plan
+            && (plan.contains(['\\', ':', '*'])
+                || plan.starts_with('/')
+                || plan
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == ".."))
+        {
+            return Err(invalid("PM plan must be a project-relative path"));
+        }
+    }
+    let mut keys = BTreeSet::new();
+    for dispatch in &item.dispatches {
+        nonempty(&dispatch.key, "dispatch key")?;
+        let number = dispatch
+            .token
+            .strip_prefix("x-")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| invalid("invalid dispatch token"))?;
+        max_dispatch = max_dispatch.max(number);
+        if !tokens.insert(dispatch.token.as_str()) {
+            return Err(invalid("duplicate dispatch token"));
+        }
+        if !keys.insert(dispatch.key.as_str()) && dispatch.predecessor.is_none() {
+            return Err(invalid("dispatch key replacement needs a predecessor"));
+        }
+        if let Some(previous) = &dispatch.predecessor {
+            let predecessor = item
+                .dispatches
+                .iter()
+                .find(|d| &d.token == previous)
+                .ok_or_else(|| invalid("dispatch predecessor missing"))?;
+            if predecessor.key != dispatch.key
+                || predecessor.retired.is_none()
+                || predecessor.token == dispatch.token
+            {
+                return Err(invalid("dispatch predecessor is not retired"));
+            }
+        }
+        if dispatch.manifest_hash != manifest_hash(dispatch)? {
+            return Err(conflict("dispatch manifest hash does not match"));
+        }
+        scope::normalize_list(&dispatch.spec.scope)?;
+        if !scope::within(&dispatch.spec.scope, &item.scope)? {
+            return Err(Error::new(
+                Reason::OutOfScope,
+                "dispatch exceeds item scope",
+            ));
+        }
+    }
+    if let Some(completion) = &item.completion {
+        nonempty(&completion.evidence, "completion evidence")?;
+    }
+    Ok((number, max_dispatch))
+}
+
+fn validate_dependencies(id: &str, dependencies: &[String], ids: &BTreeSet<&str>) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for dependency in dependencies {
+        if dependency == id || !ids.contains(dependency.as_str()) || !seen.insert(dependency) {
+            return Err(invalid("missing, repeated, or self dependency"));
+        }
     }
     Ok(())
 }

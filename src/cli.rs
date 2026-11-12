@@ -150,6 +150,8 @@ enum Cmd {
     /// Canonical project schedules and operational work distribution.
     #[command(subcommand)]
     Schedule(crate::schedule::ScheduleCmd),
+    /// Archive eligible terminal runtime history.
+    Compact,
     /// Leases.
     #[command(subcommand)]
     Lease(LeaseCmd),
@@ -985,6 +987,21 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             })
         }
         Cmd::Schedule(cmd) => crate::schedule::run_cli(cmd, json, pager),
+        Cmd::Compact => {
+            let store = open_store()?;
+            let caller = mutating_caller(pager)?;
+            identity::refresh_bindings(&store, pager)?;
+            let result = crate::schedule::compact(&store, &caller)?;
+            if json {
+                print_json(&result);
+            } else {
+                println!(
+                    "archived duties: {}, escalations: {}, records: {}",
+                    result["duties"], result["escalations"], result["records"]
+                );
+            }
+            Ok(())
+        }
         Cmd::Duty(DutyCmd::Show { duty, session }) => {
             let store = open_store()?;
             let session = match session {

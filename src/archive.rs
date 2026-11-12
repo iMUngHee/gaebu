@@ -27,48 +27,32 @@ pub(crate) fn scan<T: DeserializeOwned>(path: &Path, mut visit: impl FnMut(T)) -
     Ok(())
 }
 
-/// `bytes == None` is a dedup hit: reopen and sync the existing file and its
-/// directory, since a previous writer may have stopped before either sync.
-pub(crate) fn append(path: &Path, bytes: Option<&[u8]>) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true).append(true);
-    if bytes.is_some() {
-        options.create(true);
-    }
-    let mut file = options.open(path).map_err(io_error)?;
-    #[cfg(test)]
-    OBSERVED.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
-    if let Some(bytes) = bytes {
-        let length = file.metadata().map_err(io_error)?.len();
-        if length > 0 {
-            file.seek(SeekFrom::End(-1)).map_err(io_error)?;
-            let mut last = [0];
-            file.read_exact(&mut last).map_err(io_error)?;
-            if last[0] != b'\n' {
-                file.write_all(b"\n").map_err(io_error)?;
-            }
+/// Append a complete batch and publish its directory entry before the caller
+/// can replace the document that references these rows.
+pub(crate) fn append(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(io_error)?;
+    let length = file.metadata().map_err(io_error)?.len();
+    if length > 0 {
+        file.seek(SeekFrom::End(-1)).map_err(io_error)?;
+        let mut last = [0];
+        file.read_exact(&mut last).map_err(io_error)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n").map_err(io_error)?;
         }
-        file.write_all(bytes).map_err(io_error)?;
-        file.write_all(b"\n").map_err(io_error)?;
     }
+    file.write_all(bytes).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
-    #[cfg(test)]
-    OBSERVED.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
-    // Unix requires the directory entry to be durable too, including retries
-    // after a failed first creation. Windows retains file-sync guarantees.
-    #[cfg(unix)]
-    File::open(
+    // Retry the directory sync even if a failed first creation left the file.
+    crate::store::sync_dir(
         path.parent()
             .ok_or_else(|| Error::new(Reason::InvalidArgument, "archive path has no parent"))?,
-    )
-    .and_then(|directory| directory.sync_all())
-    .map_err(io_error)?;
+    )?;
     Ok(())
-}
-
-#[cfg(test)]
-thread_local! {
-    static OBSERVED: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
@@ -76,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dedup_resyncs_and_append_repairs_a_torn_tail() {
+    fn batch_append_repairs_a_torn_tail() {
         let dir = std::env::temp_dir().join(format!(
             "gaebu-archive-unit-{}-{}",
             std::process::id(),
@@ -85,13 +69,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("archive.jsonl");
         std::fs::write(&path, b"{broken").unwrap();
-        OBSERVED.with(|counts| counts.set((0, 0)));
-        append(&path, Some(b"{\"value\":7}")).unwrap();
+        append(&path, b"{\"value\":7}\n").unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes, b"{broken\n{\"value\":7}\n");
-        append(&path, None).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert_eq!(OBSERVED.with(|counts| counts.get()), (2, 2));
         let mut values = vec![];
         scan::<serde_json::Value>(&path, |value| values.push(value)).unwrap();
         assert_eq!(values, vec![serde_json::json!({"value":7})]);
