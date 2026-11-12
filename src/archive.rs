@@ -75,7 +75,14 @@ mod tests {
         let mut values = vec![];
         scan::<serde_json::Value>(&path, |value| values.push(value)).unwrap();
         assert_eq!(values, vec![serde_json::json!({"value":7})]);
-        assert!(scan::<serde_json::Value>(&path.join("not-a-directory"), |_| {}).is_err());
+        // A file used as a parent can report NotFound on Windows. An invalid
+        // path tests error propagation independently of that OS mapping.
+        assert!(scan::<serde_json::Value>(&dir.join("invalid\0path"), |_| {}).is_err());
+        assert!(scan::<serde_json::Value>(&dir, |_| {}).is_err());
+        scan::<serde_json::Value>(&dir.join("missing.jsonl"), |_| {
+            panic!("a missing archive must not produce entries")
+        })
+        .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

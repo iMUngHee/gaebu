@@ -4,7 +4,7 @@
 
 0.4.0 storage changes, 2026-11-13: Linux 7.2.15-1-omarchy, x86_64,
 Btrfs, Rust 1.99.0. `cargo fmt --check`, strict clippy and `cargo test`
-pass (292 passed, 0 failed, 3 helper entry points ignored). Native mod tests
+pass (293 passed, 0 failed, 3 helper entry points ignored). Native mod tests
 pass 26 of 26; plugin validation passes with the existing missing-author and
 catalog-icon warnings.
 
@@ -20,6 +20,13 @@ takes about 98 ms. The 10,000-entry runtime fixture measures about 0.43 ms
 for boundary-check/append and 71 ms for locked lookup. These are synthetic
 local observations, not production latency guarantees. Unix file/directory
 sync ordering is reviewed in code; physical power-loss persistence is untested.
+
+Archive fixture checks also pass with a symlinked `TMPDIR` on Linux. A Unix
+subprocess regression exercises the read counter and registration-move checks
+through that alias. Fixtures use canonical paths to match registration, and
+I/O failure tests use invalid paths rather than assuming an OS-specific error
+for a file used as a parent. The macOS and Windows CI rerun for this fixture
+correction remains pending.
 
 ## Windows
 
