@@ -134,8 +134,29 @@ current state. A state written by a newer schema is refused as unsupported,
 with no fallback and no repair over it. The schema-2 migration keeps the
 schema-1 original in `state.v1.json` and writes the previous generation as v2
 first, so a gaebu 0.1 binary fails closed rather than reading a stale v1 state.
-Per-session logs use their own locks. Those mechanisms coordinate
+The schema-4 migration preserves schema-1/2/3 originals and publishes both
+runtime generations as schema 4, so older binaries cannot discard archive
+boundaries. Per-session logs use their own locks. Those mechanisms coordinate
 cooperative writers and do not prevent a same-user process bypassing the engine.
+
+Runtime archives are committed byte prefixes, protected by `state.lock` for
+append, truncation and full duty lookup. Before append, missing/short committed
+prefixes and missing boundary newlines fail closed; typed parsing is deferred
+to lookup. Lookup validates the whole committed duty prefix and rejects
+malformed entries, while ignoring uncommitted suffixes. This detects accidental
+truncation and malformed JSON, not malicious edits to otherwise valid JSON.
+Hot foreign-team duties retain `no_grant`; archived contracts are searched
+only in the caller team's file and foreign IDs return `not_found`.
+
+On Unix, archive file sync precedes sync of its team directory, archive
+directory and home directory, then runtime state publication. Every successful
+state rename also syncs its parent, including the previous generation and
+Schedule saves. A sync error after rename may report failure after the state
+became visible; it does not promise rollback. Both visible generations remain
+safe because archive data was synced first. Windows retains file sync and
+rename, without portable directory-fsync durability. Process tests exercise
+publication failure, retries and lock races; they do not prove physical
+power-loss ordering, which requires code inspection or platform fault testing.
 
 Leases are advisory reservations, not filesystem edit guards. Duty completion
 records the recipient's assertion; review and runtime verification establish

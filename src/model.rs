@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub type Ms = u64;
 
@@ -24,6 +24,9 @@ pub struct State {
     /// Registered canonical project schedules, keyed by runtime team id.
     #[serde(default)]
     pub schedules: BTreeMap<String, ScheduleRegistration>,
+    /// Committed JSONL byte lengths, keyed by runtime team id.
+    #[serde(default)]
+    pub archives: BTreeMap<String, ArchiveLengths>,
     pub teams: BTreeMap<String, Team>,
     pub bus: BTreeMap<String, Bu>,
     pub members: BTreeMap<String, Member>,
@@ -32,7 +35,7 @@ pub struct State {
     pub leases: BTreeMap<String, Lease>,
     pub escalations: BTreeMap<String, Escalation>,
     pub records: Vec<Record>,
-    /// Idempotency keys of root directives: `<prompt sha256>:<action>:<target>`.
+    /// Idempotency keys of root directives: `<session id>:<prompt seq>:<action>:<target>`.
     pub root_actions: BTreeMap<String, RootAction>,
     /// Notices to deliver through pager after commit.
     pub outbox: Vec<Notice>,
@@ -46,6 +49,7 @@ impl Default for State {
             next_id: 1,
             runtime_id: String::new(),
             schedules: BTreeMap::new(),
+            archives: BTreeMap::new(),
             teams: BTreeMap::new(),
             bus: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -58,6 +62,13 @@ impl Default for State {
             outbox: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveLengths {
+    pub duties: u64,
+    pub escalations: u64,
+    pub records: u64,
 }
 
 impl State {
@@ -383,6 +394,8 @@ pub struct Escalation {
     pub answer: Option<String>,
     pub created_at: Ms,
     pub answered_at: Option<Ms>,
+    #[serde(default)]
+    pub closed_at: Option<Ms>,
     #[serde(default)]
     pub superseded_by: Option<String>,
 }

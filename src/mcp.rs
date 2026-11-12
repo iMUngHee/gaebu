@@ -215,7 +215,8 @@ fn call(
     if matches!(name, "me" | "board" | "duty_get") {
         let st = store.read_view()?;
         if name == "duty_get" {
-            return serde_json::to_value(card::full_duty(
+            return serde_json::to_value(crate::compact::full_duty(
+                store,
                 &st,
                 &caller.session_id,
                 required(args, "duty")?,

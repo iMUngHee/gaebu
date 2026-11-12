@@ -3,8 +3,8 @@
 This is the contract for what Gaebu stores and prints. The Rust types in
 `src/model.rs`, `src/schedule.rs` and `src/card.rs` are its source of truth; this page explains
 them. The JSON in `~/.gaebu/state.json` is exactly their serde form, with
-`schema_version: 3`. A schema-1 or schema-2 file is migrated on first write (see
-[Schema 3 migration](#schema-3-migration)).
+`schema_version: 4`. A schema-1, schema-2 or schema-3 file is migrated on first write (see
+[Schema 4 migration](#schema-4-migration)).
 
 ## Vocabulary
 
@@ -91,6 +91,8 @@ only from grants.
   escalation whose recipient can no longer answer (vacant, pending, dismissed,
   in a cancelled bu) moves to the asker's nearest live superior, or to the
   user's queue when there is none or the asker itself can no longer act.
+  `closed_at` records answer, withdrawal or supersession time. Legacy closed
+  entries without it use `answered_at`, then `created_at`, for retention.
 - **Record**: `kind` (`decision`, `handoff`, `change`, `note`), `author`,
   `refs`, `text`.
 - **Outbox**: notices waiting to be delivered with `pager send <target>`, where
@@ -236,6 +238,10 @@ still has that token.
 ~/.gaebu/state.prev.json       previous generation
 ~/.gaebu/state.v1.json         the schema-1 original, kept once by the migration
 ~/.gaebu/state.v2.json         the schema-2 original, kept once by the migration
+~/.gaebu/state.v3.json         the schema-3 original, kept once by the migration
+~/.gaebu/archive/<team>/duties.jsonl      retired full duty contracts
+~/.gaebu/archive/<team>/escalations.jsonl retired closed questions
+~/.gaebu/archive/<team>/records.jsonl     retired team records
 <project>/schedule.md          canonical operational work and review evidence
 <project>/schedule.md.lock     sidecar OS lock, never deleted
 ~/.gaebu/state.lock            OS lock, never deleted
@@ -247,17 +253,70 @@ still has that token.
 
 `GAEBU_HOME` overrides `~/.gaebu`.
 
-## Schema 3 migration
+## Runtime history
 
-The first write or repair of schema 1/2 backs up the exact original bytes to
-`state.v1.json` or `state.v2.json` without replacing a previous backup. Migration
-publishes schema 3 to `state.prev.json` and then `state.json` before running the
+`State.archives[team]` contains the committed byte lengths `duties`,
+`escalations` and `records` of that team's JSONL files. Runtime compaction
+keeps terminal duties for at least 24 hours after `updated_at`, closed
+escalations for 24 hours after closure, and records for one hour. Duties
+covered by any human hold or referenced by an open escalation remain hot.
+Teams, bus, members, grants, root idempotency keys and Schedule registrations
+remain hot; the allocator and runtime identity are preserved.
+
+A linked duty of an Active team retires only when the caller holds that
+team's Schedule observation with matching registration/document/reference ID
+and a tombstone for its item. Other Active teams' linked duties remain hot.
+Terminal linked duties of Cancelled teams can retire without their Schedule,
+because those teams cannot materialize another dispatch. Retention, holds and
+open escalations still apply to that exception.
+
+Automatic compaction runs after a member operation has committed, in a
+separate transaction, when at least 64 eligible entities exist across the
+collections and teams. A failure prints a warning without failing the member
+operation. Explicit compaction uses a threshold of one and reports errors.
+Root operations and hooks do not trigger compaction. Neither path takes a
+Schedule lock inside `state.lock`.
+
+Archive appends first check that the committed prefix exists, is long enough,
+and ends in a newline. They truncate only its uncommitted suffix, append full
+entities, and sync files and directory links before publishing boundaries
+and removing hot entries in one state commit. Appends do not reparse old
+entries. A failed state publication leaves hot entries authoritative and an
+uncommitted suffix that the next append discards.
+
+`duty show` and MCP `duty_get` acquire `state.lock`, re-read the current state
+and caller's team, and choose the hot contract or stream the caller team's
+committed duty archive. They return the last matching ID and validate every
+line in the committed region. Missing, short, malformed or unterminated
+committed duty data returns `store_corrupt`; suffix bytes are ignored.
+A foreign hot duty retains the existing `no_grant` refusal. A foreign archived
+duty returns `not_found`, since only the caller team's archive is searched.
+Mutating an archived duty or escalation returns `not_found` with archive
+guidance. Repair restores earlier boundaries and the later-retired entities
+hot from the previous state; lookup holds the same lock as repair and
+truncation, so stale snapshots cannot select obsolete boundaries.
+
+Archive files grow with history. Length/newline validation before append is
+constant in archive size, but full duty lookup scans that team's committed
+history under the state lock. The CLI lock/publication budget is five seconds;
+synchronous archive I/O and parsing cannot be interrupted. Large histories or
+slow disks can exceed that budget and delay other writers. The 10,000-entry
+`runtime_compact::archive_large_cost` test reports observed costs on its host;
+it does not establish a portable latency bound.
+
+## Schema 4 migration
+
+The first write or repair of schema 1/2/3 backs up the exact original bytes to
+`state.v1.json`, `state.v2.json` or `state.v3.json` without replacing a previous backup. Migration
+publishes schema 4 to `state.prev.json` and then `state.json` before running the
 requested operation. A crash repeats the migration safely; older binaries cannot
 fall back to an older generation and ignore Schedule guards.
 
 Schema 1 still receives evidence strength, notice deduplication and escalation
-normalization. Both legacy schemas gain default Schedule fields and a stable
-runtime origin. The requesting operation runs only after migration commits.
+normalization. Legacy schemas gain default Schedule/archive fields and a stable
+runtime origin if absent. Older closed escalations default `closed_at` to null.
+The requesting operation runs only after migration commits. Older binaries
+refuse schema 4 rather than dropping archive boundaries on their next write.
 
 The schema probe precedes full decoding. Future schemas return
 `store_unsupported` and never fall back or get overwritten by repair. Install the

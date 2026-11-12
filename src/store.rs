@@ -7,6 +7,8 @@
 //! state.json            the whole State, replaced atomically
 //! state.prev.json       the previous generation (recovery)
 //! state.v1.json         the schema-1 original, kept by the v2 migration
+//! state.v3.json         the schema-3 original, kept by the v4 migration
+//! archive/<team>/{duties,escalations,records}.jsonl  committed history
 //! state.lock            OS lock (never deleted)
 //! sessions/<id>/events.jsonl    SessionEvent lines (hook writes)
 //! sessions/<id>/composer.jsonl  ComposerRecord lines (mod writes via CLI)
@@ -145,7 +147,7 @@ impl Store {
         };
         ensure_budget(deadline)?;
         if let Some((version, original)) = legacy {
-            // Its own commit, before `f`: a failure here leaves the v1 file
+            // Its own commit, before `f`: a failure here leaves the legacy file
             // as it was and runs no user change.
             self.publish_migration(&mut state, version, &original, deadline)?;
         }
@@ -468,7 +470,7 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
     };
     let probe: Probe = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
     match probe.schema_version {
-        version @ (1 | 2) => {
+        version @ (1..=3) => {
             // Legacy additions default; schema 1 also needs notice/evidence normalization.
             let mut state: State = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
             if version == 1 {
@@ -623,7 +625,7 @@ pub(crate) fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Res
         loop {
             ensure_budget(deadline)?;
             match fs::rename(&tmp, path) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return sync_dir(path.parent().unwrap_or_else(|| Path::new("."))),
                 Err(e)
                     if (e.kind() == io::ErrorKind::PermissionDenied
                         || cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
@@ -642,6 +644,36 @@ pub(crate) fn replace_until(path: &Path, bytes: &[u8], deadline: Instant) -> Res
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Publish directory entries after file creation or rename on Unix.
+pub(crate) fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(write_error)?;
+    // Windows has no portable directory-fsync API in std.
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_sync_propagates_missing_parent_error() {
+        let path = std::env::temp_dir().join(format!(
+            "gaebu-sync-missing-{}-{}",
+            std::process::id(),
+            TMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert_eq!(
+            sync_dir(&path).unwrap_err().reason,
+            Reason::StoreWriteFailed
+        );
+    }
 }
 
 fn clean_tmp(dir: &Path) -> Result<()> {

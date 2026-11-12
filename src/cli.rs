@@ -992,9 +992,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 None => identity::from_pager(pager)?.session_id,
             };
             let state = store.read_view()?;
-            let duty = card::full_duty(&state, &session, &duty)?;
+            let duty = crate::compact::full_duty(&store, &state, &session, &duty)?;
             if json {
-                print_json(duty);
+                print_json(&duty);
             } else {
                 println!(
                     "{} [{}] {}\n의도: {}\n범위: {}\n결정권: {}\n완료 기준: {}\n계획: {}\n작업 위치: {}\n버전: {}\n메모: {}",

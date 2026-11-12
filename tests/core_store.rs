@@ -392,7 +392,7 @@ fn legacy_sighting_defaults_pending_throttle_fields() {
 // ----- schema v2 migration (plan gaebu-v0-2, Decisions 12–12d) -----
 
 const V1: &str = include_str!("fixtures/state-v1.json");
-const FUTURE: &str = r#"{"schema_version":4,"teams":"a newer shape this model cannot parse"}"#;
+const FUTURE: &str = r#"{"schema_version":5,"teams":"a newer shape this model cannot parse"}"#;
 
 fn json(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
@@ -411,11 +411,38 @@ fn schema_two_migrates_with_original_backup_and_current_previous_generation() {
         .transact(Duration::from_secs(5), |_| Ok(()))
         .unwrap();
     let current = json(&home.0.join("state.json"));
-    assert_eq!(current["schema_version"], 3);
+    assert_eq!(current["schema_version"], gaebu::model::SCHEMA_VERSION);
     assert!(!current["runtime_id"].as_str().unwrap().is_empty());
     assert_eq!(fs::read(home.0.join("state.v2.json")).unwrap(), original);
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 3);
+    assert_eq!(
+        json(&home.0.join("state.prev.json"))["schema_version"],
+        gaebu::model::SCHEMA_VERSION
+    );
     assert_eq!(current["schedules"], serde_json::json!({}));
+}
+
+#[test]
+fn schema_3_migrates_with_exact_backup_and_archive_defaults() {
+    let home = Home::new();
+    let mut legacy = serde_json::to_value(State::default()).unwrap();
+    legacy["schema_version"] = 3.into();
+    legacy["runtime_id"] = "original-runtime".into();
+    legacy["rev"] = 8.into();
+    legacy["next_id"] = 50.into();
+    legacy.as_object_mut().unwrap().remove("archives");
+    let original = serde_json::to_vec(&legacy).unwrap();
+    fs::write(home.0.join("state.json"), &original).unwrap();
+    let store = home.store();
+    assert_eq!(store.read_view().unwrap().schema_version, 4);
+    store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
+    let state = store.read_current().unwrap();
+    assert_eq!(state.schema_version, 4);
+    assert_eq!(state.runtime_id, "original-runtime");
+    assert_eq!(state.next_id, 50);
+    assert_eq!(state.rev, 10);
+    assert!(state.archives.is_empty());
+    assert_eq!(fs::read(home.0.join("state.v3.json")).unwrap(), original);
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 4);
 }
 
 #[test]
