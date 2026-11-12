@@ -262,8 +262,11 @@ fn append<T: Serialize>(path: &Path, committed: u64, entries: &[T]) -> Result<u6
     file.stream_position().map_err(write_error)
 }
 
-/// Re-read authority and boundaries under the same lock that protects truncation.
-pub fn full_duty(store: &Store, _st: &State, session: &str, duty: &str) -> Result<Duty> {
+/// Hot contracts use the caller's snapshot; archive reads lock against truncation.
+pub fn full_duty(store: &Store, st: &State, session: &str, duty: &str) -> Result<Duty> {
+    if st.duties.contains_key(duty) {
+        return crate::card::full_duty(st, session, duty).cloned();
+    }
     let _lock = store::lock(store.home(), "state.lock", store::CLI_DEADLINE)?;
     let st = store.read_view()?;
     let member = authz::member_for_session(&st, session)

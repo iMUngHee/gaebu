@@ -171,8 +171,9 @@ fn archived_duty_contract_cli_and_team_authorization() {
         .store
         .transact(CLI_DEADLINE, |st| Ok(seed(st, "two")))
         .unwrap();
+    let hot = f.store.read_current().unwrap();
     assert_eq!(
-        compact::full_duty(&f.store, &before, &other.session_id, &id)
+        compact::full_duty(&f.store, &hot, &other.session_id, &id)
             .unwrap_err()
             .reason,
         Reason::NoGrant
@@ -183,7 +184,7 @@ fn archived_duty_contract_cli_and_team_authorization() {
     assert!(!after.duties.contains_key(&id));
     assert_eq!(f.get(&id).unwrap(), original);
     assert_eq!(
-        compact::full_duty(&f.store, &before, &other.session_id, &id)
+        compact::full_duty(&f.store, &after, &other.session_id, &id)
             .unwrap_err()
             .reason,
         Reason::NotFound
@@ -208,6 +209,41 @@ fn archived_duty_contract_cli_and_team_authorization() {
     );
     let shown: Duty = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(shown, original);
+}
+
+#[test]
+fn hot_snapshot_lookup_does_not_wait_for_state_lock() {
+    let f = Fixture::new();
+    let id = f.duty();
+    let snapshot = f.store.read_current().unwrap();
+    let original = snapshot.duties[&id].clone();
+    compact::run(&f.store, &f.team, None).unwrap();
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(f.store.home().join("state.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            tx.send(compact::full_duty(
+                &f.store,
+                &snapshot,
+                &f.worker.session_id,
+                &id,
+            ))
+            .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_millis(250));
+        drop(lock);
+        assert_eq!(
+            result
+                .expect("hot snapshot lookup waited for state.lock")
+                .unwrap(),
+            original
+        );
+    });
 }
 
 #[test]

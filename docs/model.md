@@ -288,17 +288,20 @@ and removing hot entries in one state commit. Appends do not reparse old
 entries. A failed state publication leaves hot entries authoritative and an
 uncommitted suffix that the next append discards.
 
-`duty show` and MCP `duty_get` acquire `state.lock`, re-read the current state
-and caller's team, and choose the hot contract or stream the caller team's
-committed duty archive. They return the last matching ID and validate every
-line in the committed region. Missing, short, malformed or unterminated
+`duty show` and MCP `duty_get` return hot contracts directly from the caller's
+snapshot with its team authorization check, without acquiring `state.lock`.
+Only a hot miss acquires that lock, re-reads the current state and caller's
+team, and chooses a hot contract restored by repair or streams the caller
+team's committed duty archive. Archive reads return the last matching ID and
+validate every line in the committed region. Missing, short, malformed or unterminated
 committed duty data returns `store_corrupt`; suffix bytes are ignored.
 A foreign hot duty retains the existing `no_grant` refusal. A foreign archived
 duty returns `not_found`, since only the caller team's archive is searched.
 Mutating an archived duty or escalation returns `not_found` with archive
 guidance. Repair restores earlier boundaries and the later-retired entities
-hot from the previous state; lookup holds the same lock as repair and
-truncation, so stale snapshots cannot select obsolete boundaries.
+hot from the previous state; archive fallback holds the same lock as repair and
+truncation, so stale snapshots cannot select obsolete archive boundaries.
+Hot snapshot reads retain their existing observation-time authorization.
 
 Archive files grow with history. Length/newline validation before append is
 constant in archive size, but full duty lookup scans that team's committed
