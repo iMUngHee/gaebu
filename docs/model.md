@@ -93,8 +93,9 @@ only from grants.
   user's queue when there is none or the asker itself can no longer act.
 - **Record**: `kind` (`decision`, `handoff`, `change`, `note`), `author`,
   `refs`, `text`.
-- **Outbox**: notices waiting to be delivered with `pager send <session_id>`.
-  `body` is what is sent; `text` is the body without its record id, the
+- **Outbox**: notices waiting to be delivered with `pager send <target>`, where
+  the target is the recipient's session id, or its pager alias while the seat
+  is pending. `body` is what is sent; `text` is the body without its record id, the
   dedupe key. See [Notices](#notices).
 
 ## Scope patterns
@@ -131,17 +132,26 @@ interrupts them with a pager notice (Act); the rest wait for the next card
 | duty issued, amended, cancelled (to the assignee) | duty accepted, unblocked |
 | duty declined, blocked, done, handed off (to the issuer) | grant delegated |
 | hold set or lifted (to the assignees it covers) | bu closed, title changed |
-| escalation raised, superseded, rerouted, withdrawn (to the recipient) | binding confirmed or awaiting confirmation |
-| escalation answered (to the asker) | appointment, assignment, member added, seat rebound |
+| escalation raised, superseded, rerouted, withdrawn (to the recipient) | binding confirmed |
+| escalation answered (to the asker) | a seat awaiting confirmation (to its superior) |
 | lease force-released (to the holder) | member vacant |
 | bu or team cancelled, member dismissed, grant revoked, member moved | lease acquired, renewed, released |
 | bu opened (to the new head) | |
+| seat designated or rebound: appointment, assignment, member added, seat rebound (to the new seat's alias) | |
 
-No notice goes to the actor's own session, to a recipient with no bound
-session, or when the newest notice still queued for that session has the same
-`text` (also while a flush holds it), so a change that flips back and forth
-still arrives in order. Once delivered, the same change raised again is a new
-notice.
+A notice goes to the recipient's bound session. A pending seat has none, so
+the one notice it gets, that it was designated or rebound, is sent to its
+pager alias: the page gives that session a prompt, and its hook confirms the
+binding. Pager accepting the page is not the confirmation; a hook that cannot
+finish its check leaves the seat pending until the session's next prompt, and
+a page pager refuses ten times ends as an "undelivered notice" record. A page
+still queued when the seat is confirmed or rebound again is dropped. A vacant
+seat gets no notice.
+
+No notice goes to the actor's own session, or when the newest notice still
+queued for that target has the same `text` (also while a flush holds it), so
+a change that flips back and forth still arrives in order. Once delivered,
+the same change raised again is a new notice.
 
 ## Stage
 

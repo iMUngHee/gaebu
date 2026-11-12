@@ -876,16 +876,20 @@ fn notice_not_sent_to_actor() {
     let (mut s, a, _, _) = setup();
     s.outbox.clear();
     ops::root_assign(&mut s, 30, &ev(30), &["new-staff".into()], "root").unwrap();
-    assert!(
-        s.outbox.is_empty(),
-        "pending target needs no notice; root actor must not receive one"
+    assert_eq!(
+        s.outbox
+            .iter()
+            .map(|n| n.target.as_str())
+            .collect::<Vec<_>>(),
+        ["new-staff"],
+        "the pending seat is paged at its alias; the root actor receives nothing"
     );
     let records = s.records.len();
     ops::confirm_binding(&mut s, 31, "new-staff-session", Tool::Codex, "new-staff")
         .unwrap()
         .unwrap();
-    // A confirmed seat is Record-only (plan gaebu-v0-2, Decision 13): the
-    // commander sees it on the next card.
+    // A confirmed seat is Record-only: the commander sees it on the next
+    // card, and the page still queued for the seat is moot.
     assert!(s.outbox.is_empty());
     assert_eq!(s.records.len(), records + 1);
     // An Act change from the commander still skips the commander's session.
@@ -896,6 +900,7 @@ fn notice_not_sent_to_actor() {
         .unwrap()
         .ids[0]
         .clone();
+    s.outbox.clear();
     s.members.get_mut(&id).unwrap().binding.session_id = Some(a.session_id.clone());
     ops::title_set(&mut s, 33, &a, &id, "참군").unwrap();
     assert!(
@@ -904,9 +909,99 @@ fn notice_not_sent_to_actor() {
     );
     ops::member_rebind(&mut s, 34, &a, "child", "new-child").unwrap();
     assert!(
-        s.outbox.iter().all(|n| n.to_session != a.session_id),
+        s.outbox.iter().all(|n| n.target != a.session_id),
         "rebind must not notify its actual actor"
     );
+}
+
+/// (target, to_member) of every queued notice, in order.
+fn pages(s: &State) -> Vec<(String, String)> {
+    s.outbox
+        .iter()
+        .map(|n| (n.target.clone(), n.to_member.clone()))
+        .collect()
+}
+
+#[test]
+fn pending_seat_is_paged_by_alias() {
+    // The commander is itself still pending: it must not be paged about its
+    // new staff, and each new seat is paged once at its own alias.
+    let mut s = State::default();
+    ops::root_appoint(&mut s, 10, &ev(10), "boss", Some("t"), "p", None).unwrap();
+    s.outbox.clear();
+    let aliases = ["fasa".to_string(), "cazi".into(), "roza".into()];
+    let ids = ops::root_assign(&mut s, 11, &ev(11), &aliases, "boss")
+        .unwrap()
+        .ids;
+    let want: Vec<_> = aliases.iter().cloned().zip(ids).collect();
+    assert_eq!(pages(&s), want);
+    let body = &s.outbox[0].body;
+    assert!(
+        body.contains("(fasa) assigned; confirmation pending"),
+        "{body}"
+    );
+    assert!(body.ends_with("gaebu me"), "{body}");
+}
+
+#[test]
+fn seat_notice_covers_every_pending_origin() {
+    // root_appoint: the new commander's alias.
+    let mut s = State::default();
+    let out = ops::root_appoint(&mut s, 10, &ev(10), "boss", Some("t"), "p", None).unwrap();
+    assert_eq!(pages(&s), [("boss".to_string(), out.ids[0].clone())]);
+
+    // member_add: the added alias, not the bu head.
+    let (mut s, a, b, c) = setup();
+    s.outbox.clear();
+    let bu = s.members[&b.member].bu.clone();
+    let id = ops::member_add(&mut s, 30, &a, &bu, "added", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(pages(&s), [("added".to_string(), id)]);
+
+    // member_rebind: the new alias of the reset seat.
+    s.outbox.clear();
+    ops::member_rebind(&mut s, 31, &a, &b.member, "child-next").unwrap();
+    assert_eq!(pages(&s), [("child-next".to_string(), b.member.clone())]);
+
+    // root_rebind: authored by the commander here, whose bound session is
+    // the seat's superior and still gets nothing.
+    s.outbox.clear();
+    ops::root_rebind(&mut s, 32, &ev(32), &c.member, "other-next").unwrap();
+    assert_eq!(pages(&s), [("other-next".to_string(), c.member.clone())]);
+}
+
+#[test]
+fn confirmed_seat_drops_its_queued_page() {
+    let (mut s, a, b, _) = setup();
+    let d = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    s.outbox.clear();
+    ops::root_assign(&mut s, 30, &ev(30), &["late".into()], "root").unwrap();
+    ops::duty_cancel(&mut s, 31, &a, &d, "moot").unwrap();
+    assert_eq!(s.outbox.len(), 2);
+    ops::confirm_binding(&mut s, 32, "late-session", Tool::Codex, "late")
+        .unwrap()
+        .unwrap();
+    // Only the page for the confirmed seat goes; other notices stay queued.
+    assert_eq!(pages(&s), [(b.session_id.clone(), b.member.clone())]);
+
+    // A seat rebound twice is paged at its last alias only, and confirming it
+    // leaves the notice its former session was still owed.
+    ops::member_rebind(&mut s, 33, &a, &b.member, "child-a").unwrap();
+    ops::member_rebind(&mut s, 34, &a, &b.member, "child-b").unwrap();
+    let owed = (b.session_id.clone(), b.member.clone());
+    assert_eq!(
+        pages(&s),
+        [owed.clone(), ("child-b".to_string(), b.member.clone())]
+    );
+    ops::confirm_binding(&mut s, 35, "child-b-session", Tool::Codex, "child-b")
+        .unwrap()
+        .unwrap();
+    assert_eq!(pages(&s), [owed]);
 }
 
 #[test]
@@ -1829,7 +1924,7 @@ fn escalation_reuse_reroutes_when_recipient_unavailable() {
     assert!(again.summary.contains("rerouted"));
     assert_eq!(s.escalations[&e].to.as_deref(), Some(a.member.as_str()));
     assert_eq!(s.outbox.len(), queued + 1);
-    assert_eq!(s.outbox.last().unwrap().to_session, a.session_id);
+    assert_eq!(s.outbox.last().unwrap().target, a.session_id);
     let queued = s.outbox.len();
     let third = ops::escalate(&mut s, 32, &c, None, "is the schema frozen?").unwrap();
     assert!(third.summary.contains("reused"));
@@ -1945,7 +2040,8 @@ fn escalations_reroute_after_commit() {
 // ----- attention budget (plan gaebu-v0-2, Decisions 4, 13, 15) -----
 
 /// Notices a change should queue under the rule: Act → each distinct bound
-/// recipient session other than the author's own; Record → none.
+/// recipient session other than the author's own; Record → none. The seat
+/// rows are checked in `notice_classification_matrix` itself.
 fn expected_notices(s: &State, r: &Record, act: bool) -> usize {
     if !act {
         return 0;
@@ -2348,6 +2444,17 @@ fn notice_classification_matrix() {
         op(&mut s, &a, &b, &c, &arg);
         let added = &s.records[records..];
         assert_eq!(added.len(), 1, "{name}: one team record per event");
+        // Seat rows are neither Act nor Record: one page, at the alias of
+        // the seat the operation left pending.
+        if ["root_appoint", "root_assign", "member_add", "rebind"].contains(&name) {
+            assert!(!act, "{name}: a seat row is listed as non-Act");
+            assert_eq!(s.outbox.len(), 1, "{name}: one seat page");
+            let n = &s.outbox[0];
+            let seat = &s.members[&n.to_member].binding;
+            assert_eq!(seat.state, BindingState::Pending, "{name}");
+            assert_eq!(n.target, seat.alias, "{name}");
+            continue;
+        }
         let want: usize = added.iter().map(|r| expected_notices(&s, r, act)).sum();
         assert_eq!(s.outbox.len(), want, "{name}: notices");
         if act {
@@ -2394,7 +2501,7 @@ fn composite_ops_notice_totals() {
         1,
         "only the opening interrupts the new head"
     );
-    assert_eq!(s.outbox[0].to_session, b.session_id);
+    assert_eq!(s.outbox[0].target, b.session_id);
     // A dismissal that strands an escalation: the dismissal, then the reroute.
     let (mut s, a, b, c) = chain();
     ops::escalate(&mut s, 30, &c, None, "is it frozen?").unwrap();
@@ -2409,7 +2516,7 @@ fn composite_ops_notice_totals() {
     assert!(
         s.outbox
             .iter()
-            .any(|n| n.to_session == a.session_id && n.body.contains("rerouted"))
+            .any(|n| n.target == a.session_id && n.body.contains("rerouted"))
     );
     let _ = b;
 }

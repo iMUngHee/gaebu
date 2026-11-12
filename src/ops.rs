@@ -178,7 +178,7 @@ pub fn root_appoint(
         &mid,
         std::slice::from_ref(&mid),
         "root appointed",
-        Notify::Record,
+        Notify::Seat(&mid),
     );
     Ok(out("appointed; awaiting target hook", vec![mid, tid]))
 }
@@ -231,7 +231,7 @@ pub fn root_assign(
             &commander.id,
             &[id.clone(), commander.id.clone()],
             &format!("member {id} ({alias}) assigned; confirmation pending"),
-            Notify::Record,
+            Notify::Seat(&id),
         );
         ids.push(id);
     }
@@ -520,6 +520,10 @@ pub fn confirm_binding(
         m.binding.tool = Some(tool);
         m.binding.bound_at = Some(now);
         let superior = m.superior.clone();
+        // The seat has its session: a page still queued for its alias would
+        // only wake it again.
+        st.outbox
+            .retain(|n| !(n.to_member == *id && n.target == reported_alias));
         let mut affected = vec![id.clone()];
         affected.extend(superior);
         changed(
@@ -829,7 +833,7 @@ pub fn member_add(
         &a.id,
         &[b.head],
         &format!("member {id} ({alias}) added; confirmation pending"),
-        Notify::Record,
+        Notify::Seat(&id),
     );
     Ok(out("member pending", vec![id]))
 }
@@ -1915,6 +1919,10 @@ fn rebind(st: &mut State, now: Ms, author: &str, member: &str, alias: &str) -> R
     let mut affected = vec![member.to_owned()];
     affected.extend(st.members[member].superior.clone());
     st.leases.retain(|_, l| l.holder != member);
+    // A page still queued for the alias this seat is leaving has no one to wake.
+    let left = st.members[member].binding.alias.clone();
+    st.outbox
+        .retain(|n| !(n.to_member == member && n.target == left));
     st.members.get_mut(member).unwrap().binding = pending(alias, now);
     changed(
         st,
@@ -1922,7 +1930,7 @@ fn rebind(st: &mut State, now: Ms, author: &str, member: &str, alias: &str) -> R
         author,
         &affected,
         &format!("member {member} binding replaced; awaiting confirmation as {alias}"),
-        Notify::Record,
+        Notify::Seat(member),
     );
     Ok(())
 }
@@ -1979,14 +1987,25 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) -> Vec<String> {
 }
 /// Whether a change interrupts its recipients (plan gaebu-v0-2, Decision 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Notify {
-    /// The recipient must do or stop doing something: a pager notice.
+pub enum Notify<'a> {
+    /// The recipient must do or stop doing something: a pager notice to the
+    /// bound session of each affected member.
     Act,
     /// Visible on the next card; only the team record.
     Record,
+    /// This member's seat awaits its session: a pager notice to the seat's
+    /// alias, so that session's hook runs and confirms the binding.
+    Seat(&'a str),
 }
 
-fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &str, notify: Notify) {
+fn changed(
+    st: &mut State,
+    now: Ms,
+    author: &str,
+    affected: &[String],
+    text: &str,
+    notify: Notify<'_>,
+) {
     let Some(actor) = st.members.get(author) else {
         return;
     };
@@ -2009,42 +2028,85 @@ fn changed(st: &mut State, now: Ms, author: &str, affected: &[String], text: &st
         text: text.into(),
         at: now,
     });
-    if notify == Notify::Record {
-        return;
-    }
-    let key = notice_key(&body);
-    for member in affected {
-        let session = st
+    let recipients: Vec<(String, String)> = match notify {
+        Notify::Record => return,
+        Notify::Act => affected
+            .iter()
+            .filter_map(|id| Some((id.clone(), st.members.get(id)?.binding.session_id.clone()?)))
+            .collect(),
+        Notify::Seat(id) => st
             .members
-            .get(member)
-            .and_then(|m| m.binding.session_id.clone());
-        if let Some(session) = session {
-            if actor_session.as_deref() == Some(&session) {
-                continue;
-            }
-            // The same change still waiting for this session: one notice. Only
-            // the newest queued one counts, so a change that flips back and
-            // forth (held, released, held) still arrives in order.
-            if st
-                .outbox
-                .iter()
-                .rev()
-                .find(|n| n.to_session == session)
-                .is_some_and(|n| n.text == key)
-            {
-                continue;
-            }
-            let id = st.mint("n");
-            st.outbox.push(Notice {
-                id,
-                to_member: member.clone(),
-                to_session: session,
-                body: body.clone(),
-                text: key.clone(),
-                created_at: now,
-                attempts: 0,
-                claimed_at: None,
-            });
+            .get(id)
+            .filter(|m| m.binding.state == BindingState::Pending)
+            .map(|m| (m.id.clone(), m.binding.alias.clone()))
+            .into_iter()
+            .collect(),
+    };
+    let key = notice_key(&body);
+    for (member, target) in recipients {
+        if actor_session.as_deref() == Some(&target) {
+            continue;
         }
+        // The same change still waiting for this target: one notice. Only
+        // the newest queued one counts, so a change that flips back and
+        // forth (held, released, held) still arrives in order.
+        if st
+            .outbox
+            .iter()
+            .rev()
+            .find(|n| n.target == target)
+            .is_some_and(|n| n.text == key)
+        {
+            continue;
+        }
+        let id = st.mint("n");
+        st.outbox.push(Notice {
+            id,
+            to_member: member,
+            target,
+            body: body.clone(),
+            text: key.clone(),
+            created_at: now,
+            attempts: 0,
+            claimed_at: None,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every public operation that asks for a seat page has just made the
+    /// seat pending, so the other binding states are reached only from here.
+    #[test]
+    fn seat_page_reaches_only_a_pending_seat() {
+        let mut st = State::default();
+        let ev = Evidence {
+            session_id: "user".into(),
+            prompt_seq: 10,
+            sha256: "hash".into(),
+            attest: Attest::Fixture,
+            quote: "user instruction".into(),
+            at: 10,
+            strength: crate::model::Strength::default(),
+        };
+        let id = root_appoint(&mut st, 10, &ev, "boss", Some("t"), "p", None)
+            .unwrap()
+            .ids[0]
+            .clone();
+        let mut pages = |state| {
+            st.outbox.clear();
+            st.members.get_mut(&id).unwrap().binding.state = state;
+            let seat = std::slice::from_ref(&id);
+            changed(&mut st, 11, &id, seat, "seat checked", Notify::Seat(&id));
+            st.outbox
+                .iter()
+                .map(|n| n.target.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(pages(BindingState::Bound).is_empty());
+        assert!(pages(BindingState::Vacant).is_empty());
+        assert_eq!(pages(BindingState::Pending), ["boss"]);
     }
 }

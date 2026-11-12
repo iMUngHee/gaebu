@@ -678,3 +678,31 @@ fn repair_from_v1_prev_migrates_consistently() {
         V1.as_bytes()
     );
 }
+
+#[test]
+fn notice_serializes_target_as_to_session() {
+    // The stored key is `to_session`, the name 0.3.0 binaries read and write,
+    // whatever the field is called in code.
+    let home = Home::new();
+    home.store()
+        .transact(Duration::from_secs(5), |st| {
+            st.outbox.push(gaebu::model::Notice {
+                id: "n-1".into(),
+                to_member: "m-1".into(),
+                target: "fasa".into(),
+                body: "b".into(),
+                text: "b".into(),
+                created_at: 1,
+                attempts: 0,
+                claimed_at: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.0.join("state.json")).unwrap()).unwrap();
+    let stored = &raw["outbox"][0];
+    assert_eq!(stored["to_session"], "fasa");
+    assert!(stored.get("target").is_none(), "{stored}");
+    assert_eq!(home.store().read().unwrap().outbox[0].target, "fasa");
+}
