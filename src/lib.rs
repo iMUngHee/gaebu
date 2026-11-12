@@ -6,6 +6,7 @@
 //! See `docs/model.md` for the data contract and `docs/threat-model.md` for
 //! what the checks do and do not protect against.
 
+mod archive;
 pub mod authz;
 pub mod card;
 pub mod cli;

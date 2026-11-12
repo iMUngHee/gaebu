@@ -63,6 +63,15 @@ fn mcp_initialize_list_call_roundtrip() {
         14 + gaebu::schedule::tools().len()
     );
     assert_eq!(out[2]["result"]["isError"], true);
+    let tools = out[1]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|tool| tool["name"] == "schedule_archive"));
+    assert!(tools.iter().any(|tool| tool["name"] == "schedule_move"));
+    let show = tools
+        .iter()
+        .find(|tool| tool["name"] == "schedule_show")
+        .unwrap();
+    assert_eq!(show["inputSchema"]["properties"]["item"]["type"], "string");
+    assert_eq!(show["inputSchema"]["properties"]["all"]["type"], "boolean");
     assert_eq!(out[3], json!({"jsonrpc":"2.0","id":"p","result":{}}));
 }
 

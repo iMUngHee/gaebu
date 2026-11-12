@@ -436,8 +436,8 @@ fn delegated_schedule_nested_team_hold_and_review_work_through_cli() {
     );
     let st = store.read().unwrap();
     assert_eq!(
-        gaebu::schedule::view(&store, &st, &master.team).unwrap()["items"][0]["stage"],
-        "complete"
+        gaebu::schedule::view(&store, &st, &master.team).unwrap()["items"],
+        serde_json::json!([])
     );
     let mut card = gaebu::card::build(&st, &master.id, now_ms(), Some(now_ms())).unwrap();
     gaebu::card::enrich(&store, &st, &mut card);
