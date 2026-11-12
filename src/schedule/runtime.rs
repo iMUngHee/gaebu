@@ -125,9 +125,7 @@ pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> 
     if document.schedule.id != registration.schedule_id {
         return Err(conflict("schedule identity changed"));
     }
-    for retired in &document.schedule.retired {
-        archive::load(&path, &document.schedule, retired)?;
-    }
+    archive::load(&path, &document.schedule, &document.schedule.retired)?;
     store.transact(CLI_DEADLINE, |st| {
         let actor = identity::actor(st, caller)?;
         commander(st, &actor, &team)?;
@@ -181,7 +179,7 @@ pub fn transaction<T>(
             None => Err(conflict("linked duty has no schedule registration")),
         }
     };
-    store.transact(CLI_DEADLINE, |st| {
+    let result = store.transact(CLI_DEADLINE, |st| {
         let actor = identity::actor(st, caller)?;
         if st.schedules.get(&team) != registration.as_ref() {
             return Err(conflict("schedule registration changed while waiting"));
@@ -272,7 +270,59 @@ pub fn transaction<T>(
             }
         }
         Ok(result)
-    })
+    })?;
+    match store.read_current() {
+        Ok(after) if after.schedules.get(&team) == registration.as_ref() => {
+            let retired = if crate::compact::needs_schedule(&after, &team) {
+                document().ok().map(|document| crate::compact::Retired {
+                    schedule_id: document.schedule.id.clone(),
+                    items: document
+                        .schedule
+                        .retired
+                        .iter()
+                        .map(|item| item.id.clone())
+                        .collect(),
+                })
+            } else {
+                None
+            };
+            crate::compact::auto(store, &team, retired.as_ref());
+        }
+        Ok(_) => (),
+        Err(error) => eprintln!("gaebu: runtime compaction deferred: {error}"),
+    }
+    Ok(result)
+}
+
+/// Explicit history maintenance follows the Schedule -> state lock order.
+pub fn compact(store: &Store, caller: &Caller) -> Result<Value> {
+    let snapshot = store.read_current()?;
+    let actor = identity::actor(&snapshot, caller)?;
+    let team = snapshot.members[&actor.member].team.clone();
+    let registration = snapshot.schedules.get(&team);
+    let _file = registration
+        .map(|reg| lock_path(Path::new(&reg.path)))
+        .transpose()?;
+    let current = store.read_current()?;
+    identity::actor(&current, caller)?;
+    if current.schedules.get(&team) != registration {
+        return Err(conflict("schedule registration changed"));
+    }
+    let retired = registration.and_then(|reg| {
+        read_document(Path::new(&reg.path))
+            .ok()
+            .filter(|document| document.schedule.id == reg.schedule_id)
+            .map(|document| crate::compact::Retired {
+                schedule_id: document.schedule.id,
+                items: document
+                    .schedule
+                    .retired
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect(),
+            })
+    });
+    crate::compact::run(store, &team, retired.as_ref())
 }
 
 pub(super) fn lock_document(path: &Path) -> Result<(File, Document)> {
@@ -502,6 +552,7 @@ fn lock_path(path: &Path) -> Result<File> {
 pub(super) fn runtime_duty<'a>(
     st: &'a State,
     schedule: &Schedule,
+    item: &Item,
     dispatch: &Dispatch,
 ) -> Result<Option<&'a Duty>> {
     let matches: Vec<_> = st
@@ -521,10 +572,7 @@ pub(super) fn runtime_duty<'a>(
             || duty.assignee != dispatch.assignee.id
             || duty.issuer != dispatch.issuer.id
             || duty.schedule_ref.as_ref().unwrap().manifest_hash != dispatch.manifest_hash
-            || !schedule.items.iter().any(|item| {
-                item.id == duty.schedule_ref.as_ref().unwrap().item_id
-                    && item.dispatches.iter().any(|d| d.token == dispatch.token)
-            }))
+            || item.id != duty.schedule_ref.as_ref().unwrap().item_id)
     {
         return Err(conflict("runtime duty manifest differs from schedule"));
     }

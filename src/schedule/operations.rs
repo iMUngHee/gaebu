@@ -106,7 +106,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                             "unknown runtime origin cannot establish completion",
                         ));
                     }
-                    if runtime_duty(st, &document.schedule, dispatch)?
+                    if runtime_duty(st, &document.schedule, &item, dispatch)?
                         .is_none_or(|d| d.status != DutyStatus::Done)
                     {
                         return Err(conflict(
@@ -159,7 +159,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                 if dispatch.retired.is_some() {
                     return Ok(json!({"token":token,"retired":true}));
                 }
-                if let Some(duty) = runtime_duty(st, &document.schedule, dispatch)? {
+                if let Some(duty) = runtime_duty(st, &document.schedule, &item, dispatch)? {
                     if name == "schedule_abandon" {
                         return Err(conflict("duty exists; retire only after known termination"));
                     }
@@ -264,7 +264,7 @@ pub(super) fn ensure_terminated(
         if !matching_origin(st, team, &dispatch.assignee) {
             return Err(conflict("foreign runtime attempt is unresolved"));
         }
-        let duty = runtime_duty(st, schedule, dispatch)?.ok_or_else(|| {
+        let duty = runtime_duty(st, schedule, item, dispatch)?.ok_or_else(|| {
             conflict("unmaterialized attempt needs explicit abandonment before reassignment")
         })?;
         terminated(st, duty, dispatch)?;

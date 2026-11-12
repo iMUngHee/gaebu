@@ -104,7 +104,7 @@ pub(super) fn materialize(
         {
             return Err(conflict("dispatch runtime origin does not match"));
         }
-        if let Some(duty) = runtime_duty(st, &document.schedule, dispatch)? {
+        if let Some(duty) = runtime_duty(st, &document.schedule, item, dispatch)? {
             return Ok(json!({"item":item_id,"token":token,"duty":duty.id,"existing":true}));
         }
         authorize_master(st, &actor, &team, item)?;

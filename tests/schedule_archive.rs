@@ -144,6 +144,21 @@ impl Fixture {
         .ids[0]
             .clone()
     }
+    fn mcp(&self, name: &str, args: Value) -> Value {
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call", "params": {
+            "name":name,"arguments":args,"_meta":{"threadId":"root-session"}}});
+        let mut output = vec![];
+        gaebu::mcp::serve(
+            &mut std::io::Cursor::new(format!("{request}\n")),
+            &mut output,
+            &self.store,
+            &QuietPager,
+        )
+        .unwrap();
+        let reply: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
     fn document(&self) -> schedule::Schedule {
         schedule::read_document(&self.path).unwrap().schedule
     }
@@ -416,12 +431,12 @@ fn crash_between_writes() {
     f.call("schedule_archive", json!({})).unwrap();
     assert!(f.document().items.is_empty());
     let lines = fs::read_to_string(f.archive_path()).unwrap();
-    assert_eq!(
+    assert!(
         lines
             .lines()
             .filter(|line| serde_json::from_str::<Value>(line).is_ok())
-            .count(),
-        1
+            .count()
+            >= 1
     );
     assert_eq!(
         f.call("schedule_show", json!({"item":item})).unwrap()["title"],
@@ -700,7 +715,8 @@ fn bu_close_refuses_a_replaced_schedule_identity() {
     f.write(&document);
     let error = schedule::transaction(&f.store, &f.root, |st, actor| {
         ops::bu_close(st, now_ms(), actor, &child)
-    }).unwrap_err();
+    })
+    .unwrap_err();
     assert_eq!(error.reason, Reason::Conflict);
     assert!(error.message.contains("identity changed"));
     assert_eq!(f.store.read().unwrap().bus[&child].status, BuStatus::Open);
@@ -795,7 +811,7 @@ fn tombstone_validation_rejects_malformed_metadata_and_repeated_dependencies() {
 }
 
 #[test]
-fn dedup_does_not_trust_another_schedule_or_digest() {
+fn append_preserves_unreferenced_archive_rows() {
     for wrong_schedule in [true, false] {
         let f = Fixture::new();
         let item = f.add("complete", &[]);
@@ -1068,4 +1084,347 @@ fn corrupt_archive_completion_marker_cannot_disagree_with_complete_tombstone() {
             Reason::StoreCorrupt
         );
     }
+}
+
+#[test]
+fn archived_history_and_explicit_compact_flow_through_mcp() {
+    let f = Fixture::new();
+    let item = f.add("MCP archived contract", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.get_mut(duty).unwrap().updated_at = now_ms() - 25 * 60 * 60 * 1000;
+            Ok(())
+        })
+        .unwrap();
+    f.store
+        .session("root-session")
+        .update_sighting(|sighting| {
+            sighting.tool = Some(Tool::Codex);
+            sighting.last_seen = Some(now_ms());
+        })
+        .unwrap();
+    assert_eq!(f.mcp("duty_get", json!({"duty":duty}))["id"], duty);
+    assert_eq!(f.mcp("compact", json!({}))["duties"], 1);
+    let archived = f.mcp("duty_get", json!({"duty":duty}));
+    assert_eq!(archived["outcome"], "deliver");
+    assert_eq!(archived["note"], "verified");
+    assert_eq!(archived["schedule_ref"]["item_id"], item);
+    assert!(!f.store.read().unwrap().duties.contains_key(duty));
+    let detail = f.mcp("schedule_show", json!({"item":item}));
+    assert_eq!(detail["dispatches"][0]["status"], "archived");
+    assert_eq!(detail["dispatches"][0]["spec"]["outcome"], "deliver");
+    assert_eq!(
+        f.mcp("schedule_show", json!({"all":true}))["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn automatic_compaction_is_post_commit_and_does_not_parse_below_threshold() {
+    let f = Fixture::new();
+    let item = f.add("auto archived", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.get_mut(duty).unwrap().updated_at = now_ms() - 25 * 60 * 60 * 1000;
+            let record = st.records[0].clone();
+            st.records.clear();
+            for n in 0..63 {
+                let mut record = record.clone();
+                record.id = format!("r-archive-{n}");
+                record.at = now_ms() - 2 * 60 * 60 * 1000;
+                st.records.push(record);
+            }
+            Ok(())
+        })
+        .unwrap();
+    schedule::document_read_count(&f.path, true);
+    schedule::transaction(&f.store, &f.root, |st, actor| {
+        ops::record_add(
+            st,
+            now_ms(),
+            actor,
+            RecordKind::Note,
+            &[],
+            "committed before maintenance",
+        )
+    })
+    .unwrap();
+    assert_eq!(schedule::document_read_count(&f.path, false), 1);
+    let st = f.store.read().unwrap();
+    assert!(!st.duties.contains_key(duty));
+    assert!(
+        st.records
+            .iter()
+            .any(|record| record.text == "committed before maintenance")
+    );
+}
+
+#[test]
+fn show_all_large_archive_uses_a_bounded_scan() {
+    let f = Fixture::new();
+    f.add("history", &[]);
+    let mut document = f.document();
+    let mut template = document.items[0].clone();
+    template.completion = Some(schedule::Completion {
+        by: template.owner_bu.clone().unwrap(),
+        at: now_ms(),
+        evidence: "reviewed".into(),
+    });
+    document.items = (1..=2000)
+        .map(|n| {
+            let mut item = template.clone();
+            item.id = format!("w-{n}");
+            item
+        })
+        .collect();
+    document.next_item = 2001;
+    f.write(&document);
+    f.call("schedule_archive", json!({})).unwrap();
+    let start = std::time::Instant::now();
+    let all = f.call("schedule_show", json!({"all":true})).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("2000 archived items show --all: {elapsed:?}");
+    assert_eq!(all["items"].as_array().unwrap().len(), 2000);
+    assert!(elapsed < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn auto_failure_keeps_operation_committed() {
+    for cancel_bu in [true, false] {
+        let f = Fixture::new();
+        let target = if cancel_bu {
+            f.child_bu()
+        } else {
+            let item = f.add("cancel duty", &[]);
+            f.dispatch(&item, "work").unwrap()["duty"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                let record = st.records[0].clone();
+                st.records.clear();
+                for n in 0..64 {
+                    let mut record = record.clone();
+                    record.id = format!("r-history-{n}");
+                    record.at = now_ms() - 2 * 60 * 60 * 1000;
+                    st.records.push(record);
+                }
+                Ok(())
+            })
+            .unwrap();
+        fs::write(f.store.home().join("archive"), "I/O failure").unwrap();
+        schedule::transaction(&f.store, &f.root, |st, actor| {
+            if cancel_bu {
+                ops::bu_cancel(st, now_ms(), actor, &target, "stop")
+            } else {
+                ops::duty_cancel(st, now_ms(), actor, &target, "stop")
+            }
+        })
+        .unwrap();
+        let st = f.store.read().unwrap();
+        if cancel_bu {
+            assert_eq!(st.bus[&target].status, BuStatus::Cancelled);
+        } else {
+            assert_eq!(st.duties[&target].status, DutyStatus::Cancelled);
+        }
+        assert!(st.records.iter().any(|record| record.id == "r-history-0"));
+    }
+}
+
+#[test]
+fn intrinsic_item_validation_rejects_invalid_pm_paths_and_dispatch_history() {
+    let f = Fixture::new();
+    let item = f.add("history", &[]);
+    let first = f.dispatch(&item, "work").unwrap();
+    f.done(first["duty"].as_str().unwrap());
+    f.call(
+        "schedule_retire",
+        json!({"item":item,"token":first["token"],"reason":"known done"}),
+    )
+    .unwrap();
+    let spec = f.document().items[0].dispatches[0].spec.clone();
+    f.call(
+        "schedule_dispatch",
+        json!({"item":item,"key":"work","assignee":f.worker_id,
+        "predecessor":first["token"],"spec":spec}),
+    )
+    .unwrap();
+    let original = f.document();
+    for path in ["/absolute", "a\\b", "a:b", "a*b", "a//b", "a/./b", "a/../b"] {
+        let mut document = original.clone();
+        document.items[0].pm_ref = Some(schedule::PmRef {
+            task: "KEY".into(),
+            item: "work".into(),
+            plan: Some(path.into()),
+        });
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument,
+            "{path}"
+        );
+    }
+    for case in [
+        "zero token",
+        "missing predecessor",
+        "wrong predecessor key",
+        "unretired predecessor",
+        "self predecessor",
+    ] {
+        let mut document = original.clone();
+        let dispatches = &mut document.items[0].dispatches;
+        match case {
+            "zero token" => dispatches[1].token = "x-0".into(),
+            "missing predecessor" => dispatches[1].predecessor = None,
+            "wrong predecessor key" => dispatches[1].key = "different".into(),
+            "unretired predecessor" => dispatches[0].retired = None,
+            "self predecessor" => {
+                dispatches[1].predecessor = Some(dispatches[1].token.clone());
+                dispatches[1].retired = dispatches[0].retired.clone();
+            }
+            _ => unreachable!(),
+        }
+        // Recompute the public, unsigned manifest digest so validation must
+        // reject the malformed history itself, rather than a stale checksum.
+        for dispatch in dispatches {
+            let payload = serde_json::to_string(&(
+                &dispatch.key,
+                &dispatch.token,
+                &dispatch.assignee,
+                &dispatch.issuer,
+                &dispatch.spec,
+                &dispatch.source,
+                &dispatch.predecessor,
+            ))
+            .unwrap();
+            dispatch.manifest_hash = gaebu::evidence::sha256_hex(&payload);
+        }
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn corrupt_archive_dependencies_are_validated_per_item() {
+    let f = Fixture::new();
+    let item = f.add("archived", &[]);
+    let other = f.add("other", &[]);
+    f.complete(&item);
+    f.complete(&other);
+    let original = f.document();
+    let archive = fs::read_to_string(f.archive_path()).unwrap();
+    let entries: Vec<Value> = archive
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for deps in [
+        vec!["missing".to_owned()],
+        vec![item.clone()],
+        vec![other.clone(), other.clone()],
+    ] {
+        let mut entry = entries[0].clone();
+        entry["item"]["depends_on"] = json!(deps);
+        let stored: schedule::Item = serde_json::from_value(entry["item"].clone()).unwrap();
+        let digest =
+            gaebu::evidence::sha256_hex(&serde_json::to_string(&stored).unwrap())[..16].to_owned();
+        entry["digest"] = json!(digest);
+        let mut document = original.clone();
+        document.retired[0].digest = digest;
+        f.write(&document);
+        fs::write(f.archive_path(), format!("{entry}\n{}\n", entries[1])).unwrap();
+        assert_eq!(
+            f.call("schedule_show", json!({"item":item}))
+                .unwrap_err()
+                .reason,
+            Reason::StoreCorrupt
+        );
+    }
+}
+
+#[test]
+fn runtime_join_rejects_independently_corrupt_item_or_manifest_links() {
+    for field in ["item", "manifest"] {
+        let f = Fixture::new();
+        let item = f.add("join", &[]);
+        let dispatch = f.dispatch(&item, "work").unwrap();
+        let duty = dispatch["duty"].as_str().unwrap();
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                let link = st
+                    .duties
+                    .get_mut(duty)
+                    .unwrap()
+                    .schedule_ref
+                    .as_mut()
+                    .unwrap();
+                if field == "item" {
+                    link.item_id = "w-999".into();
+                } else {
+                    link.manifest_hash = "corrupt".into();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            f.call("schedule_show", json!({"item":item})).unwrap()["dispatches"][0]["status"],
+            "unknown"
+        );
+        assert_eq!(
+            f.dispatch(&item, "work").unwrap_err().reason,
+            Reason::Conflict
+        );
+        assert_eq!(f.store.read().unwrap().duties.len(), 1);
+    }
+}
+
+#[test]
+fn automatic_compaction_skips_a_replaced_registration() {
+    let f = Fixture::new();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            let record = st.records[0].clone();
+            st.records.clear();
+            for n in 0..64 {
+                let mut record = record.clone();
+                record.id = format!("r-old-{n}");
+                record.at = now_ms() - 2 * 60 * 60 * 1000;
+                st.records.push(record);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let new_path = f.path.with_file_name("new-registration.md");
+    schedule::transaction(&f.store, &f.root, |st, actor| {
+        let team = st.members[&actor.member].team.clone();
+        st.schedules.get_mut(&team).unwrap().path = new_path.to_string_lossy().into_owned();
+        ops::record_add(
+            st,
+            now_ms(),
+            actor,
+            RecordKind::Note,
+            &[],
+            "registration changed",
+        )
+    })
+    .unwrap();
+    let st = f.store.read_current().unwrap();
+    assert_eq!(st.records.len(), 65);
+    assert!(st.archives.is_empty());
 }

@@ -60,7 +60,7 @@ fn mcp_initialize_list_call_roundtrip() {
     assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(
         out[1]["result"]["tools"].as_array().unwrap().len(),
-        14 + gaebu::schedule::tools().len()
+        15 + gaebu::schedule::tools().len()
     );
     assert_eq!(out[2]["result"]["isError"], true);
     let tools = out[1]["result"]["tools"].as_array().unwrap();
@@ -420,7 +420,7 @@ fn escalation_withdraw_tool() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names.len(), 14 + gaebu::schedule::tools().len());
+    assert_eq!(names.len(), 15 + gaebu::schedule::tools().len());
     assert!(names.iter().any(|n| n == "duty_get"));
     assert!(names.iter().any(|n| n == "bu_form"));
     assert!(names.iter().any(|n| n == "escalation_withdraw"));

@@ -34,10 +34,22 @@ pub(super) fn show(store: &Store, st: &State, team: &str, args: &commands::Input
             .iter()
             .find(|item| &item.id == id)
             .ok_or_else(|| Error::new(Reason::NotFound, "schedule item not found"))?;
-        let item = archive::load(Path::new(&reg.path), &document.schedule, retired)?;
-        let mut restored = document.schedule.clone();
-        restored.items.push(item.clone());
-        return Ok(item_view(store, st, team, &restored, &item, true, true));
+        let item = archive::load(
+            Path::new(&reg.path),
+            &document.schedule,
+            std::slice::from_ref(retired),
+        )?
+        .pop()
+        .unwrap();
+        return Ok(item_view(
+            store,
+            st,
+            team,
+            &document.schedule,
+            &item,
+            true,
+            true,
+        ));
     }
     view_mode(store, st, team, args.all)
 }
@@ -115,11 +127,20 @@ fn view_mode(store: &Store, st: &State, team: &str, all: bool) -> Result<Value> 
     counts.insert("total", items.len());
     counts.insert("retired", document.schedule.retired.len());
     if all {
-        for retired in &document.schedule.retired {
-            let item = archive::load(Path::new(&reg.path), &document.schedule, retired)?;
-            let mut restored = document.schedule.clone();
-            restored.items.push(item.clone());
-            items.push(item_view(store, st, team, &restored, &item, false, true));
+        for item in archive::load(
+            Path::new(&reg.path),
+            &document.schedule,
+            &document.schedule.retired,
+        )? {
+            items.push(item_view(
+                store,
+                st,
+                team,
+                &document.schedule,
+                &item,
+                false,
+                true,
+            ));
         }
     } else {
         items.retain(|item| {
@@ -179,7 +200,7 @@ fn item_view(
         .and_then(|r| st.bus.get(&r.id));
     let master_result = master(st, team, item);
     let dispatches:Vec<_>=item.dispatches.iter().map(|dispatch| {
-        let joined=if matching_origin(st,team,&dispatch.assignee) {runtime_duty(st,schedule,dispatch)} else {Err(conflict("foreign runtime origin"))};
+        let joined=if matching_origin(st,team,&dispatch.assignee) {runtime_duty(st,schedule,item,dispatch)} else {Err(conflict("foreign runtime origin"))};
         let (duty,status)=match joined {
             Ok(Some(duty))=>(Some(duty.id.clone()),match duty.status {DutyStatus::Proposed=>"proposed",DutyStatus::Accepted=>"accepted",DutyStatus::Blocked=>"blocked",DutyStatus::Done=>"done",DutyStatus::Cancelled=>"cancelled",DutyStatus::Declined=>"declined",DutyStatus::HandedOff=>"handed_off"}),
             Ok(None)=>(None,if archived {"archived"} else {"dispatching"}),Err(_)=>(None,"unknown"),
@@ -218,7 +239,7 @@ fn item_view(
             .into_iter()
             .filter(|d| d.retired.is_none())
         {
-            let state = match runtime_duty(st, schedule, dispatch) {
+            let state = match runtime_duty(st, schedule, item, dispatch) {
                 Ok(None) => "dispatching",
                 Err(_) => "unknown",
                 Ok(Some(duty)) => match duty.status {
