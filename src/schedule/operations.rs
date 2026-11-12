@@ -8,6 +8,11 @@ use serde_json::{Value, json};
 
 pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -> Result<Value> {
     operate(store, caller, args, |st, actor, team, document| {
+        if name == "schedule_archive" {
+            authorize_manager(st, actor, team, &[])?;
+            let path = Path::new(&st.schedules[team].path);
+            return archive::sweep(st, team, document, path, true);
+        }
         if name == "schedule_add" {
             let title = args.text("title")?.to_owned();
             nonempty(&title, "title")?;
@@ -246,7 +251,12 @@ fn terminated(st: &State, duty: &Duty, dispatch: &Dispatch) -> Result<()> {
     Ok(())
 }
 
-fn ensure_terminated(st: &State, team: &str, schedule: &Schedule, item: &Item) -> Result<()> {
+pub(super) fn ensure_terminated(
+    st: &State,
+    team: &str,
+    schedule: &Schedule,
+    item: &Item,
+) -> Result<()> {
     for dispatch in &item.dispatches {
         if dispatch.retired.is_some() {
             continue;

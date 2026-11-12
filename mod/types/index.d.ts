@@ -62,6 +62,7 @@ export type ScheduleView = {
   manager?: { member: string; alias: string; mode: 'commander' | 'delegated'; state: string }
   viewer?: { runtime_id: string; team: string; id: string }
   items: ScheduleItem[]
+  counts?: Record<string, number>
   error?: { reason: string; message: string }
 }
 

@@ -23,6 +23,9 @@ pub(super) struct Input {
     pub reason: Option<String>,
     pub evidence: Option<String>,
     pub until: Option<String>,
+    pub path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub all: bool,
     #[serde(default)]
     pub explicit: bool,
     #[serde(skip)]
@@ -101,8 +104,19 @@ pub enum ScheduleCmd {
         scope: Vec<String>,
     },
     Show {
+        #[arg(conflicts_with = "all")]
+        item: Option<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         session: Option<String>,
+    },
+    Archive {
+        #[arg(long)]
+        expected_revision: Option<u64>,
+    },
+    Move {
+        path: std::path::PathBuf,
     },
     Add {
         #[arg(long)]
@@ -201,7 +215,9 @@ pub fn tools() -> Vec<Value> {
     let pm = json!({"type":["object","null"],"properties":{"task":string,"item":string,"plan":{"type":["string","null"]}},"required":["task","item"],"additionalProperties":false});
     let spec = json!({"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":string},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false});
     [
-        ("schedule_show","Read the canonical schedule and derived execution states",json!({}),vec![]),
+        ("schedule_show","Read compact open work, all history, or one full Schedule item",json!({"item":string,"all":{"type":"boolean"}}),vec![]),
+        ("schedule_archive","Archive eligible terminal Schedule items",json!({"expected_revision":revision}),vec![]),
+        ("schedule_move","Move the commander team's missing Schedule registration to an existing file",json!({"path":string}),vec!["path"]),
         ("schedule_add","Add an operational work item without changing PM",json!({"title":string,"scope":strings,"owner_bu":{"type":["string","null"]},"priority":{"type":"integer","minimum":0,"maximum":65535},"depends_on":strings,"pm_ref":pm,"expected_revision":revision}),vec!["title","scope"]),
         ("schedule_update","Update operational priority or an undispatched item contract",json!({"item":string,"title":string,"scope":strings,"owner_bu":{"type":["string","null"]},"priority":{"type":"integer","minimum":0,"maximum":65535},"depends_on":strings,"pm_ref":pm,"expected_revision":revision}),vec!["item"]),
         ("schedule_dispatch","Task master commits an assignment and materializes its worker duty idempotently",json!({"item":string,"key":string,"assignee":string,"spec":spec,"predecessor":string,"expected_revision":revision}),vec!["item","key","assignee","spec"]),
@@ -237,13 +253,25 @@ pub fn call(
         }
     }
     if name == "schedule_show" {
+        let input = Input::parse(args)?;
+        if input.all && input.item.is_some() {
+            return Err(invalid("item and all are mutually exclusive"));
+        }
         let st = store.read_current()?;
         let member = crate::authz::member_for_session(&st, &caller.session_id)
             .ok_or_else(|| Error::new(Reason::NotMember, "session has no member"))?;
-        return presentation::view(store, &st, &member.team);
+        return presentation::show(store, &st, &member.team, &input);
     }
     let input = Input::parse(args)?;
     let result = match name {
+        "schedule_move" => runtime::move_registration(
+            store,
+            caller,
+            input
+                .path
+                .as_deref()
+                .ok_or_else(|| invalid("missing schedule path"))?,
+        ),
         "schedule_dispatch" => {
             let reserved = dispatch::reserve_input(store, caller, &input)?;
             dispatch::materialize(
@@ -267,6 +295,7 @@ pub fn run_cli(cmd: ScheduleCmd, json_output: bool, pager: &dyn Pager) -> Result
     let mut caller = crate::identity::from_pager(pager)?;
     if let ScheduleCmd::Show {
         session: Some(session),
+        ..
     } = &cmd
     {
         caller.session_id = session.clone();
@@ -287,7 +316,27 @@ pub fn run_cli(cmd: ScheduleCmd, json_output: bool, pager: &dyn Pager) -> Result
         ScheduleCmd::Manager { member, scope } => {
             runtime::set_manager(&store, &caller, &member, &scope)
         }
-        ScheduleCmd::Show { .. } => call(&store, pager, &caller, "schedule_show", &json!({})),
+        ScheduleCmd::Show { item, all, .. } => {
+            let mut args = json!({"all":all});
+            if let Some(item) = item {
+                args["item"] = json!(item);
+            }
+            call(&store, pager, &caller, "schedule_show", &args)
+        }
+        ScheduleCmd::Archive { expected_revision } => {
+            let mut args = json!({});
+            if let Some(revision) = expected_revision {
+                args["expected_revision"] = json!(revision);
+            }
+            call(&store, pager, &caller, "schedule_archive", &args)
+        }
+        ScheduleCmd::Move { path } => call(
+            &store,
+            pager,
+            &caller,
+            "schedule_move",
+            &json!({"path":path}),
+        ),
         ScheduleCmd::Add {
             title,
             scope,

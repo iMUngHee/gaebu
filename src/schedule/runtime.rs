@@ -109,6 +109,48 @@ pub fn set_manager(
         Ok(json!({"manager":selected,"mode":if selected.is_some(){"delegated"}else{"commander"}}))
     })
 }
+
+pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> Result<Value> {
+    let snapshot = store.read_current()?;
+    let actor = identity::actor(&snapshot, caller)?;
+    let team = snapshot.members[&actor.member].team.clone();
+    commander(&snapshot, &actor, &team)?;
+    let registration = snapshot
+        .schedules
+        .get(&team)
+        .cloned()
+        .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
+    let path = fs::canonicalize(path).map_err(io_error)?;
+    let (_file, document) = lock_document(&path)?;
+    if document.schedule.id != registration.schedule_id {
+        return Err(conflict("schedule identity changed"));
+    }
+    for retired in &document.schedule.retired {
+        archive::load(&path, &document.schedule, retired)?;
+    }
+    store.transact(CLI_DEADLINE, |st| {
+        let actor = identity::actor(st, caller)?;
+        commander(st, &actor, &team)?;
+        if st.schedules.get(&team) != Some(&registration) {
+            return Err(conflict("schedule registration changed"));
+        }
+        match fs::metadata(&registration.path) {
+            Ok(_) => return Err(conflict("old schedule still exists; move the file first")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(io_error(error)),
+        }
+        if st
+            .schedules
+            .iter()
+            .any(|(id, reg)| id != &team && reg.path == path.to_string_lossy())
+        {
+            return Err(conflict("schedule is already registered to another team"));
+        }
+        st.schedules.get_mut(&team).unwrap().path = path.to_string_lossy().into_owned();
+        Ok(json!({"schedule_id":registration.schedule_id,"path":path}))
+    })
+}
+
 pub fn transaction<T>(
     store: &Store,
     caller: &Caller,
@@ -120,7 +162,25 @@ pub fn transaction<T>(
     let registration = before.schedules.get(&team).cloned();
     let locked = registration
         .as_ref()
-        .map(|reg| lock_document(Path::new(&reg.path)));
+        .map(|reg| lock_path(Path::new(&reg.path)));
+    let cached = std::cell::OnceCell::new();
+    let document = || -> Result<&Document> {
+        match &locked {
+            Some(Ok(_)) => cached
+                .get_or_init(|| {
+                    let registration = registration.as_ref().unwrap();
+                    let document = read_document(Path::new(&registration.path))?;
+                    if document.schedule.id != registration.schedule_id {
+                        return Err(conflict("schedule identity changed"));
+                    }
+                    Ok(document)
+                })
+                .as_ref()
+                .map_err(Clone::clone),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err(conflict("linked duty has no schedule registration")),
+        }
+    };
     store.transact(CLI_DEADLINE, |st| {
         let actor = identity::actor(st, caller)?;
         if st.schedules.get(&team) != registration.as_ref() {
@@ -159,12 +219,7 @@ pub fn transaction<T>(
             {
                 continue;
             }
-            let (_, document) = match &locked {
-                Some(Ok(locked)) => locked,
-                Some(Err(error)) => return Err(error.clone()),
-                None => return Err(conflict("linked duty has no schedule registration")),
-            };
-            guard_duty(st, &team, document, duty)?;
+            guard_duty(st, &team, document()?, duty)?;
         }
         for lease in st.leases.values() {
             if old
@@ -190,11 +245,7 @@ pub fn transaction<T>(
                     allowed = true;
                     break;
                 }
-                let check = match &locked {
-                    Some(Ok((_, document))) => guard_duty(st, &team, document, duty),
-                    Some(Err(error)) => Err(error.clone()),
-                    None => Err(conflict("linked duty has no registration")),
-                };
+                let check = document().and_then(|document| guard_duty(st, &team, document, duty));
                 match check {
                     Ok(()) => {
                         allowed = true;
@@ -205,6 +256,19 @@ pub fn transaction<T>(
             }
             if !allowed && let Some(error) = refusal {
                 return Err(error);
+            }
+        }
+        if registration.is_some() {
+            for bu in st.bus.values().filter(|bu| bu.status == BuStatus::Closed
+                && old.bus.get(&bu.id).is_some_and(|before| before.status == BuStatus::Open)) {
+                let open: Vec<_> = document()?.schedule.items.iter().filter(|item| {
+                    item.completion.is_none() && item.cancellation.is_none()
+                        && item.owner_bu.as_ref().is_some_and(|owner|
+                            matching_origin(st, &bu.team, owner) && owner.id == bu.id)
+                }).map(|item| item.id.as_str()).collect();
+                if !open.is_empty() {
+                    return Err(conflict(format!("bu owns open schedule items {}; transfer them with gaebu schedule update <item> --owner-bu <bu> or cancel them", open.join(", "))));
+                }
             }
         }
         Ok(result)
@@ -224,6 +288,17 @@ fn guard_duty(st: &State, team: &str, document: &Document, duty: &Duty) -> Resul
         .ok_or_else(|| conflict("missing schedule link"))?;
     if reference.schedule_id != document.schedule.id {
         return Err(conflict("schedule origin mismatch"));
+    }
+    if let Some(retired) = document
+        .schedule
+        .retired
+        .iter()
+        .find(|r| r.id == reference.item_id)
+    {
+        return Err(match retired.state {
+            RetiredState::Complete => conflict("schedule item is already complete"),
+            RetiredState::Cancelled => Error::new(Reason::Cancelled, "schedule item cancelled"),
+        });
     }
     let item = &document.schedule.items[item_index(&document.schedule, &reference.item_id)?];
     let dispatch = item
@@ -285,12 +360,20 @@ fn duty_matches(duty: &Duty, dispatch: &Dispatch) -> bool {
 }
 
 pub(super) fn dependencies_ready(schedule: &Schedule, item: &Item) -> bool {
-    item.depends_on.iter().all(|id| {
-        schedule
-            .items
+    item.depends_on
+        .iter()
+        .all(|id| dependency_complete(schedule, id))
+}
+
+pub(super) fn dependency_complete(schedule: &Schedule, id: &str) -> bool {
+    schedule
+        .items
+        .iter()
+        .any(|d| d.id == id && d.completion.is_some() && d.cancellation.is_none())
+        || schedule
+            .retired
             .iter()
-            .any(|d| &d.id == id && d.completion.is_some() && d.cancellation.is_none())
-    })
+            .any(|d| d.id == id && d.state == RetiredState::Complete)
 }
 
 pub(super) fn master<'a>(st: &'a State, team: &str, item: &Item) -> Result<&'a Member> {
@@ -397,6 +480,7 @@ pub(super) fn operate<T>(
     let before = document.schedule.clone();
     let result = f(&st, &actor, &team, &mut document)?;
     if before != document.schedule {
+        archive::sweep(&st, &team, &mut document, Path::new(&reg.path), false)?;
         document.save(Path::new(&reg.path), Instant::now() + CLI_DEADLINE)?;
     }
     Ok(result)

@@ -11,6 +11,7 @@ use std::{
     time::Instant,
 };
 
+mod archive;
 mod commands;
 mod dispatch;
 mod operations;
@@ -198,6 +199,31 @@ pub struct Schedule {
     pub next_item: u64,
     pub next_dispatch: u64,
     pub items: Vec<Item>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<Retired>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetiredState {
+    Complete,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retired {
+    pub id: String,
+    pub state: RetiredState,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_dispatch: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +244,13 @@ fn io_error(error: impl std::fmt::Display) -> Error {
 }
 
 pub fn read_document(path: &Path) -> Result<Document> {
+    DOCUMENT_READS.with(|counter| {
+        if let Some((watched, reads)) = counter.borrow_mut().as_mut()
+            && watched == path
+        {
+            *reads += 1;
+        }
+    });
     let mut bytes = Vec::new();
     fs::File::open(path)
         .map_err(io_error)?
@@ -229,6 +262,26 @@ pub fn read_document(path: &Path) -> Result<Document> {
     }
     let text = String::from_utf8(bytes).map_err(|_| invalid("schedule is not UTF-8"))?;
     parse_document(&text)
+}
+
+thread_local! {
+    static DOCUMENT_READS: std::cell::RefCell<Option<(std::path::PathBuf, u64)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Opt-in, thread-local observation for integration tests; ordinary processes
+/// keep no counter or growing path registry.
+#[doc(hidden)]
+pub fn document_read_count(path: &Path, reset: bool) -> u64 {
+    DOCUMENT_READS.with(|counter| {
+        let mut counter = counter.borrow_mut();
+        if reset {
+            *counter = Some((path.to_owned(), 0));
+        }
+        counter
+            .as_ref()
+            .filter(|(watched, _)| watched == path)
+            .map_or(0, |(_, reads)| *reads)
+    })
 }
 
 pub fn parse_document(text: &str) -> Result<Document> {
@@ -276,6 +329,7 @@ impl Document {
                 next_item: 1,
                 next_dispatch: 1,
                 items: vec![],
+                retired: vec![],
             },
             prefix: format!("# Gaebu Schedule\n\n{MARKER}\n```json\n"),
             suffix: "\n```\n".into(),
@@ -306,6 +360,10 @@ fn nonempty(text: &str, field: &str) -> Result<()> {
 }
 
 fn validate(schedule: &Schedule) -> Result<()> {
+    validate_contents(schedule, MAX_ITEMS)
+}
+
+fn validate_contents(schedule: &Schedule, max_items: usize) -> Result<()> {
     if schedule.schema_version != 1 {
         return Err(Error::new(
             Reason::StoreUnsupported,
@@ -313,20 +371,28 @@ fn validate(schedule: &Schedule) -> Result<()> {
         ));
     }
     nonempty(&schedule.id, "schedule id")?;
-    if schedule.items.len() > MAX_ITEMS || schedule.next_item == 0 || schedule.next_dispatch == 0 {
+    if schedule.items.len() > max_items || schedule.next_item == 0 || schedule.next_dispatch == 0 {
         return Err(invalid("invalid schedule size or allocator"));
     }
     let mut ids = BTreeSet::new();
     let mut tokens = BTreeSet::new();
     let mut max_item = 0;
     let mut max_dispatch = 0;
+    for retired in &schedule.retired {
+        max_item = max_item.max(item_number(&retired.id)?);
+        max_dispatch = max_dispatch.max(retired.last_dispatch);
+        if !ids.insert(retired.id.as_str()) {
+            return Err(invalid("duplicate schedule item id"));
+        }
+        if retired.digest.len() != 16
+            || !retired.digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || retired.state == RetiredState::Complete && !retired.depends_on.is_empty()
+        {
+            return Err(invalid("invalid schedule tombstone"));
+        }
+    }
     for item in &schedule.items {
-        let number = item
-            .id
-            .strip_prefix("w-")
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| invalid("invalid item id"))?;
+        let number = item_number(&item.id)?;
         max_item = max_item.max(number);
         if !ids.insert(item.id.as_str()) {
             return Err(invalid("duplicate schedule item id"));
@@ -393,23 +459,41 @@ fn validate(schedule: &Schedule) -> Result<()> {
     if schedule.next_item <= max_item || schedule.next_dispatch <= max_dispatch {
         return Err(invalid("schedule allocator would reuse an id"));
     }
-    for item in &schedule.items {
-        let mut seen = BTreeSet::new();
-        for dependency in &item.depends_on {
-            if dependency == &item.id
-                || !ids.contains(dependency.as_str())
-                || !seen.insert(dependency)
-            {
-                return Err(invalid("missing, repeated, or self dependency"));
-            }
-        }
-    }
-    // An iterative walk keeps a long but bounded dependency chain off the stack.
-    let mut pending: BTreeMap<&str, usize> = schedule
+    let complete: BTreeSet<_> = schedule
+        .retired
+        .iter()
+        .filter(|item| item.state == RetiredState::Complete)
+        .map(|item| item.id.as_str())
+        .collect();
+    let nodes: Vec<_> = schedule
         .items
         .iter()
-        .map(|item| (item.id.as_str(), item.depends_on.len()))
+        .map(|item| (item.id.as_str(), &item.depends_on))
+        .chain(
+            schedule
+                .retired
+                .iter()
+                .filter(|item| item.state == RetiredState::Cancelled)
+                .map(|item| (item.id.as_str(), &item.depends_on)),
+        )
         .collect();
+    let mut pending = BTreeMap::new();
+    let mut dependants: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, dependencies) in &nodes {
+        let mut seen = BTreeSet::new();
+        let mut count = 0;
+        for dependency in *dependencies {
+            if dependency == id || !ids.contains(dependency.as_str()) || !seen.insert(dependency) {
+                return Err(invalid("missing, repeated, or self dependency"));
+            }
+            if !complete.contains(dependency.as_str()) {
+                count += 1;
+                dependants.entry(dependency).or_default().push(id);
+            }
+        }
+        pending.insert(*id, count);
+    }
+    // An iterative walk keeps a long but bounded dependency chain off the stack.
     let mut ready: Vec<&str> = pending
         .iter()
         .filter_map(|(id, count)| (*count == 0).then_some(*id))
@@ -417,17 +501,17 @@ fn validate(schedule: &Schedule) -> Result<()> {
     let mut completed = 0;
     while let Some(id) = ready.pop() {
         completed += 1;
-        for item in &schedule.items {
-            if item.depends_on.iter().any(|dep| dep == id) {
-                let count = pending.get_mut(item.id.as_str()).unwrap();
+        if let Some(children) = dependants.get(id) {
+            for child in children {
+                let count = pending.get_mut(child).unwrap();
                 *count -= 1;
                 if *count == 0 {
-                    ready.push(item.id.as_str());
+                    ready.push(child);
                 }
             }
         }
     }
-    if completed != schedule.items.len() {
+    if completed != pending.len() {
         return Err(invalid("schedule dependency cycle"));
     }
     Ok(())
@@ -460,11 +544,23 @@ fn matching_origin(st: &State, team: &str, reference: &OriginRef) -> bool {
 }
 
 fn item_index(schedule: &Schedule, id: &str) -> Result<usize> {
+    if schedule.retired.iter().any(|item| item.id == id) {
+        return Err(conflict(format!(
+            "schedule item {id} is retired to the archive"
+        )));
+    }
     schedule
         .items
         .iter()
         .position(|item| item.id == id)
         .ok_or_else(|| Error::new(Reason::NotFound, "schedule item not found"))
+}
+
+fn item_number(id: &str) -> Result<u64> {
+    id.strip_prefix("w-")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| invalid("invalid item id"))
 }
 
 fn latest_dispatches(item: &Item) -> Vec<&Dispatch> {

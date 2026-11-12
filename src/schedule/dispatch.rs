@@ -137,6 +137,9 @@ pub(super) fn reconcile(store: &Store, caller: &Caller, args: &Input) -> Result<
         .get(team)
         .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
     let document = read_document(Path::new(&reg.path))?;
+    if let Some(item) = &args.item {
+        item_index(&document.schedule, item)?;
+    }
     let mut results = vec![];
     for item in &document.schedule.items {
         if args.item.as_deref().is_some_and(|id| id != item.id) {

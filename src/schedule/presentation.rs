@@ -4,6 +4,45 @@ use crate::{authz, store::Store};
 use serde_json::{Value, json};
 
 pub fn view(store: &Store, st: &State, team: &str) -> Result<Value> {
+    view_mode(store, st, team, false)
+}
+
+pub(super) fn show(store: &Store, st: &State, team: &str, args: &commands::Input) -> Result<Value> {
+    if let Some(id) = &args.item {
+        let reg = st
+            .schedules
+            .get(team)
+            .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
+        let document = read_document(Path::new(&reg.path))?;
+        if document.schedule.id != reg.schedule_id {
+            return Err(conflict("schedule identity changed"));
+        }
+        if let Some(item) = document.schedule.items.iter().find(|item| &item.id == id) {
+            return Ok(item_view(
+                store,
+                st,
+                team,
+                &document.schedule,
+                item,
+                true,
+                false,
+            ));
+        }
+        let retired = document
+            .schedule
+            .retired
+            .iter()
+            .find(|item| &item.id == id)
+            .ok_or_else(|| Error::new(Reason::NotFound, "schedule item not found"))?;
+        let item = archive::load(Path::new(&reg.path), &document.schedule, retired)?;
+        let mut restored = document.schedule.clone();
+        restored.items.push(item.clone());
+        return Ok(item_view(store, st, team, &restored, &item, true, true));
+    }
+    view_mode(store, st, team, args.all)
+}
+
+fn view_mode(store: &Store, st: &State, team: &str, all: bool) -> Result<Value> {
     let Some(reg) = st.schedules.get(team) else {
         return Ok(json!({"registered":false,"items":[]}));
     };
@@ -40,7 +79,7 @@ pub fn view(store: &Store, st: &State, team: &str) -> Result<Value> {
         .schedule
         .items
         .iter()
-        .map(|item| item_view(store, st, team, &document.schedule, item))
+        .map(|item| item_view(store, st, team, &document.schedule, item, false, false))
         .collect();
     items.sort_by_key(|item| {
         (
@@ -74,6 +113,28 @@ pub fn view(store: &Store, st: &State, team: &str) -> Result<Value> {
     }
     counts.insert("queued", counts["unassigned"] + counts["dependency_wait"]);
     counts.insert("total", items.len());
+    counts.insert("retired", document.schedule.retired.len());
+    if all {
+        for retired in &document.schedule.retired {
+            let item = archive::load(Path::new(&reg.path), &document.schedule, retired)?;
+            let mut restored = document.schedule.clone();
+            restored.items.push(item.clone());
+            items.push(item_view(store, st, team, &restored, &item, false, true));
+        }
+    } else {
+        items.retain(|item| {
+            item["stage"] != "complete"
+                && (item["stage"] != "cancelled"
+                    || item["dispatches"].as_array().is_some_and(|dispatches| {
+                        dispatches.iter().any(|dispatch| {
+                            matches!(
+                                dispatch["status"].as_str(),
+                                Some("proposed" | "accepted" | "blocked")
+                            )
+                        })
+                    }))
+        });
+    }
     let next_action = [
         "unknown",
         "held",
@@ -100,7 +161,15 @@ pub fn view(store: &Store, st: &State, team: &str) -> Result<Value> {
     )
 }
 
-fn item_view(store: &Store, st: &State, team: &str, schedule: &Schedule, item: &Item) -> Value {
+fn item_view(
+    store: &Store,
+    st: &State,
+    team: &str,
+    schedule: &Schedule,
+    item: &Item,
+    full: bool,
+    archived: bool,
+) -> Value {
     let mut reasons = vec![];
     let mut stage = "ready";
     let owner = item
@@ -113,9 +182,14 @@ fn item_view(store: &Store, st: &State, team: &str, schedule: &Schedule, item: &
         let joined=if matching_origin(st,team,&dispatch.assignee) {runtime_duty(st,schedule,dispatch)} else {Err(conflict("foreign runtime origin"))};
         let (duty,status)=match joined {
             Ok(Some(duty))=>(Some(duty.id.clone()),match duty.status {DutyStatus::Proposed=>"proposed",DutyStatus::Accepted=>"accepted",DutyStatus::Blocked=>"blocked",DutyStatus::Done=>"done",DutyStatus::Cancelled=>"cancelled",DutyStatus::Declined=>"declined",DutyStatus::HandedOff=>"handed_off"}),
-            Ok(None)=>(None,"dispatching"),Err(_)=>(None,"unknown"),
+            Ok(None)=>(None,if archived {"archived"} else {"dispatching"}),Err(_)=>(None,"unknown"),
         };
-        json!({"key":dispatch.key,"token":dispatch.token,"assignee":dispatch.assignee,"duty":duty,"status":status,"retired":dispatch.retired,"manifest_hash":dispatch.manifest_hash,"spec":dispatch.spec,"source":dispatch.source})
+        let mut value = json!({"key":dispatch.key,"token":dispatch.token,"assignee":dispatch.assignee,"duty":duty,"status":status,"retired":dispatch.retired,"manifest_hash":dispatch.manifest_hash});
+        if full {
+            value["spec"] = json!(dispatch.spec);
+            value["source"] = json!(dispatch.source);
+        }
+        value
     }).collect();
     if item.cancellation.is_some() {
         stage = "cancelled";
@@ -135,13 +209,7 @@ fn item_view(store: &Store, st: &State, team: &str, schedule: &Schedule, item: &
         reasons.extend(
             item.depends_on
                 .iter()
-                .filter(|id| {
-                    schedule
-                        .items
-                        .iter()
-                        .find(|d| &d.id == *id)
-                        .is_none_or(|d| d.completion.is_none() || d.cancellation.is_some())
-                })
+                .filter(|id| !super::runtime::dependency_complete(schedule, id))
                 .map(|id| format!("waiting for {id} acceptance")),
         );
     } else {
