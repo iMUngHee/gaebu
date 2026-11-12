@@ -9,6 +9,53 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.4.0 — 2026-11-13
+
+### Added
+
+- Automatic and explicit Schedule archival to a JSONL sidecar, compact
+  tombstones, `schedule archive`, `schedule show --all`, full
+  `schedule show <item>`, and matching MCP tools. Retired IDs and tokens cannot
+  issue new work; completed tombstones continue to satisfy dependencies.
+- Runtime compaction (`gaebu compact` and MCP `compact`) archives terminal
+  duties and closed escalations after 24 hours, and records after one hour.
+  Member operations trigger a separate best-effort pass from 64 eligible
+  entries; hooks never compact. `duty show` and `duty_get` recover archived
+  contracts within the caller's team.
+- Commander-only `schedule move <path>` rebinds a moved, identity-preserving
+  document after the old file disappears and its archived history is verified.
+
+### Changed
+
+- Default Schedule output omits complete items and dispatch `spec`/`source`.
+  Cancelled items remain until their live duties end, preserving cleanup rows
+  and preventing standalone working duplicates in the mod.
+- Unit close refuses while the unit owns open Schedule items and lists the
+  IDs to transfer or cancel. Unrelated member operations defer Schedule parsing
+  until a linked guard, close check, or compaction requires it.
+- Leases conflict across active teams with the same nonempty project label.
+  Different or empty project labels retain independent namespaces.
+- Unix archive and state publication sync parent directories as well as file
+  contents. Runtime archive commit boundaries preserve recovery after an
+  interrupted append or `repair`. Existing foreign hot duties still return
+  `no_grant`; foreign archived duties return `not_found` because only the
+  caller team's archive is searched.
+
+### Upgrading
+
+Runtime schema is 4. The first write keeps the previous schema's original
+`state.vN.json` and publishes schema 4 to current and previous generations.
+Upgrade binaries and restart resident MCP processes before continuing work.
+0.3.x refuses schema 4 and Schedule documents containing `retired`; restoring
+an older binary alone does not undo archival. Back up the Schedule together
+with `<filename>.archive.jsonl`, and runtime state together with `archive/`.
+
+The 2 MiB document limit remains, with 2,000 active items; tombstones still grow.
+Runtime historical lookup scans committed data while holding `state.lock` and
+can exhaust another caller's 5-second wait budget on large archives. Windows
+retains file-sync/rename guarantees; Unix directory-sync ordering is reviewed
+in code, without a physical power-loss test. See [platform checks](PLATFORMS.md).
+
 ## 0.3.1 — 2026-11-12
 
 ### Changed

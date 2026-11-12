@@ -45,7 +45,11 @@ valid. A failure leaves the previous seats, IDs, grants and notices intact.
 Existing `bu open` remains available when only a head should move.
 
 `gaebu bu close <bu>` requires a clean subordinate unit: no open duties, live
-leases or open child units. It returns active members to the parent unit,
+leases, open child units, or incomplete, uncancelled Schedule items owned by
+that unit. A refusal lists those item IDs: transfer them with
+`schedule update <item> --owner-bu <open-unit>` or cancel them explicitly.
+If a registered Schedule cannot be read, close is refused; unit cancellation
+remains available. A successful close returns active members to the parent unit,
 preserves their superior relationships and grants, and connects the former head
 to the parent head. Those same seat IDs can then be used in another `bu form`.
 A repeated close can recover seats left in an old closed unit; cancelled units
@@ -91,7 +95,9 @@ gaebu schedule complete w-1 --evidence 'Reviewed tests and integrated result'
 
 Schedule commits an immutable dispatch token and manifest before materializing
 the runtime duty. Retrying the same key and manifest reuses that token and duty,
-including after a response was lost or the duty reached a terminal state. A
+including after a response was lost or the duty reached a terminal state while
+the item is still active. Archived items refuse dispatch and reconciliation
+with a `retired` conflict; their tokens cannot issue another duty. A
 crash before runtime materialization stays visible as dispatching; it does not
 expire into another assignment. Different keys can run in parallel.
 
@@ -141,6 +147,32 @@ context loss: intent, original unit, decision rights, escalation triggers,
 source, plan, execution root, version and notes. A read-only `--session` is
 available for the mod; it does not authorize mutations.
 
+`schedule show` and the Schedule section of cards list open work with compact
+dispatch metadata; they omit full dispatch `spec` and `source`. Complete items
+disappear from this default list. Cancelled items remain visible as cancelled
+while they have live linked duties, so those duties are not presented as
+independent working tasks. Their next action is cleanup.
+
+```sh
+gaebu schedule show w-1     # Full item and dispatch contracts, active or archived.
+gaebu schedule show --all   # Include deferred and archived terminal items.
+gaebu schedule archive --expected-revision 12
+gaebu compact
+```
+
+MCP exposes the same operations as `schedule_show` (`item` or `all`, mutually
+exclusive), `schedule_archive`, and `compact`. Archive is restricted to the
+commander or current Schedule manager; it reports retired IDs and deferred
+items with reasons. Completion, cancellation, and later Schedule writes also
+try to retire eligible items without adding a second revision increment.
+
+Retirement requires completion or cancellation, no item hold, known terminal
+worker attempts and no remaining leases in their scope. Unmaterialized attempts
+must be explicitly abandoned first. Automatic archive I/O failures defer
+retirement while preserving the successful operation; explicit archive reports
+the error. Completed tombstones still satisfy dependencies; cancelled ones do
+not. `schedule show <item>` retains the complete original contract and evidence.
+
 ## The operations pane
 
 `/gaebu` opens the native operations desk. It prioritizes decisions waiting for
@@ -163,10 +195,51 @@ fence. CLI/MCP preserve surrounding prose, refuse unknown fields and stale
 revisions, and replace the file under a fixed sidecar OS lock. Unknown legacy
 prose is refused without overwrite; it is not silently imported.
 
-Runtime schema 3 qualifies local member/unit references with their runtime and
+Runtime schema 4 retains schema 3's qualified local member/unit references with runtime and
 team origin. A Schedule copied from another computer cannot accidentally bind
 its `m-3` to an unrelated local `m-3`. Unknown joins stay unresolved. The
 supported write path is CLI/MCP against one registered canonical file; separate
 machines concurrently editing separate copies and manual edits bypassing its
 locks are outside that coordination contract. The engine supports cooperative
 agents; it does not forcibly interrupt a process already executing a command.
+
+Finished items move to `<schedule filename>.archive.jsonl`, while the marked
+JSON keeps compact tombstones and monotonic item/dispatch allocators. The 2 MiB
+document limit still applies; the 2,000-item limit counts active items only.
+The archive is required for historical detail and `--all`, but open work does
+not need to read it. Missing or corrupt referenced archive entries are errors,
+never silently missing history. Keep the Schedule and sidecar together in
+backups and file moves. Tombstones still grow; this is not an unlimited-history
+document format.
+
+To move a registration, first move the document and its archive sidecar, then
+have the commander run:
+
+```sh
+gaebu schedule move /new/absolute/path/schedule.md
+```
+
+The old document must be absent. The new file must retain the registered
+Schedule identity and every tombstone must resolve in its new archive. This
+changes the registration only; it does not copy or rename files. Writers that
+waited with an older registration are refused before publishing changes.
+
+Runtime compaction retains terminal duties and closed escalations for 24 hours,
+and records for one hour. Holds and open escalation references keep duties hot.
+Linked duties of an active team retire only after that team's item is archived;
+foreign active-team linked duties are deferred. Cancelled-team terminal duties
+can retire without their Schedule because the team cannot issue further work.
+Automatic compaction runs after member operations commit, with a 64-candidate
+threshold; hooks do not compact. Explicit `gaebu compact` runs from one eligible
+entry and reports I/O failures. Historical duty lookup remains available through
+`duty show` and `duty_get`: a foreign hot duty returns `no_grant`; a foreign
+archived duty is outside the caller team's archive and returns `not_found`.
+
+Runtime archives live in `$GAEBU_HOME/archive/<team>/`. Their committed byte
+boundaries are stored in state, so uncommitted tails are ignored and trimmed on
+the next append. Append checks file length and the boundary newline; lookup
+parses the committed region under `state.lock`, serialized with repair. Large
+lookups can hold this lock long enough for another operation's 5-second wait
+budget to expire. Unix writes sync archive files and directory links before
+publishing state, and sync directories after atomic replacements. Windows
+retains file-sync/rename durability; physical power-loss behavior is untested.
