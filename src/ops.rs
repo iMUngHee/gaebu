@@ -1310,13 +1310,23 @@ pub fn lease_acquire(
     lease_scope(st, &a.id, &key_text, "lease requires accepted duty scope")?;
     let ttl = ttl(ttl_ms)?;
     expire_leases(st, now);
-    for l in st.leases.values().filter(|l| l.team == a.team) {
+    let project = &st.teams[&a.team].project;
+    for l in st.leases.values().filter(|l| {
+        l.team == a.team
+            || (!project.is_empty()
+                && st.teams.get(&l.team).is_some_and(|team| {
+                    team.status == TeamStatus::Active && team.project == *project
+                }))
+    }) {
         if (mode == LeaseMode::Exclusive || l.mode == LeaseMode::Exclusive)
             && scope::parse(&l.key)?.overlaps(&key)
         {
             return refuse(
                 Reason::LeasedBy,
-                format!("{} holds {} ({})", l.holder, l.key, l.id),
+                format!(
+                    "{} holds {} ({}) in team {} ({})",
+                    l.holder, l.key, l.id, st.teams[&l.team].name, l.team,
+                ),
             );
         }
     }

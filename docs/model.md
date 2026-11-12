@@ -82,6 +82,10 @@ only from grants.
 - **Lease**: a `key` (a scope pattern or `res:<name>`), `mode` (`exclusive` or
   `shared`), a holder member and session, and `expires_at`. A lease resolves
   conflicts. It confers no decision rights.
+  Exclusive overlaps conflict within a team and across Active teams sharing
+  the same non-empty `project` label. Empty or different project labels keep
+  separate namespaces. Shared/shared overlaps remain allowed. Conflict errors
+  name the holder's team and lease.
 - **Escalation**: `from`, `to` (none means the user's queue), an optional
   `duty`, a `question`, an `answer`, a `status` (`open`, `answered`,
   `withdrawn`, `superseded`) and `superseded_by`. An asker has at most one open

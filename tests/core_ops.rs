@@ -240,6 +240,117 @@ fn exclusive_conflict_leased_by() {
         ops::lease_acquire(&mut s, 23, &c, "src2/a", LeaseMode::Exclusive, None, "work").is_err()
     );
 }
+
+fn cross_team_setup() -> (State, Actor, Actor, String, String) {
+    let (mut st, a, b, _) = setup();
+    accept(&mut st, &a, &b);
+    ops::dev_seed(
+        &mut st,
+        10,
+        &SeedSpec {
+            team: "second".into(),
+            project: "project".into(),
+            commander_alias: "second-root".into(),
+            commander_session: Some("second-root".into()),
+            commander_tool: Some(Tool::Codex),
+            members: vec![(
+                "second-worker".into(),
+                Some("second-worker".into()),
+                Some(Tool::Codex),
+            )],
+        },
+    )
+    .unwrap();
+    let root = Actor {
+        member: authz::member_for_session(&st, "second-root")
+            .unwrap()
+            .id
+            .clone(),
+        session_id: "second-root".into(),
+    };
+    let worker = Actor {
+        member: authz::member_for_session(&st, "second-worker")
+            .unwrap()
+            .id
+            .clone(),
+        session_id: "second-worker".into(),
+    };
+    accept(&mut st, &root, &worker);
+    let one = st.members[&b.member].team.clone();
+    let two = st.members[&worker.member].team.clone();
+    (st, b, worker, one, two)
+}
+
+#[test]
+fn cross_team_lease_same_project_conflict_names_owner_team() {
+    for (first, second) in [
+        (LeaseMode::Exclusive, LeaseMode::Exclusive),
+        (LeaseMode::Exclusive, LeaseMode::Shared),
+        (LeaseMode::Shared, LeaseMode::Exclusive),
+    ] {
+        let (mut st, one, two, first_team, _) = cross_team_setup();
+        ops::lease_acquire(&mut st, 30, &one, "src/**", first, None, "work").unwrap();
+        let error =
+            ops::lease_acquire(&mut st, 31, &two, "src/a", second, None, "work").unwrap_err();
+        assert_eq!(error.reason, Reason::LeasedBy);
+        assert!(error.message.contains(&st.teams[&first_team].name));
+        assert!(error.message.contains(&first_team));
+        assert!(ops::lease_acquire(&mut st, 32, &two, "src/other", second, None, "work").is_err());
+    }
+}
+
+#[test]
+fn cross_team_lease_shared_and_nonoverlapping_keys_are_allowed() {
+    let (mut st, one, two, _, _) = cross_team_setup();
+    ops::lease_acquire(&mut st, 30, &one, "src/a", LeaseMode::Shared, None, "read").unwrap();
+    ops::lease_acquire(&mut st, 31, &two, "src/a", LeaseMode::Shared, None, "read").unwrap();
+    ops::lease_acquire(
+        &mut st,
+        32,
+        &two,
+        "src/b",
+        LeaseMode::Exclusive,
+        None,
+        "write",
+    )
+    .unwrap();
+}
+
+#[test]
+fn cross_team_lease_different_empty_projects_and_cancelled_teams_are_independent() {
+    for (first_project, second_project, status) in [
+        ("project", "other", TeamStatus::Active),
+        ("", "project", TeamStatus::Active),
+        ("project", "", TeamStatus::Active),
+        ("", "", TeamStatus::Active),
+        ("project", "project", TeamStatus::Cancelled),
+    ] {
+        let (mut st, one, two, first_team, second_team) = cross_team_setup();
+        st.teams.get_mut(&first_team).unwrap().project = first_project.into();
+        st.teams.get_mut(&second_team).unwrap().project = second_project.into();
+        ops::lease_acquire(
+            &mut st,
+            30,
+            &one,
+            "src/a",
+            LeaseMode::Exclusive,
+            None,
+            "write",
+        )
+        .unwrap();
+        st.teams.get_mut(&first_team).unwrap().status = status;
+        ops::lease_acquire(
+            &mut st,
+            31,
+            &two,
+            "src/a",
+            LeaseMode::Exclusive,
+            None,
+            "write",
+        )
+        .unwrap();
+    }
+}
 #[test]
 fn ttl_expiry_allows_acquire() {
     let (mut s, a, b, c) = setup();

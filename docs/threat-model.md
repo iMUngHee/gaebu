@@ -158,8 +158,12 @@ rename, without portable directory-fsync durability. Process tests exercise
 publication failure, retries and lock races; they do not prove physical
 power-loss ordering, which requires code inspection or platform fault testing.
 
-Leases are advisory reservations, not filesystem edit guards. Duty completion
-records the recipient's assertion; review and runtime verification establish
+Leases also compare overlapping scopes across Active teams with the same
+non-empty project label. This is label equality, not canonical repository
+identity: different labels for one repository do not coordinate, and reusing
+a label for unrelated repositories can cause conflicts. Empty labels remain
+team-local. Leases are advisory reservations, not filesystem edit guards.
+Duty completion records the recipient's assertion; review and runtime verification establish
 quality. Automated tests and seeded fixture teams do not prove a real human's
 appointment workflow, host delivery, or context restoration. Report each tested
 evidence class separately and mark unperformed runtime checks as UNVERIFIED.
