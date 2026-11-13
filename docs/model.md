@@ -345,6 +345,28 @@ the CLI's five-second lock/publication budget. The 10,000-entry
 `runtime_compact::archive_large_cost` test reports observed host costs, not a portable
 latency bound.
 
+Explicit `gaebu compact --heal` (MCP `compact {"heal": true}`) repairs a
+missing-segment hole by permanently deleting every matching older file before the
+newest missing listed segment, including unlisted files. It requires the caller
+team's commander, rechecked inside the state transaction before any pre-check or
+unlink. All three caller-team streams are checked before the first deletion;
+invalid metadata, another open error, or a damaged last retained boundary aborts
+without deleting anything. Automatic compaction and plain `compact` never heal.
+
+`healed.<stream>` reports listed `segments` and committed `bytes` actually unlinked,
+plus `unlisted_files` and their actual `unlisted_bytes`. Successfully normalized
+bookkeeping counts each removed entry once: `healed` plus `expired` equals the
+entries dropped from the stream. Already-missing segments count as `expired`.
+A partial heal reports actual removals with `heal_deferred.<stream>` and the
+observed `hole_remaining.<stream>`, skips that stream's normal pass, preserves its
+bookkeeping and eligible hot rows, and archives other streams normally. A failed
+observation conservatively reports a remaining hole and defers the pass. A sync
+failure after the last unlink may report `hole_remaining: false` while still
+skipping the pass. Retry `--heal`, or use plain `compact` once only a prefix is missing.
+Errors after deletions include each affected archive's removal count and identify
+any incomplete heal, even if a later stream or state publication failed. Removing
+unlisted lower files also keeps previous-generation repair consistent with expiry.
+
 Schedule documents use a separate schema 3 segmented head: chain base, expired
 rows, monotonic next segment number, allocator maxima, and per-segment byte/row
 commitments and item bounds. Tombstones remain only for live dependencies or hot

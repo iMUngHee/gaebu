@@ -298,10 +298,21 @@ pub fn transaction<T>(
 }
 
 /// Explicit history maintenance follows the Schedule -> state lock order.
-pub fn compact(store: &Store, caller: &Caller) -> Result<Value> {
+pub fn compact(store: &Store, caller: &Caller, heal: bool) -> Result<Value> {
     let snapshot = store.read_current()?;
     let actor = identity::actor(&snapshot, caller)?;
     let team = snapshot.members[&actor.member].team.clone();
+    if heal
+        && snapshot
+            .teams
+            .get(&team)
+            .is_none_or(|t| t.commander != actor.member)
+    {
+        return Err(Error::new(
+            Reason::NoGrant,
+            "compact --heal requires the team commander",
+        ));
+    }
     let registration = snapshot.schedules.get(&team);
     let _file = registration
         .map(|reg| lock_path(Path::new(&reg.path)))
@@ -326,7 +337,11 @@ pub fn compact(store: &Store, caller: &Caller) -> Result<Value> {
                     .collect(),
             })
     });
-    crate::compact::run(store, &team, retired.as_ref())
+    if heal {
+        crate::compact::run_heal(store, caller, &team, retired.as_ref())
+    } else {
+        crate::compact::run(store, &team, retired.as_ref())
+    }
 }
 
 pub(super) fn lock_document(path: &Path) -> Result<(File, Document)> {

@@ -151,7 +151,11 @@ enum Cmd {
     #[command(subcommand)]
     Schedule(crate::schedule::ScheduleCmd),
     /// Archive eligible terminal runtime history.
-    Compact,
+    Compact {
+        /// Permanently delete older history to repair missing-segment holes (commander only).
+        #[arg(long)]
+        heal: bool,
+    },
     /// Leases.
     #[command(subcommand)]
     Lease(LeaseCmd),
@@ -987,11 +991,11 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             })
         }
         Cmd::Schedule(cmd) => crate::schedule::run_cli(cmd, json, pager),
-        Cmd::Compact => {
+        Cmd::Compact { heal } => {
             let store = open_store()?;
             let caller = mutating_caller(pager)?;
             identity::refresh_bindings(&store, pager)?;
-            let result = crate::schedule::compact(&store, &caller)?;
+            let result = crate::schedule::compact(&store, &caller, heal)?;
             if json {
                 print_json(&result);
             } else {
@@ -1000,6 +1004,11 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     result["duties"], result["escalations"], result["records"]
                 );
                 println!("expired history: {}", result["expired"]);
+                for field in ["healed", "heal_deferred", "hole_remaining"] {
+                    if let Some(value) = result.get(field) {
+                        println!("{field}: {value}");
+                    }
+                }
                 println!(
                     "retained bytes: {} (limit per team/stream: {})",
                     result["retained_bytes"], result["limit_bytes"]

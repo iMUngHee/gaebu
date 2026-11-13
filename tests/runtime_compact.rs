@@ -136,6 +136,65 @@ impl Fixture {
     fn reopen(&mut self, limit: u64) {
         self.store = Store::open_with_archive_limit(self.store.home(), limit).unwrap();
     }
+    fn archive_batches(&self, count: usize) -> Vec<[String; 3]> {
+        (0..count)
+            .map(|_| {
+                let ids = self.batch();
+                compact::run(&self.store, &self.team, None).unwrap();
+                ids
+            })
+            .collect()
+    }
+    fn batch(&self) -> [String; 3] {
+        self.store
+            .transact(CLI_DEADLINE, |st| {
+                let duty = terminal(st, &self.root, &self.worker);
+                st.duties.get_mut(&duty).unwrap().note = Some("d".repeat(1024));
+                let old = now_ms() - 2 * DAY;
+                let escalation = ops::escalate(st, old, &self.root, None, &"e".repeat(1024))
+                    .unwrap()
+                    .ids[0]
+                    .clone();
+                ops::escalation_withdraw(st, old, &self.root, &escalation, None).unwrap();
+                st.records.clear();
+                st.outbox.clear();
+                let record = st.mint("r");
+                st.records.push(Record {
+                    id: record.clone(),
+                    team: self.team.clone(),
+                    kind: RecordKind::Note,
+                    author: self.root.member.clone(),
+                    refs: vec![],
+                    text: "r".repeat(1024),
+                    at: old,
+                });
+                Ok([duty, escalation, record])
+            })
+            .unwrap()
+    }
+    fn heal(&self) -> gaebu::Result<serde_json::Value> {
+        gaebu::schedule::compact(&self.store, &caller(&self.root), true)
+    }
+    fn mcp(&self, args: serde_json::Value) -> serde_json::Value {
+        self.store
+            .session(&self.root.session_id)
+            .update_sighting(|s| {
+                s.tool = Some(Tool::Codex);
+                s.last_seen = Some(now_ms());
+            })
+            .unwrap();
+        let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+            "name":"compact", "arguments":args, "_meta":{"threadId":self.root.session_id}}});
+        let mut output = Vec::new();
+        gaebu::mcp::serve(
+            &mut std::io::Cursor::new(format!("{request}\n")),
+            &mut output,
+            &self.store,
+            &QuietPager,
+        )
+        .unwrap();
+        serde_json::from_slice(&output).unwrap()
+    }
     fn get(&self, id: &str) -> gaebu::Result<Duty> {
         compact::full_duty(
             &self.store,
@@ -1699,5 +1758,473 @@ fn duty_bounds_cover_out_of_order_appends() {
     );
     for id in [&ids[0], "d-1", "d-999999"] {
         assert_eq!(f.get(id).unwrap().id, id);
+    }
+}
+
+fn caller(actor: &Actor) -> gaebu::identity::Caller {
+    gaebu::identity::Caller {
+        session_id: actor.session_id.clone(),
+        tool: Some(Tool::Codex),
+        source: gaebu::identity::Source::PagerNative,
+    }
+}
+
+#[test]
+fn compact_heal_recovers_a_hole() {
+    let f = Fixture::with_limit(8192);
+    let ids = f.archive_batches(4);
+    let before = f.store.read_current().unwrap();
+    for name in ["duties", "escalations", "records"] {
+        assert_eq!(f.stream(name).segments.len(), 4);
+        fs::remove_file(f.segment(name, 2)).unwrap();
+    }
+    assert_eq!(
+        gaebu::schedule::compact(&f.store, &caller(&f.root), false)
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+    assert_eq!(f.store.read_current().unwrap(), before);
+    let result = f.heal().unwrap();
+    for name in ["duties", "escalations", "records"] {
+        let archives = &before.archives[&f.team];
+        let stream = match name {
+            "duties" => &archives.duties,
+            "escalations" => &archives.escalations,
+            _ => &archives.records,
+        };
+        assert_eq!(result["healed"][name]["segments"], 1);
+        assert_eq!(result["healed"][name]["bytes"], stream.segments[0].bytes);
+        assert_eq!(result["expired"][name]["segments"], 1);
+        assert_eq!(result["expired"][name]["bytes"], stream.segments[1].bytes);
+        assert_eq!(
+            f.stream(name)
+                .segments
+                .iter()
+                .map(|s| s.n)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(!f.segment(name, 1).exists());
+        for segment in f.stream(name).segments {
+            assert!(f.segment(name, segment.n).is_file());
+        }
+    }
+    assert_eq!(f.get(&ids[3][0]).unwrap().id, ids[3][0]);
+    let expired = f.get(&ids[0][0]).unwrap_err();
+    assert_eq!(expired.reason, Reason::NotFound);
+    assert_eq!(
+        expired.message,
+        "duty not found in hot state or retained team archive"
+    );
+    let again = f.heal().unwrap();
+    for name in ["duties", "escalations", "records"] {
+        assert_eq!(again["healed"][name]["segments"], 0);
+    }
+}
+
+#[test]
+fn compact_heal_requires_commander() {
+    for damage in ["member", "demoted", "dismissed", "moved-team"] {
+        let f = Fixture::with_limit(8192);
+        f.archive_batches(4);
+        fs::remove_file(f.segment("duties", 2)).unwrap();
+        if damage == "demoted" {
+            f.store
+                .transact(CLI_DEADLINE, |st| {
+                    st.teams.get_mut(&f.team).unwrap().commander = f.worker.member.clone();
+                    Ok(())
+                })
+                .unwrap();
+        } else if damage == "dismissed" {
+            f.store
+                .transact(CLI_DEADLINE, |st| {
+                    st.members.get_mut(&f.root.member).unwrap().status = MemberStatus::Dismissed;
+                    Ok(())
+                })
+                .unwrap();
+        } else if damage == "moved-team" {
+            f.store
+                .transact(CLI_DEADLINE, |st| {
+                    let (_, _, team) = seed(st, "other");
+                    st.members.get_mut(&f.root.member).unwrap().team = team;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let before = f.store.read_current().unwrap();
+        let bytes = fs::read(f.segment("duties", 1)).unwrap();
+        let error = if damage == "member" {
+            gaebu::schedule::compact(&f.store, &caller(&f.worker), true).unwrap_err()
+        } else {
+            compact::run_heal(&f.store, &caller(&f.root), &f.team, None).unwrap_err()
+        };
+        assert!(
+            matches!(error.reason, Reason::NoGrant | Reason::NotMember),
+            "{damage}: {error}"
+        );
+        assert_eq!(f.store.read_current().unwrap(), before);
+        assert_eq!(fs::read(f.segment("duties", 1)).unwrap(), bytes);
+    }
+    let f = Fixture::new();
+    f.duty();
+    assert_eq!(
+        gaebu::schedule::compact(&f.store, &caller(&f.worker), false).unwrap()["duties"],
+        1
+    );
+}
+
+#[test]
+fn heal_does_not_mask_other_corruption() {
+    for damage in ["next", "bounds", "short", "newline"] {
+        let f = Fixture::with_limit(8192);
+        f.archive_batches(4);
+        fs::remove_file(f.segment("duties", 2)).unwrap();
+        match damage {
+            "next" | "bounds" => {
+                f.store
+                    .transact(CLI_DEADLINE, |st| {
+                        let stream = &mut st.archives.get_mut(&f.team).unwrap().records;
+                        if damage == "next" {
+                            stream.next = 4;
+                        } else {
+                            stream.segments[0].lo = Some(2);
+                            stream.segments[0].hi = Some(1);
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            _ => {
+                let path = f.segment("records", 4);
+                let mut bytes = fs::read(&path).unwrap();
+                if damage == "short" {
+                    bytes.pop();
+                } else {
+                    *bytes.last_mut().unwrap() = b' ';
+                }
+                fs::write(path, bytes).unwrap();
+            }
+        }
+        let before = f.store.read_current().unwrap();
+        let original = fs::read(f.segment("duties", 1)).unwrap();
+        assert_eq!(
+            f.heal().unwrap_err().reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        assert_eq!(f.store.read_current().unwrap(), before);
+        assert_eq!(fs::read(f.segment("duties", 1)).unwrap(), original);
+        for name in ["duties", "escalations", "records"] {
+            for n in 1..=4 {
+                if name != "duties" || n != 2 {
+                    assert!(f.segment(name, n).is_file());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn heal_handles_missing_last_segment() {
+    let f = Fixture::with_limit(8192);
+    f.archive_batches(4);
+    for name in ["duties", "escalations", "records"] {
+        fs::remove_file(f.segment(name, 4)).unwrap();
+    }
+    let result = f.heal().unwrap();
+    for name in ["duties", "escalations", "records"] {
+        assert_eq!(result["healed"][name]["segments"], 3);
+        assert_eq!(result["expired"][name]["segments"], 1);
+        assert!(f.stream(name).segments.is_empty());
+        assert_eq!(f.stream(name).next, 5);
+    }
+    f.batch();
+    compact::run(&f.store, &f.team, None).unwrap();
+    for name in ["duties", "escalations", "records"] {
+        assert_eq!(f.stream(name).segments[0].n, 5);
+    }
+}
+
+#[test]
+fn heal_reports_listed_and_unlisted_separately() {
+    let f = Fixture::with_limit(8192);
+    f.archive_batches(4);
+    let original = f.stream("duties");
+    let unlisted_bytes = fs::metadata(f.segment("duties", 2)).unwrap().len();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.archives
+                .get_mut(&f.team)
+                .unwrap()
+                .duties
+                .segments
+                .retain(|s| s.n >= 3);
+            Ok(())
+        })
+        .unwrap();
+    fs::remove_file(f.segment("duties", 1)).unwrap();
+    fs::remove_file(f.segment("duties", 4)).unwrap();
+    let result = f.heal().unwrap();
+    assert_eq!(result["healed"]["duties"]["segments"], 1);
+    assert_eq!(
+        result["healed"]["duties"]["bytes"],
+        original.segments[2].bytes
+    );
+    assert_eq!(result["healed"]["duties"]["unlisted_files"], 1);
+    assert_eq!(result["healed"]["duties"]["unlisted_bytes"], unlisted_bytes);
+    assert_eq!(result["expired"]["duties"]["segments"], 1);
+    assert!(f.stream("duties").segments.is_empty());
+}
+
+#[test]
+fn heal_keeps_recovery_generation_consistent() {
+    for failure in ["append", "publish"] {
+        let f = Fixture::with_limit(8192);
+        let ids = f.archive_batches(4);
+        let pending = f.batch();
+        let mut current = f.store.read_current().unwrap();
+        let all = current.archives[&f.team].duties.clone();
+        current
+            .archives
+            .get_mut(&f.team)
+            .unwrap()
+            .duties
+            .segments
+            .retain(|s| s.n >= 3);
+        let mut previous = current.clone();
+        previous.archives.get_mut(&f.team).unwrap().duties.segments = all
+            .segments
+            .into_iter()
+            .filter(|s| [2, 3].contains(&s.n))
+            .collect();
+        previous.archives.get_mut(&f.team).unwrap().duties.next = 4;
+        fs::write(
+            f.store.home().join("state.json"),
+            serde_json::to_vec(&current).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            f.store.home().join("state.prev.json"),
+            serde_json::to_vec(&previous).unwrap(),
+        )
+        .unwrap();
+        for n in [1, 4] {
+            fs::remove_file(f.segment("duties", n)).unwrap();
+        }
+        let backup = if failure == "append" {
+            fs::create_dir(f.segment("duties", 5)).unwrap();
+            None
+        } else {
+            Some(block_publication(&f))
+        };
+        let error = f.heal().unwrap_err();
+        assert_eq!(error.reason, Reason::StoreWriteFailed);
+        assert!(
+            error.message.contains(&format!(
+                "heal had removed 2 segment(s) of {}/duties",
+                f.team
+            )),
+            "{error}"
+        );
+        assert_eq!(f.store.read_current().unwrap(), current);
+        for n in [1, 2, 3] {
+            assert!(!f.segment("duties", n).exists());
+        }
+        if let Some(bytes) = backup {
+            unblock_publication(&f, &bytes);
+        } else {
+            fs::remove_dir(f.segment("duties", 5)).unwrap();
+        }
+        f.store.repair().unwrap();
+        assert_eq!(f.get(&ids[1][0]).unwrap_err().reason, Reason::NotFound);
+        assert_eq!(f.get(&pending[0]).unwrap().id, pending[0]);
+        let retry = compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(retry["duties"], 1);
+        assert_eq!(f.get(&pending[0]).unwrap().id, pending[0]);
+    }
+}
+
+#[test]
+fn heal_error_after_unlink_names_removals() {
+    for escalation_hole in [false, true] {
+        let f = Fixture::with_limit(8192);
+        f.archive_batches(4);
+        f.batch();
+        fs::remove_file(f.segment("duties", 2)).unwrap();
+        if escalation_hole {
+            fs::remove_file(f.segment("escalations", 2)).unwrap();
+        }
+        fs::create_dir(f.segment("escalations", 5)).unwrap();
+        let before = f.store.read_current().unwrap();
+        let error = f.heal().unwrap_err();
+        assert_eq!(error.reason, Reason::StoreWriteFailed);
+        assert!(
+            error.message.contains(&format!(
+                "heal had removed 1 segment(s) of {}/duties",
+                f.team
+            )),
+            "{error}"
+        );
+        if escalation_hole {
+            assert!(
+                error.message.contains(&format!(
+                    "heal had removed 1 segment(s) of {}/escalations",
+                    f.team
+                )),
+                "{error}"
+            );
+        } else {
+            assert!(
+                !error
+                    .message
+                    .contains(&format!("segment(s) of {}/escalations", f.team)),
+                "{error}"
+            );
+        }
+        assert_eq!(f.store.read_current().unwrap(), before);
+        assert!(!f.segment("duties", 1).exists());
+        assert_eq!(!f.segment("escalations", 1).exists(), escalation_hole);
+    }
+}
+
+#[test]
+fn heal_then_failed_publish_is_consistent() {
+    let f = Fixture::with_limit(8192);
+    f.archive_batches(4);
+    let waiting = f.batch();
+    f.store.transact(CLI_DEADLINE, |_| Ok(())).unwrap();
+    fs::remove_file(f.segment("duties", 2)).unwrap();
+    let previous = block_publication(&f);
+    let error = f.heal().unwrap_err();
+    assert!(error.message.contains(&format!(
+        "heal had removed 1 segment(s) of {}/duties",
+        f.team
+    )));
+    unblock_publication(&f, &previous);
+    f.store.repair().unwrap();
+    assert_eq!(f.get(&waiting[0]).unwrap().id, waiting[0]);
+    let retry = compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(retry["duties"], 1);
+    assert_eq!(retry["expired"]["duties"]["segments"], 2);
+    assert_eq!(f.get(&waiting[0]).unwrap().id, waiting[0]);
+}
+
+#[test]
+fn heal_on_adopted_archives_is_a_noop() {
+    let f = Fixture::new();
+    let ids = f.archive_duties(1);
+    let mut value = serde_json::to_value(f.store.read_current().unwrap()).unwrap();
+    value["schema_version"] = 4.into();
+    value["archives"] = serde_json::json!({f.team.clone(): {"duties": fs::metadata(f.path("duties")).unwrap().len(), "escalations": 0, "records": 0}});
+    let original = serde_json::to_vec(&value).unwrap();
+    fs::write(f.store.home().join("state.json"), &original).unwrap();
+    let result = f.heal().unwrap();
+    for name in ["duties", "escalations", "records"] {
+        assert_eq!(result["healed"][name]["segments"], 0);
+    }
+    assert_eq!(
+        fs::read(f.store.home().join("state.v4.json")).unwrap(),
+        original
+    );
+    assert_eq!(f.get(&ids[0]).unwrap().id, ids[0]);
+}
+
+#[test]
+fn automatic_paths_never_heal() {
+    let f = Fixture::with_limit(8192);
+    f.archive_batches(4);
+    fs::remove_file(f.segment("duties", 2)).unwrap();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            for _ in 0..65 {
+                terminal(st, &f.root, &f.worker);
+            }
+            st.records.clear();
+            Ok(())
+        })
+        .unwrap();
+    let before = f.store.read_current().unwrap();
+    let oldest = fs::read(f.segment("duties", 1)).unwrap();
+    compact::auto(&f.store, &f.team, None);
+    assert_eq!(f.store.read_current().unwrap(), before);
+    assert_eq!(fs::read(f.segment("duties", 1)).unwrap(), oldest);
+}
+
+struct CliPager;
+impl Pager for CliPager {
+    fn whoami(&self, session: Option<&str>) -> gaebu::Result<WhoAmI> {
+        let session = session.unwrap_or("one-root");
+        Ok(WhoAmI {
+            session_id: session.into(),
+            via: "native".into(),
+            alias: Some(session.into()),
+            tool: Some("codex".into()),
+        })
+    }
+    fn host_status(&self, _: &str) -> gaebu::Result<HostStatus> {
+        Ok(HostStatus::Unknown)
+    }
+    fn send(&self, _: &str, _: &str) -> gaebu::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "child process helper"]
+fn heal_cli_child() {
+    if let Ok(args) = std::env::var("GAEBU_TEST_HEAL_CLI_ARGS") {
+        let args: Vec<String> = serde_json::from_str(&args).unwrap();
+        std::process::exit(gaebu::cli::run_with(
+            args.into_iter().map(std::ffi::OsString::from),
+            &CliPager,
+        ));
+    }
+}
+
+#[test]
+fn heal_flag_reaches_both_commands() {
+    for transport in ["cli", "mcp"] {
+        let f = Fixture::with_limit(8192);
+        f.archive_batches(4);
+        fs::remove_file(f.segment("duties", 2)).unwrap();
+        if transport == "cli" {
+            for heal in [false, true] {
+                let mut args = vec!["gaebu", "compact"];
+                if heal {
+                    args.push("--heal");
+                }
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "heal_cli_child", "--ignored", "--nocapture"])
+                    .env("GAEBU_HOME", f.store.home())
+                    .env(
+                        "GAEBU_TEST_HEAL_CLI_ARGS",
+                        serde_json::to_string(&args).unwrap(),
+                    )
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    result.status.success(),
+                    heal,
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                if heal {
+                    assert!(String::from_utf8_lossy(&result.stdout).contains("healed:"));
+                }
+            }
+        } else {
+            let invalid = f.mcp(serde_json::json!({"heal":"true"}));
+            assert_eq!(invalid["result"]["isError"], true);
+            let plain = f.mcp(serde_json::json!({}));
+            assert_eq!(plain["result"]["isError"], true);
+            let healed = f.mcp(serde_json::json!({"heal":true}));
+            assert_eq!(healed["result"]["isError"], false, "{healed}");
+            let result: serde_json::Value =
+                serde_json::from_str(healed["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(result["healed"]["duties"]["segments"], 1);
+        }
+        assert!(!f.segment("duties", 1).exists());
     }
 }
