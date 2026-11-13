@@ -24,6 +24,10 @@ the state, and anything to do after upgrading.
   retain waiting hot rows, and can be retried. Later errors name prior removals.
 - Runtime heal requires the current commander and checks all three caller-team
   streams before deleting; Schedule heal keeps commander/manager authorization.
+- Compaction no longer fails because another team's archive is damaged: that
+  team's stream is skipped, its rows stay hot, and the result lists it under
+  `skipped` with the reason. The caller team's own damage still fails the command.
+  `schedule archive --heal` runs its full verification only when a hole exists.
 - Windows directory flushing in `store::sync_dir` is recorded in `PLATFORMS.md`
   for native implementation and verification. Healing is the explicit recovery
   path while a power loss can reorder deletions there.

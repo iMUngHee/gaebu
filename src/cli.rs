@@ -1016,6 +1016,9 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                 if let Some(deferred) = result.get("expiry_deferred") {
                     println!("expiry deferred: {deferred}");
                 }
+                if let Some(skipped) = result.get("skipped") {
+                    println!("skipped damaged archives of other teams: {skipped}");
+                }
                 if result["over_limit"]
                     .as_array()
                     .is_some_and(|entries| !entries.is_empty())
