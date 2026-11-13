@@ -205,6 +205,131 @@ pub(crate) fn expired_prefix<S: Segment>(base: &Path, segments: &[S]) -> Result<
     Ok(expired)
 }
 
+fn inspect_heal_with<S: Segment>(
+    base: &Path,
+    segments: &[S],
+    mut open: impl FnMut(&Path) -> Result<Option<File>>,
+) -> Result<(usize, bool)> {
+    let (mut previous, mut after_missing, mut seen_present, mut hole) = (0, 0, false, false);
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.number() <= previous || segment.bytes() == 0 {
+            return Err(corrupt("invalid archive segment bookkeeping"));
+        }
+        previous = segment.number();
+        if open(&segment_path(base, segment.number()))?.is_some() {
+            seen_present = true;
+        } else {
+            after_missing = index + 1;
+            hole |= seen_present;
+        }
+    }
+    Ok((after_missing, hole))
+}
+
+/// Read-only checks; the returned index excludes every segment heal may expire.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn precheck_heal<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
+    let (retained, _) = inspect_heal_with(base, segments, open_optional)?;
+    if let Some(last) = segments.last().filter(|_| retained < segments.len()) {
+        boundary(
+            &mut open_prefix(&segment_path(base, last.number()), last.bytes(), false)?,
+            last.bytes(),
+        )?;
+    }
+    Ok(retained)
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) struct Healed {
+    pub segments: Vec<u64>,
+    pub unlisted_files: u64,
+    pub unlisted_bytes: u64,
+    pub deferred: Option<String>,
+    pub hole_remaining: bool,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static FAILED_HEAL_SYNC: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Healed> {
+    #[cfg(test)]
+    let mut calls = 0;
+    heal_with(
+        base,
+        segments,
+        || {
+            #[cfg(test)]
+            {
+                calls += 1;
+                if FAILED_HEAL_SYNC.with_borrow(|failed| {
+                    failed
+                        .as_ref()
+                        .is_some_and(|(path, at)| path == base && *at == calls)
+                }) {
+                    return Err(io_error(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )));
+                }
+            }
+            crate::store::sync_dir(parent(base)?)
+        },
+        unlink_segment,
+    )
+}
+
+fn heal_with<S: Segment>(
+    base: &Path,
+    segments: &[S],
+    mut sync: impl FnMut() -> Result<()>,
+    mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Healed> {
+    let mut result = Healed::default();
+    let (retained, hole) = inspect_heal_with(base, segments, open_optional)?;
+    if !hole {
+        return Ok(result);
+    }
+    let cutoff = segments[retained - 1].number();
+    let listed: std::collections::BTreeSet<_> = segments.iter().map(Segment::number).collect();
+    let mut files = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(parent(base)?).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        if let Some(number) = segment_number(base, &entry.file_name())
+            && number < cutoff
+        {
+            let bytes = entry.metadata().map_err(io_error)?.len();
+            files.insert(number, (entry.path(), bytes));
+        }
+    }
+    let delete = (|| -> Result<()> {
+        sync()?;
+        for (number, (path, bytes)) in files {
+            match unlink(&path) {
+                Ok(()) => {
+                    if listed.contains(&number) {
+                        result.segments.push(number);
+                    } else {
+                        result.unlisted_files += 1;
+                        result.unlisted_bytes += bytes;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(io_error(error)),
+            }
+            sync()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = delete {
+        result.deferred = Some(error.message);
+    }
+    result.hole_remaining = inspect_heal_with(base, segments, open_optional)?.1;
+    Ok(result)
+}
+
 fn parent(base: &Path) -> Result<&Path> {
     base.parent()
         .ok_or_else(|| corrupt("archive path has no parent"))
@@ -460,6 +585,188 @@ mod tests {
         ));
         let store = crate::store::Store::open_with_archive_limit(&dir, 64).unwrap();
         (store, dir.join("history.jsonl"))
+    }
+
+    #[test]
+    fn heal_removes_every_segment_file_below_the_hole() {
+        let (store, base) = fixture();
+        let segments: Vec<_> = (3..=6).map(|n| SegmentRecord { n, bytes: 2 }).collect();
+        for n in [2, 3, 4, 6, 9] {
+            fs::write(segment_path(&base, n), b"x\n").unwrap();
+        }
+        let unrelated = base.with_file_name("another.2.jsonl");
+        fs::write(&unrelated, b"keep").unwrap();
+        let events = std::cell::RefCell::new(vec![]);
+        assert_eq!(precheck_heal(&base, &segments).unwrap(), 3);
+        let result = heal_with(
+            &base,
+            &segments,
+            || {
+                events.borrow_mut().push(0);
+                Ok(())
+            },
+            |path| {
+                events
+                    .borrow_mut()
+                    .push(segment_number(&base, path.file_name().unwrap()).unwrap());
+                fs::remove_file(path)
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), [0, 2, 0, 3, 0, 4, 0]);
+        assert_eq!(result.segments, [3, 4]);
+        assert_eq!((result.unlisted_files, result.unlisted_bytes), (1, 2));
+        assert!(result.deferred.is_none());
+        assert!(!result.hole_remaining);
+        for n in [2, 3, 4] {
+            assert!(!segment_path(&base, n).exists());
+        }
+        for n in [6, 9] {
+            assert_eq!(fs::read(segment_path(&base, n)).unwrap(), b"x\n");
+        }
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        for list in [&segments[..], &segments[3..], &segments[..0]] {
+            let result =
+                heal_with(&base, list, || panic!("no hole"), |_| panic!("no hole")).unwrap();
+            assert!(result.segments.is_empty());
+        }
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_defers_on_unlink_or_sync_failure() {
+        for fail in [0, 1, 2] {
+            let (store, base) = fixture();
+            let segments: Vec<_> = (1..=3).map(|n| SegmentRecord { n, bytes: 2 }).collect();
+            for n in [1, 2] {
+                fs::write(segment_path(&base, n), b"x\n").unwrap();
+            }
+            let calls = std::cell::Cell::new(0);
+            let result = heal_with(
+                &base,
+                &segments,
+                || {
+                    let count = calls.get();
+                    calls.set(count + 1);
+                    if fail == 0 || (fail == 2 && count == 1) {
+                        Err(corrupt("injected sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path| {
+                    if fail == 1 && path == segment_path(&base, 2) {
+                        Err(std::io::ErrorKind::PermissionDenied.into())
+                    } else {
+                        fs::remove_file(path)
+                    }
+                },
+            )
+            .unwrap();
+            assert!(result.deferred.is_some());
+            assert!(result.hole_remaining);
+            assert_eq!(result.segments, if fail == 0 { vec![] } else { vec![1] });
+            assert_eq!(segment_path(&base, 1).exists(), fail == 0);
+            assert!(segment_path(&base, 2).exists());
+            let retry = heal_holes(&base, &segments).unwrap();
+            assert!(!retry.hole_remaining);
+            assert!(retry.deferred.is_none());
+            assert!(!segment_path(&base, 2).exists());
+            fs::remove_dir_all(store.home()).unwrap();
+        }
+    }
+
+    #[test]
+    fn heal_sync_failure_after_last_unlink() {
+        let (store, base) = fixture();
+        fs::write(&base, b"x\n").unwrap();
+        let segments = [
+            SegmentRecord { n: 1, bytes: 2 },
+            SegmentRecord { n: 2, bytes: 2 },
+        ];
+        FAILED_HEAL_SYNC.with_borrow_mut(|failed| *failed = Some((base.clone(), 2)));
+        let result = heal_holes(&base, &segments).unwrap();
+        FAILED_HEAL_SYNC.with_borrow_mut(|failed| *failed = None);
+        assert_eq!(result.segments, [1]);
+        assert!(result.deferred.is_some());
+        assert!(!result.hole_remaining);
+        assert_eq!(precheck_heal(&base, &segments).unwrap(), 2);
+        assert_eq!(expired_prefix(&base, &segments).unwrap(), 2);
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_does_not_count_a_file_that_disappeared_before_unlink() {
+        let (store, base) = fixture();
+        fs::write(&base, b"x\n").unwrap();
+        let segments = [
+            SegmentRecord { n: 1, bytes: 2 },
+            SegmentRecord { n: 2, bytes: 2 },
+        ];
+        let result = heal_with(
+            &base,
+            &segments,
+            || Ok(()),
+            |path| {
+                fs::remove_file(path)?;
+                Err(std::io::ErrorKind::NotFound.into())
+            },
+        )
+        .unwrap();
+        assert!(result.segments.is_empty());
+        assert!(result.deferred.is_none());
+        assert!(!result.hole_remaining);
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_treats_only_not_found_as_missing() {
+        let (store, base) = fixture();
+        fs::write(&base, b"x\n").unwrap();
+        let segments = [
+            SegmentRecord { n: 1, bytes: 2 },
+            SegmentRecord { n: 2, bytes: 2 },
+        ];
+        let result = inspect_heal_with(&base, &segments, |path| {
+            if path == segment_path(&base, 2) {
+                Err(io_error(std::io::ErrorKind::PermissionDenied.into()))
+            } else {
+                open_optional(path)
+            }
+        });
+        assert_eq!(result.unwrap_err().reason, Reason::StoreWriteFailed);
+        assert_eq!(fs::read(&base).unwrap(), b"x\n");
+        fs::write(segment_path(&base, 2), b"short").unwrap();
+        let bad = [
+            SegmentRecord { n: 1, bytes: 2 },
+            SegmentRecord { n: 2, bytes: 6 },
+        ];
+        assert_eq!(
+            precheck_heal(&base, &bad).unwrap_err().reason,
+            Reason::StoreCorrupt
+        );
+        fs::write(segment_path(&base, 2), b"bad!").unwrap();
+        let bad = [
+            SegmentRecord { n: 1, bytes: 2 },
+            SegmentRecord { n: 2, bytes: 4 },
+        ];
+        assert_eq!(
+            precheck_heal(&base, &bad).unwrap_err().reason,
+            Reason::StoreCorrupt
+        );
+        assert_eq!(
+            precheck_heal(&base, &[SegmentRecord { n: 0, bytes: 2 }])
+                .unwrap_err()
+                .reason,
+            Reason::StoreCorrupt
+        );
+        assert_eq!(
+            precheck_heal(&base, &[SegmentRecord { n: 1, bytes: 0 }])
+                .unwrap_err()
+                .reason,
+            Reason::StoreCorrupt
+        );
+        fs::remove_dir_all(store.home()).unwrap();
     }
 
     #[test]
