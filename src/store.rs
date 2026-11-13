@@ -553,7 +553,13 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
                         )
                     })
                     .collect();
-                value["archives"] = serde_json::to_value(archives).map_err(corrupt_error)?;
+                value
+                    .as_object_mut()
+                    .ok_or_else(|| Error::new(Reason::StoreCorrupt, "state is not an object"))?
+                    .insert(
+                        "archives".into(),
+                        serde_json::to_value(archives).map_err(corrupt_error)?,
+                    );
             }
             let mut state: State = serde_json::from_value(value).map_err(corrupt_error)?;
             if version == 1 {

@@ -31,6 +31,7 @@ pub fn register(store: &Store, caller: &Caller, path: &Path, create: bool) -> Re
                 .ok_or_else(|| invalid("schedule has no file name"))?,
         )
     };
+    archive::refuse_sidecar_name(&path)?;
     let _file = lock_path(&path)?;
     let mut document = if path.exists() {
         read_document(&path)?
@@ -121,6 +122,7 @@ pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> 
         .cloned()
         .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
     let path = fs::canonicalize(path).map_err(io_error)?;
+    archive::refuse_sidecar_name(&path)?;
     let (_file, document) = lock_document(&path)?;
     if document.schedule.id != registration.schedule_id {
         return Err(conflict("schedule identity changed"));

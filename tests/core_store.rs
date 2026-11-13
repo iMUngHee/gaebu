@@ -875,3 +875,13 @@ fn state_v4_archives_become_segment_one() {
         Reason::NotFound
     );
 }
+
+#[test]
+fn array_shaped_legacy_state_is_corrupt_not_a_panic() {
+    let home = Home::new();
+    fs::write(home.0.join("state.json"), "[4]").unwrap();
+    assert_eq!(
+        home.store().read().unwrap_err().reason,
+        Reason::StoreCorrupt
+    );
+}
