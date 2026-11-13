@@ -66,12 +66,15 @@ fn seed(st: &mut State, label: &str) -> (Actor, Actor, String) {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_limit(64 * 1024 * 1024)
+    }
+    fn with_limit(limit: u64) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "gaebu-compact-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let store = Store::open(&dir).unwrap();
+        let store = Store::open_with_archive_limit(&dir, limit).unwrap();
         let (root, worker, team) = store
             .transact(CLI_DEADLINE, |st| {
                 let actors = seed(st, "one");
@@ -103,6 +106,35 @@ impl Fixture {
             .join("archive")
             .join(&self.team)
             .join(format!("{collection}.jsonl"))
+    }
+    fn segment(&self, name: &str, n: u64) -> PathBuf {
+        if n == 1 {
+            self.path(name)
+        } else {
+            self.path(name).with_extension(format!("{n}.jsonl"))
+        }
+    }
+    fn stream(&self, name: &str) -> ArchiveStream {
+        let state = self.store.read_current().unwrap();
+        let archives = &state.archives[&self.team];
+        match name {
+            "duties" => archives.duties.clone(),
+            "escalations" => archives.escalations.clone(),
+            "records" => archives.records.clone(),
+            _ => panic!("unknown stream"),
+        }
+    }
+    fn archive_duties(&self, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|_| {
+                let id = self.duty();
+                compact::run(&self.store, &self.team, None).unwrap();
+                id
+            })
+            .collect()
+    }
+    fn reopen(&mut self, limit: u64) {
+        self.store = Store::open_with_archive_limit(self.store.home(), limit).unwrap();
     }
     fn get(&self, id: &str) -> gaebu::Result<Duty> {
         compact::full_duty(
@@ -624,8 +656,8 @@ fn records_retention_and_root_idempotency_survive_compaction() {
 }
 
 #[test]
-fn archive_boundary_corrupt_missing_short_and_unterminated_preserve_hot() {
-    for damage in ["missing", "short", "newline"] {
+fn archive_boundary_corrupt_short_and_unterminated_preserve_hot() {
+    for damage in ["short", "newline"] {
         let f = Fixture::new();
         let first = f.duty();
         compact::run(&f.store, &f.team, None).unwrap();
@@ -713,7 +745,14 @@ fn archive_boundary_utf8_wrong_team_and_last_matching_id() {
     fs::write(f.path("duties"), &bytes).unwrap();
     f.store
         .transact(CLI_DEADLINE, |st| {
-            st.archives.get_mut(&f.team).unwrap().duties = bytes.len() as u64;
+            st.archives
+                .get_mut(&f.team)
+                .unwrap()
+                .duties
+                .segments
+                .last_mut()
+                .unwrap()
+                .bytes = bytes.len() as u64;
             Ok(())
         })
         .unwrap();
@@ -728,7 +767,14 @@ fn archive_boundary_utf8_wrong_team_and_last_matching_id() {
     fs::write(f.path("duties"), &bytes).unwrap();
     f.store
         .transact(CLI_DEADLINE, |st| {
-            st.archives.get_mut(&f.team).unwrap().duties = bytes.len() as u64;
+            st.archives
+                .get_mut(&f.team)
+                .unwrap()
+                .duties
+                .segments
+                .last_mut()
+                .unwrap()
+                .bytes = bytes.len() as u64;
             Ok(())
         })
         .unwrap();
@@ -992,5 +1038,657 @@ fn linked_retirement_uses_live_set_and_allocator() {
             expected,
             "{item}, live={live}"
         );
+    }
+}
+
+#[test]
+fn runtime_archives_stay_under_limit() {
+    let f = Fixture::with_limit(4096);
+    let mut written = [0u64; 3];
+    let mut largest = [0u64; 3];
+    for _ in 0..40 {
+        let sizes = f
+            .store
+            .transact(CLI_DEADLINE, |st| {
+                let duty = terminal(st, &f.root, &f.worker);
+                st.duties.get_mut(&duty).unwrap().note = Some("d".repeat(2048));
+                let old = now_ms() - 2 * DAY;
+                let escalation = ops::escalate(st, old, &f.root, None, &"e".repeat(2048))
+                    .unwrap()
+                    .ids[0]
+                    .clone();
+                ops::escalation_withdraw(st, old, &f.root, &escalation, None).unwrap();
+                st.records.clear();
+                let record = Record {
+                    id: st.mint("r"),
+                    team: f.team.clone(),
+                    kind: RecordKind::Note,
+                    author: f.root.member.clone(),
+                    refs: vec![],
+                    text: "r".repeat(2048),
+                    at: old,
+                };
+                let sizes = [
+                    serde_json::to_vec(&st.duties[&duty]).unwrap().len() as u64 + 1,
+                    serde_json::to_vec(&st.escalations[&escalation])
+                        .unwrap()
+                        .len() as u64
+                        + 1,
+                    serde_json::to_vec(&record).unwrap().len() as u64 + 1,
+                ];
+                st.records.push(record);
+                Ok(sizes)
+            })
+            .unwrap();
+        let result = compact::run(&f.store, &f.team, None).unwrap();
+        for (index, name) in ["duties", "escalations", "records"].iter().enumerate() {
+            written[index] += sizes[index];
+            largest[index] = largest[index].max(sizes[index]);
+            let stream = f.stream(name);
+            let physical: u64 = stream
+                .segments
+                .iter()
+                .map(|s| fs::metadata(f.segment(name, s.n)).unwrap().len())
+                .sum();
+            assert!(physical <= 4096 + largest[index], "{name}: {physical}");
+            assert!(stream.segments.len() <= 17);
+            assert_eq!(result["retained_bytes"][name], physical);
+            assert_eq!(result["limit_bytes"], 4096);
+        }
+    }
+    assert!(written.iter().all(|bytes| *bytes > 10 * 4096));
+}
+
+#[test]
+fn expired_duty_is_not_found() {
+    let f = Fixture::with_limit(8);
+    let ids = f.archive_duties(2);
+    let error = f.get(&ids[0]).unwrap_err();
+    assert_eq!(error.reason, Reason::NotFound);
+    assert_eq!(
+        error.message,
+        "duty not found in hot state or retained team archive"
+    );
+    let mut latest = f.get(&ids[1]).unwrap();
+    latest.note = Some("newest segment".into());
+    // Recovered hot duties may be re-archived with the same id.
+    let larger = Store::open_with_archive_limit(f.store.home(), 2048).unwrap();
+    larger
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.insert(latest.id.clone(), latest.clone());
+            Ok(())
+        })
+        .unwrap();
+    compact::run(&larger, &f.team, None).unwrap();
+    assert_eq!(f.stream("duties").segments.len(), 2);
+    assert_eq!(f.get(&ids[1]).unwrap(), latest);
+}
+
+#[test]
+fn lookup_skips_segments_by_bounds() {
+    let f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(3);
+    let newest_bytes = fs::read(f.segment("duties", 3)).unwrap();
+    let mut damaged_newest = newest_bytes.clone();
+    damaged_newest[0] = b'!';
+    fs::write(f.segment("duties", 3), damaged_newest).unwrap();
+    assert_eq!(f.get(&ids[1]).unwrap().id, ids[1]);
+    assert_eq!(f.get(&ids[2]).unwrap_err().reason, Reason::StoreCorrupt);
+    fs::write(f.segment("duties", 3), newest_bytes).unwrap();
+    let mut corrupt = fs::read(f.segment("duties", 1)).unwrap();
+    corrupt[0] = b'!';
+    fs::write(f.segment("duties", 1), corrupt).unwrap();
+    assert_eq!(f.get(&ids[2]).unwrap().id, ids[2]);
+    assert_eq!(f.get(&ids[0]).unwrap_err().reason, Reason::StoreCorrupt);
+    // Retiring out of order makes ranges overlap; the newer matching row wins.
+    let mut recovered = f.get(&ids[1]).unwrap();
+    recovered.note = Some("out of order".into());
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.insert(recovered.id.clone(), recovered.clone());
+            Ok(())
+        })
+        .unwrap();
+    compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(f.get(&ids[1]).unwrap(), recovered);
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            let segments = &mut st.archives.get_mut(&f.team).unwrap().duties.segments;
+            for segment in segments {
+                segment.lo = Some(1);
+                segment.hi = Some(u64::MAX);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.get(&ids[1]).unwrap(), recovered);
+    assert_eq!(f.get("d-999999").unwrap_err().reason, Reason::StoreCorrupt);
+}
+
+#[test]
+fn missing_prefix_is_expired_but_holes_are_corrupt() {
+    for missing in [vec![1], vec![1, 2, 3], vec![2], vec![3]] {
+        let f = Fixture::with_limit(2048);
+        let ids = f.archive_duties(3);
+        assert_eq!(f.stream("duties").segments.len(), 3);
+        let next = f.stream("duties").next;
+        for number in &missing {
+            fs::remove_file(f.segment("duties", *number)).unwrap();
+        }
+        let before = f.store.read_current().unwrap();
+        let newest = f.get(&ids[2]);
+        if missing[0] != 1 {
+            assert_eq!(newest.unwrap_err().reason, Reason::StoreCorrupt);
+            assert_eq!(
+                compact::run(&f.store, &f.team, None).unwrap_err().reason,
+                Reason::StoreCorrupt
+            );
+            assert_eq!(f.store.read_current().unwrap(), before);
+        } else {
+            if missing.len() == 3 {
+                assert_eq!(newest.unwrap_err().reason, Reason::NotFound);
+            } else {
+                assert_eq!(newest.unwrap().id, ids[2]);
+            }
+            assert_eq!(f.get(&ids[0]).unwrap_err().reason, Reason::NotFound);
+            let result = compact::run(&f.store, &f.team, None).unwrap();
+            assert_eq!(result["expired"]["duties"]["segments"], missing.len());
+            assert_eq!(
+                result["expired"]["duties"]["bytes"],
+                before.archives[&f.team]
+                    .duties
+                    .segments
+                    .iter()
+                    .filter(|s| missing.contains(&s.n))
+                    .map(|s| s.bytes)
+                    .sum::<u64>()
+            );
+            assert_eq!(f.stream("duties").next, next);
+            let id = f.duty();
+            compact::run(&f.store, &f.team, None).unwrap();
+            assert_eq!(f.stream("duties").segments.last().unwrap().n, next);
+            assert_eq!(f.get(&id).unwrap().id, id);
+        }
+    }
+}
+
+#[test]
+fn segment_count_is_capped_across_limits() {
+    let mut f = Fixture::with_limit(8192);
+    for _ in 0..8 {
+        let id = f.duty();
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                let duty = st.duties.get_mut(&id).unwrap();
+                duty.note = Some(String::new());
+                let size = serde_json::to_vec(&*duty).unwrap().len() + 1;
+                duty.note = Some("x".repeat(1024 - size));
+                Ok(())
+            })
+            .unwrap();
+        let result = compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(result["over_limit"], serde_json::json!([]));
+    }
+    assert_eq!(f.stream("duties").segments.len(), 8);
+    f.reopen(64 * 1024);
+    for _ in 0..20 {
+        // A batch exceeds the new segment target, forcing one rollover per pass.
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                let id = terminal(st, &f.root, &f.worker);
+                st.duties.get_mut(&id).unwrap().note = Some("x".repeat(8192));
+                st.records.clear();
+                Ok(())
+            })
+            .unwrap();
+        compact::run(&f.store, &f.team, None).unwrap();
+        assert!(f.stream("duties").segments.len() <= 17);
+    }
+}
+
+#[test]
+fn explicit_maintenance_enforces_limit_without_new_rows() {
+    let mut f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(3);
+    let prior = f.stream("duties");
+    f.reopen(8);
+    let result = compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(result["duties"], 0);
+    assert_eq!(result["escalations"], 0);
+    assert_eq!(result["records"], 0);
+    assert_eq!(result["expired"]["duties"]["segments"], 2);
+    assert_eq!(
+        result["expired"]["duties"]["bytes"],
+        prior.segments[..2].iter().map(|s| s.bytes).sum::<u64>()
+    );
+    assert_eq!(f.stream("duties").segments.len(), 1);
+    assert_eq!(f.get(&ids[0]).unwrap_err().reason, Reason::NotFound);
+    assert_eq!(f.get(&ids[2]).unwrap().id, ids[2]);
+    assert!(result["retained_bytes"]["duties"].as_u64().unwrap() > 8);
+    assert!(result.get("expiry_deferred").is_none());
+    assert_eq!(
+        result["over_limit"],
+        serde_json::json!([{
+            "team": f.team, "stream": "duties", "bytes": f.stream("duties").segments[0].bytes, "limit_bytes": 8
+        }])
+    );
+}
+
+#[test]
+fn compact_refuses_damaged_segment() {
+    for limit in [2048, 64 * 1024 * 1024] {
+        for damage in ["short", "newline", "missing"] {
+            let mut f = Fixture::with_limit(2048);
+            f.archive_duties(2);
+            f.reopen(limit);
+            let new_id = f.duty();
+            let path = f.segment("duties", 2);
+            let mut bytes = fs::read(&path).unwrap();
+            match damage {
+                "short" => {
+                    bytes.pop();
+                    fs::write(&path, bytes).unwrap();
+                }
+                "newline" => {
+                    *bytes.last_mut().unwrap() = b' ';
+                    fs::write(&path, bytes).unwrap();
+                }
+                _ => fs::remove_file(&path).unwrap(),
+            }
+            let before = f.store.read_current().unwrap();
+            let first = fs::read(f.segment("duties", 1)).unwrap();
+            assert_eq!(
+                compact::run(&f.store, &f.team, None).unwrap_err().reason,
+                Reason::StoreCorrupt
+            );
+            assert_eq!(f.store.read_current().unwrap(), before);
+            assert!(before.duties.contains_key(&new_id));
+            assert_eq!(fs::read(f.segment("duties", 1)).unwrap(), first);
+            assert!(!f.segment("duties", 3).exists());
+        }
+    }
+}
+
+#[test]
+fn listed_segments_have_no_uncommitted_tail() {
+    let mut f = Fixture::new();
+    f.archive_duties(1);
+    f.reopen(2048);
+    for _ in 0..2 {
+        let last = f.stream("duties").segments.last().unwrap().clone();
+        let path = f.segment("duties", last.n);
+        let prefix = fs::read(&path).unwrap();
+        let mut garbage = prefix.clone();
+        garbage.extend_from_slice(b"failed append tail");
+        fs::write(&path, garbage).unwrap();
+        f.duty();
+        compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        for segment in f.stream("duties").segments {
+            assert_eq!(
+                fs::metadata(f.segment("duties", segment.n)).unwrap().len(),
+                segment.bytes
+            );
+        }
+    }
+    let last = f.stream("duties").segments.last().unwrap().clone();
+    let path = f.segment("duties", last.n);
+    let prefix = fs::read(&path).unwrap();
+    let mut garbage = prefix.clone();
+    garbage.extend_from_slice(b"idle failed tail");
+    fs::write(&path, garbage).unwrap();
+    assert_eq!(compact::run(&f.store, &f.team, None).unwrap()["duties"], 0);
+    assert_eq!(fs::read(&path).unwrap(), prefix);
+}
+
+#[test]
+fn unpublished_segment_is_reused() {
+    let f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(1);
+    let prefix = fs::read(f.segment("duties", 1)).unwrap();
+    let mut garbage = prefix.clone();
+    garbage.extend_from_slice(b"unpublished tail");
+    fs::write(f.segment("duties", 1), garbage).unwrap();
+    fs::write(f.segment("duties", 2), b"unpublished segment garbage").unwrap();
+    assert_eq!(f.get(&ids[0]).unwrap().id, ids[0]);
+    let second = f.duty();
+    compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(fs::read(f.segment("duties", 1)).unwrap(), prefix);
+    let rows: Vec<Duty> = fs::read_to_string(f.segment("duties", 2))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, second);
+    assert_eq!(f.get(&second).unwrap().id, second);
+}
+
+fn block_publication(f: &Fixture) -> Vec<u8> {
+    let prev = f.store.home().join("state.prev.json");
+    let bytes = fs::read(&prev).unwrap();
+    fs::remove_file(&prev).unwrap();
+    fs::create_dir(&prev).unwrap();
+    bytes
+}
+
+fn unblock_publication(f: &Fixture, previous: &[u8]) {
+    let prev = f.store.home().join("state.prev.json");
+    fs::remove_dir(&prev).unwrap();
+    fs::write(prev, previous).unwrap();
+}
+
+#[test]
+fn failed_publish_after_expiry_is_consistent() {
+    for oversized in [false, true] {
+        let mut f = Fixture::with_limit(2048);
+        let ids = f.archive_duties(if oversized { 1 } else { 3 });
+        let pending = f.duty();
+        let before = f.store.read_current().unwrap();
+        f.reopen(8);
+        let previous = block_publication(&f);
+        assert_eq!(
+            compact::run(&f.store, &f.team, None).unwrap_err().reason,
+            Reason::StoreWriteFailed
+        );
+        assert_eq!(f.store.read_current().unwrap(), before);
+        unblock_publication(&f, &previous);
+        for id in &ids {
+            assert_eq!(f.get(id).unwrap_err().reason, Reason::NotFound);
+        }
+        assert_eq!(f.get(&pending).unwrap().id, pending);
+        compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(f.get(&pending).unwrap().id, pending);
+        assert_eq!(f.stream("duties").segments.len(), 1);
+        assert_eq!(
+            f.stream("duties").segments[0].n,
+            before.archives[&f.team].duties.next
+        );
+    }
+}
+
+#[test]
+fn repair_after_expiry_reads_and_reappends() {
+    for oversized in [false, true] {
+        let mut f = Fixture::with_limit(2048);
+        let ids = f.archive_duties(if oversized { 1 } else { 3 });
+        let pending = f.duty();
+        f.reopen(8);
+        compact::run(&f.store, &f.team, None).unwrap();
+        fs::write(f.store.home().join("state.json"), b"broken").unwrap();
+        f.store.repair().unwrap();
+        for id in &ids {
+            assert_eq!(f.get(id).unwrap_err().reason, Reason::NotFound);
+        }
+        assert_eq!(f.get(&pending).unwrap().id, pending);
+        compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(f.get(&pending).unwrap().id, pending);
+    }
+    let mut f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(2);
+    f.reopen(8);
+    let previous = block_publication(&f);
+    // Idle enforcement deletes the last segment named by the predecessor.
+    assert_eq!(
+        compact::run(&f.store, &f.team, None).unwrap_err().reason,
+        Reason::StoreWriteFailed
+    );
+    unblock_publication(&f, &previous);
+    f.store.repair().unwrap();
+    assert_eq!(f.stream("duties").segments.len(), 1);
+    assert_eq!(f.get(&ids[0]).unwrap_err().reason, Reason::NotFound);
+    assert_eq!(f.get(&ids[1]).unwrap().id, ids[1]);
+    compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(f.get(&ids[1]).unwrap().id, ids[1]);
+}
+
+#[test]
+fn maintenance_removes_unlisted_files_after_repair() {
+    let mut f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(2);
+    // Keep a predecessor with no pending rows, so repair itself creates idle upkeep.
+    compact::run(&f.store, &f.team, None).unwrap();
+    let previous = block_publication(&f);
+    // Publish fails after segment 3 is written and older files expire.
+    // The pending duty is already in the current generation, but not its predecessor.
+    let mut state = f.store.read_current().unwrap();
+    let pending = terminal(&mut state, &f.root, &f.worker);
+    state.records.clear();
+    fs::write(
+        f.store.home().join("state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    f.reopen(8);
+    assert_eq!(
+        compact::run(&f.store, &f.team, None).unwrap_err().reason,
+        Reason::StoreWriteFailed
+    );
+    assert!(f.segment("duties", 3).exists());
+    unblock_publication(&f, &previous);
+    f.store.repair().unwrap();
+    assert!(f.store.read_current().unwrap().duties.is_empty());
+    assert_eq!(f.get(&pending).unwrap_err().reason, Reason::NotFound);
+    assert_eq!(f.get(&ids[0]).unwrap_err().reason, Reason::NotFound);
+    let unrelated = f.path("duties").with_extension("03.jsonl");
+    fs::write(&unrelated, b"unrelated").unwrap();
+    fs::write(f.segment("duties", 900), b"far future unlisted").unwrap();
+    for _ in 0..2 {
+        let result = compact::run(&f.store, &f.team, None).unwrap();
+        assert_eq!(result["duties"], 0);
+        assert!(f.stream("duties").segments.is_empty());
+        for number in [1, 2, 3, 900] {
+            assert!(!f.segment("duties", number).exists());
+        }
+        assert!(unrelated.exists());
+    }
+}
+
+#[test]
+fn bound_exceptions_are_reported() {
+    let mut f = Fixture::with_limit(2048);
+    let ids = f.archive_duties(2);
+    // Windows can keep the segment readable while denying deletion. Unix permits
+    // unlinking open files, so substitute a directory until enforcement returns.
+    #[cfg(windows)]
+    let blocked = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(f.segment("duties", 1))
+            .unwrap()
+    };
+    #[cfg(not(windows))]
+    let oldest = {
+        let bytes = fs::read(f.segment("duties", 1)).unwrap();
+        fs::remove_file(f.segment("duties", 1)).unwrap();
+        fs::create_dir(f.segment("duties", 1)).unwrap();
+        bytes
+    };
+    f.reopen(8);
+    let result = compact::run(&f.store, &f.team, None).unwrap();
+    assert!(result["expiry_deferred"]["duties"].as_str().is_some());
+    assert_eq!(f.stream("duties").segments.len(), 2);
+    #[cfg(windows)]
+    drop(blocked);
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir(f.segment("duties", 1)).unwrap();
+        fs::write(f.segment("duties", 1), oldest).unwrap();
+    }
+    assert_eq!(f.get(&ids[0]).unwrap().id, ids[0]);
+    let sole = compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(sole["expired"]["duties"]["segments"], 1);
+    assert!(sole["retained_bytes"]["duties"].as_u64().unwrap() > 8);
+    assert_eq!(f.get(&ids[1]).unwrap().id, ids[1]);
+    f.archive_duties(1);
+    assert_eq!(f.get(&ids[1]).unwrap_err().reason, Reason::NotFound);
+    // Failed publication leaves one unlisted segment, reused by the retry.
+    f.duty();
+    let previous = block_publication(&f);
+    let next = f.stream("duties").next;
+    assert_eq!(
+        compact::run(&f.store, &f.team, None).unwrap_err().reason,
+        Reason::StoreWriteFailed
+    );
+    assert!(f.segment("duties", next).exists());
+    unblock_publication(&f, &previous);
+    compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(f.stream("duties").segments[0].n, next);
+}
+
+#[test]
+fn automatic_compaction_accepts_more_than_the_threshold() {
+    let f = Fixture::new();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            for _ in 0..65 {
+                terminal(st, &f.root, &f.worker);
+            }
+            st.records.clear();
+            Ok(())
+        })
+        .unwrap();
+    compact::auto(&f.store, &f.team, None);
+    let state = f.store.read_current().unwrap();
+    assert!(state.duties.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.path("duties"))
+            .unwrap()
+            .lines()
+            .count(),
+        65
+    );
+}
+
+#[test]
+fn maintenance_only_touches_caller_and_streams_with_new_rows() {
+    let f = Fixture::with_limit(2048);
+    let (other_root, other_worker, other_team) = f
+        .store
+        .transact(CLI_DEADLINE, |st| {
+            let actors = seed(st, "other");
+            terminal(st, &actors.0, &actors.1);
+            st.records.clear();
+            let record_id = st.mint("r");
+            st.records.push(Record {
+                id: record_id,
+                team: actors.2.clone(),
+                kind: RecordKind::Note,
+                author: actors.0.member.clone(),
+                refs: vec![],
+                text: "old record".into(),
+                at: 1,
+            });
+            Ok(actors)
+        })
+        .unwrap();
+    compact::run(&f.store, &f.team, None).unwrap();
+    let base = f
+        .store
+        .home()
+        .join("archive")
+        .join(&other_team)
+        .join("records.jsonl");
+    fs::write(&base, b"damaged").unwrap();
+    let foreign_duty_extra = base.with_file_name("duties.99.jsonl");
+    fs::write(&foreign_duty_extra, b"unlisted foreign duty").unwrap();
+    let extra = base.with_extension("99.jsonl");
+    fs::write(&extra, b"unlisted foreign history").unwrap();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            terminal(st, &other_root, &other_worker);
+            st.records.clear();
+            Ok(())
+        })
+        .unwrap();
+    let archived = f.store.read_current().unwrap().archives[&other_team]
+        .records
+        .clone();
+    let result = compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(result["duties"], 1);
+    assert_eq!(result["records"], 0);
+    assert_eq!(
+        fs::read(&foreign_duty_extra).unwrap(),
+        b"unlisted foreign duty"
+    );
+    assert_eq!(fs::read(&base).unwrap(), b"damaged");
+    assert_eq!(fs::read(&extra).unwrap(), b"unlisted foreign history");
+    assert_eq!(
+        f.store.read_current().unwrap().archives[&other_team].records,
+        archived
+    );
+    // A caller-team maintenance pass must still detect its own damaged archive.
+    assert_eq!(
+        compact::run(&f.store, &other_team, None)
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+}
+
+#[test]
+fn invalid_segment_bookkeeping_refuses_lookup_and_maintenance() {
+    for damage in ["next-zero", "next-reused", "inverted", "lo-only", "hi-only"] {
+        let f = Fixture::with_limit(2048);
+        let ids = f.archive_duties(1);
+        let original = fs::read(f.path("duties")).unwrap();
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                let stream = &mut st.archives.get_mut(&f.team).unwrap().duties;
+                match damage {
+                    "next-zero" => stream.next = 0,
+                    "next-reused" => stream.next = 1,
+                    "inverted" => {
+                        stream.segments[0].lo = Some(2);
+                        stream.segments[0].hi = Some(1);
+                    }
+                    "lo-only" => stream.segments[0].hi = None,
+                    _ => stream.segments[0].lo = None,
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = f.store.read_current().unwrap();
+        assert_eq!(
+            f.get(&ids[0]).unwrap_err().reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        assert_eq!(
+            compact::run(&f.store, &f.team, None).unwrap_err().reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        assert_eq!(f.store.read_current().unwrap(), before);
+        assert_eq!(fs::read(f.path("duties")).unwrap(), original);
+    }
+}
+
+#[test]
+fn duty_bounds_cover_out_of_order_appends() {
+    let f = Fixture::new();
+    let ids = f.archive_duties(1);
+    let original = f.get(&ids[0]).unwrap();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            for id in ["d-1", "d-999999"] {
+                let mut recovered = original.clone();
+                recovered.id = id.into();
+                st.duties.insert(id.into(), recovered);
+            }
+            Ok(())
+        })
+        .unwrap();
+    compact::run(&f.store, &f.team, None).unwrap();
+    let stream = f.stream("duties");
+    assert_eq!(stream.segments.len(), 1);
+    assert_eq!(
+        (stream.segments[0].lo, stream.segments[0].hi),
+        (Some(1), Some(999999))
+    );
+    for id in [&ids[0], "d-1", "d-999999"] {
+        assert_eq!(f.get(id).unwrap().id, id);
     }
 }

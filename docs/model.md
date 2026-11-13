@@ -3,8 +3,8 @@
 This is the contract for what Gaebu stores and prints. The Rust types in
 `src/model.rs`, `src/schedule.rs` and `src/card.rs` are its source of truth; this page explains
 them. The JSON in `~/.gaebu/state.json` is exactly their serde form, with
-`schema_version: 4`. A schema-1, schema-2 or schema-3 file is migrated on first write (see
-[Schema 4 migration](#schema-4-migration)).
+`schema_version: 5`. Schema 1–4 files migrate on first write (see
+[Schema 5 migration](#schema-5-migration)).
 
 ## Vocabulary
 
@@ -243,9 +243,11 @@ still has that token.
 ~/.gaebu/state.v1.json         the schema-1 original, kept once by the migration
 ~/.gaebu/state.v2.json         the schema-2 original, kept once by the migration
 ~/.gaebu/state.v3.json         the schema-3 original, kept once by the migration
+~/.gaebu/state.v4.json         the schema-4 original, kept once by the migration
 ~/.gaebu/archive/<team>/duties.jsonl      retired full duty contracts
 ~/.gaebu/archive/<team>/escalations.jsonl retired closed questions
 ~/.gaebu/archive/<team>/records.jsonl     retired team records
+~/.gaebu/archive/<team>/<stream>.<n>.jsonl subsequent segments (n >= 2)
 <project>/schedule.md          canonical operational work and review evidence
 <project>/schedule.md.lock     sidecar OS lock, never deleted
 ~/.gaebu/state.lock            OS lock, never deleted
@@ -259,8 +261,13 @@ still has that token.
 
 ## Runtime history
 
-`State.archives[team]` contains the committed byte lengths `duties`,
-`escalations` and `records` of that team's JSONL files. Runtime compaction
+`State.archives[team]` contains a `duties`, `escalations` and `records` stream,
+each shaped as `{"next":3,"segments":[{"n":2,"bytes":5120,"lo":310,"hi":480}]}`.
+Segment 1 uses `<stream>.jsonl`; subsequent segments use `<stream>.<n>.jsonl`.
+`next` increases monotonically even when every retained segment expires. Only
+duties carry numeric ID suffix bounds, which may overlap and need not follow
+retirement order. Adopted legacy segments have no bounds and remain unbounded
+when appended to. Runtime compaction
 keeps terminal duties for at least 24 hours after `updated_at`, closed
 escalations for 24 hours after closure, and records for one hour. Duties
 covered by any human hold or referenced by an open escalation remain hot.
@@ -281,41 +288,62 @@ open escalations still apply to that exception.
 Automatic compaction runs after a member operation has committed, in a
 separate transaction, when at least 64 eligible entities exist across the
 collections and teams. A failure prints a warning without failing the member
-operation. Explicit compaction uses a threshold of one and reports errors.
+operation. Explicit compaction also maintains all three streams of the caller's
+team without new rows, normalizes expired prefixes, trims unpublished tails,
+enforces the limit, and removes unlisted segment files. It reports I/O errors;
+a failed expiry unlink or sync is reported as deferred enforcement.
 Root operations and hooks do not trigger compaction. Neither path takes a
 Schedule lock inside `state.lock`.
 
 Explicit compaction checks the actor on entry only: like automatic compaction, it maintains history without changing live work or authority, while eligibility is rechecked under `state.lock`.
 
-Archive appends first check that the committed prefix exists, is long enough,
-and ends in a newline. They truncate only its uncommitted suffix, append full
-entities, and sync files and directory links before publishing boundaries
-and removing hot entries in one state commit. Appends do not reparse old
-entries. A failed state publication leaves hot entries authoritative and an
-uncommitted suffix that the next append discards.
+Each team's stream has its own size limit, 64 MiB by default, configured with
+`GAEBU_ARCHIVE_LIMIT_MIB` (integer >= 1). Before appending, the last segment must
+exist, be long enough and end at a committed newline. Its unpublished tail is
+trimmed and synced on every pass, including rollover and idle maintenance.
+If that segment already contains at least one eighth of the limit, a new segment
+starts at `next`. Appends sync files and directory links before publishing
+boundaries and removing hot entries in one state commit; old rows are not reparsed.
+The writer deletes oldest segments while their total exceeds the limit or their
+count exceeds 16, keeping the newest even if oversized. Every unlink is followed
+by a directory sync before its metadata is removed. History deletion is irreversible.
+
+A missing oldest prefix, including the whole list, means expired history. A missing
+middle or last segment while older files remain is `store_corrupt`. Writers sync
+the directory before normalizing missing prefixes. Failed publication leaves hot
+entries authoritative, possibly deleted oldest files and unlisted new files.
+The next write tolerates expired prefixes, truncates unpublished tails and reuses
+an unpublished number; explicit maintenance removes unlisted files even after repair.
+Published segment numbers are never reused within surviving generations.
+
+Results retain the `duties`, `escalations`, `records` archived row counts and add
+`expired.<stream> = {segments, bytes}`, `retained_bytes.<stream>`, `limit_bytes`,
+and `over_limit = [{team, stream, bytes, limit_bytes}]`. Byte totals aggregate
+maintained streams across affected teams; the limit applies to each team's stream.
+`expiry_deferred.<stream>` appears only for failed unlink/sync work. A sole oversized
+segment remains visible in `over_limit` until a successor append permits its expiry.
 
 `duty show` and MCP `duty_get` return hot contracts directly from the caller's
 snapshot with its team authorization check, without acquiring `state.lock`.
-Only a hot miss acquires that lock, re-reads the current state and caller's
-team, and chooses a hot contract restored by repair or streams the caller
-team's committed duty archive. Archive reads return the last matching ID and
-validate every line in the committed region. Missing, short, malformed or unterminated
-committed duty data returns `store_corrupt`; suffix bytes are ignored.
-A foreign hot duty retains the existing `no_grant` refusal. A foreign archived
-duty returns `not_found`, since only the caller team's archive is searched.
-Mutating an archived duty or escalation returns `not_found` with archive
-guidance. Repair restores earlier boundaries and the later-retired entities
-hot from the previous state; archive fallback holds the same lock as repair and
-truncation, so stale snapshots cannot select obsolete archive boundaries.
-Hot snapshot reads retain their existing observation-time authorization.
+Only a hot miss acquires that lock, rereads the current state and caller's team,
+and chooses a hot contract restored by repair or searches retained duty segments
+newest first. Bounds excluding an ID skip parsing that segment. Every visited
+segment is parsed completely and checked against the caller's team. The last
+matching row within the newest matching segment wins. Short, malformed or
+unterminated committed data is `store_corrupt`; unpublished suffix bytes are ignored.
+Expired or unknown duties return `not_found` with
+"duty not found in hot state or retained team archive". A foreign hot duty retains
+the existing `no_grant` refusal; foreign archived duties return `not_found`.
+Mutating archived duties or escalations retains the archive guidance refusal.
+Archive fallback holds the same lock as repair, append and expiry, so stale snapshots
+cannot select obsolete boundaries. Hot reads retain observation-time authorization.
 
-Archive files grow with history. Length/newline validation before append is
-constant in archive size, but full duty lookup scans that team's committed
-history under the state lock. The CLI lock/publication budget is five seconds;
-synchronous archive I/O and parsing cannot be interrupted. Large histories or
-slow disks can exceed that budget and delay other writers. The 10,000-entry
-`runtime_compact::archive_large_cost` test reports observed costs on its host;
-it does not establish a portable latency bound.
+The limit bounds retained archive I/O, except a sole oversized segment, deferred
+expiry and unpublished files left by failed publication. A full lookup still parses
+candidate segments under the state lock; synchronous I/O cannot be interrupted by
+the CLI's five-second lock/publication budget. The 10,000-entry
+`runtime_compact::archive_large_cost` test reports observed host costs, not a portable
+latency bound.
 
 Schedule documents use a separate schema 2 archive head: committed bytes, rows,
 SHA-256 chain and allocator maxima. Tombstones are retained only for live
@@ -328,19 +356,22 @@ schema 1 by rewriting exactly its verified tombstone rows. A 0.4.0 binary refuse
 the `archive` field. See [Schedule storage](schedules.md) for the commitment,
 recovery, locking and compatibility contract.
 
-## Schema 4 migration
+## Schema 5 migration
 
-The first write or repair of schema 1/2/3 backs up the exact original bytes to
-`state.v1.json`, `state.v2.json` or `state.v3.json` without replacing a previous backup. Migration
-publishes schema 4 to `state.prev.json` and then `state.json` before running the
-requested operation. A crash repeats the migration safely; older binaries cannot
+The first write or repair of schema 1/2/3/4 backs up the exact original bytes to
+`state.v1.json`, `state.v2.json`, `state.v3.json` or `state.v4.json` without replacing
+a previous backup. Migration publishes schema 5 to `state.prev.json` and then
+`state.json` before running the requested operation. A crash repeats the migration safely; older binaries cannot
 fall back to an older generation and ignore Schedule guards.
 
 Schema 1 still receives evidence strength, notice deduplication and escalation
 normalization. Legacy schemas gain default Schedule/archive fields and a stable
 runtime origin if absent. Older closed escalations default `closed_at` to null.
 The requesting operation runs only after migration commits. Older binaries
-refuse schema 4 rather than dropping archive boundaries on their next write.
+refuse schema 5 rather than dropping segment boundaries on their next write.
+Schema 4's nonzero stream length becomes segment 1 with that committed byte count
+and `next: 2`, without lookup bounds; zero becomes an empty list with `next: 1`.
+Archive files are adopted in place without rewriting, renaming or copying.
 
 The schema probe precedes full decoding. Future schemas return
 `store_unsupported` and never fall back or get overwritten by repair. Install the

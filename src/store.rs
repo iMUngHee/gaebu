@@ -7,7 +7,8 @@
 //! state.json            the whole State, replaced atomically
 //! state.prev.json       the previous generation (recovery)
 //! state.v1.json         the schema-1 original, kept by the v2 migration
-//! state.v3.json         the schema-3 original, kept by the v4 migration
+//! state.v3.json         the schema-3 original, kept by migration
+//! state.v4.json         the schema-4 original, kept by the v5 migration
 //! archive/<team>/{duties,escalations,records}.jsonl  committed history
 //! state.lock            OS lock (never deleted)
 //! sessions/<id>/events.jsonl    SessionEvent lines (hook writes)
@@ -507,9 +508,54 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
     };
     let probe: Probe = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
     match probe.schema_version {
-        version @ (1..=3) => {
+        version @ (1..=4) => {
             // Legacy additions default; schema 1 also needs notice/evidence normalization.
-            let mut state: State = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(corrupt_error)?;
+            if version == 4 {
+                #[derive(Deserialize)]
+                struct LegacyArchives {
+                    duties: u64,
+                    escalations: u64,
+                    records: u64,
+                }
+                let legacy: std::collections::BTreeMap<String, LegacyArchives> =
+                    serde_json::from_value(
+                        value
+                            .get("archives")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    )
+                    .map_err(corrupt_error)?;
+                let adopt = |bytes| crate::model::ArchiveStream {
+                    next: if bytes == 0 { 1 } else { 2 },
+                    segments: if bytes == 0 {
+                        Vec::new()
+                    } else {
+                        vec![crate::model::ArchiveSegment {
+                            n: 1,
+                            bytes,
+                            lo: None,
+                            hi: None,
+                        }]
+                    },
+                };
+                let archives: std::collections::BTreeMap<_, _> = legacy
+                    .into_iter()
+                    .map(|(team, a)| {
+                        (
+                            team,
+                            crate::model::ArchiveLengths {
+                                duties: adopt(a.duties),
+                                escalations: adopt(a.escalations),
+                                records: adopt(a.records),
+                            },
+                        )
+                    })
+                    .collect();
+                value["archives"] = serde_json::to_value(archives).map_err(corrupt_error)?;
+            }
+            let mut state: State = serde_json::from_value(value).map_err(corrupt_error)?;
             if version == 1 {
                 migrate_v1(&mut state);
             }

@@ -392,7 +392,7 @@ fn legacy_sighting_defaults_pending_throttle_fields() {
 // ----- schema v2 migration (plan gaebu-v0-2, Decisions 12–12d) -----
 
 const V1: &str = include_str!("fixtures/state-v1.json");
-const FUTURE: &str = r#"{"schema_version":5,"teams":"a newer shape this model cannot parse"}"#;
+const FUTURE: &str = r#"{"schema_version":6,"teams":"a newer shape this model cannot parse"}"#;
 
 fn json(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
@@ -433,16 +433,16 @@ fn schema_3_migrates_with_exact_backup_and_archive_defaults() {
     let original = serde_json::to_vec(&legacy).unwrap();
     fs::write(home.0.join("state.json"), &original).unwrap();
     let store = home.store();
-    assert_eq!(store.read_view().unwrap().schema_version, 4);
+    assert_eq!(store.read_view().unwrap().schema_version, 5);
     store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
     let state = store.read_current().unwrap();
-    assert_eq!(state.schema_version, 4);
+    assert_eq!(state.schema_version, 5);
     assert_eq!(state.runtime_id, "original-runtime");
     assert_eq!(state.next_id, 50);
     assert_eq!(state.rev, 10);
     assert!(state.archives.is_empty());
     assert_eq!(fs::read(home.0.join("state.v3.json")).unwrap(), original);
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 4);
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 5);
 }
 
 #[test]
@@ -732,4 +732,146 @@ fn notice_serializes_target_as_to_session() {
     assert_eq!(stored["to_session"], "fasa");
     assert!(stored.get("target").is_none(), "{stored}");
     assert_eq!(home.store().read().unwrap().outbox[0].target, "fasa");
+}
+
+#[test]
+fn state_v4_archives_become_segment_one() {
+    use gaebu::{
+        authz, compact,
+        model::*,
+        ops::{self, DutySpec, SeedSpec},
+    };
+    let home = Home::new();
+    let mut state = State::default();
+    ops::dev_seed(
+        &mut state,
+        1,
+        &SeedSpec {
+            team: "legacy".into(),
+            project: "legacy".into(),
+            commander_alias: "root".into(),
+            commander_session: Some("root".into()),
+            commander_tool: Some(Tool::Codex),
+            members: vec![("worker".into(), Some("worker".into()), Some(Tool::Codex))],
+        },
+    )
+    .unwrap();
+    let root = Actor {
+        member: authz::member_for_session(&state, "root")
+            .unwrap()
+            .id
+            .clone(),
+        session_id: "root".into(),
+    };
+    let worker = authz::member_for_session(&state, "worker")
+        .unwrap()
+        .id
+        .clone();
+    let id = ops::duty_issue(
+        &mut state,
+        1,
+        &root,
+        &worker,
+        DutySpec {
+            outcome: "legacy contract".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .ids[0]
+        .clone();
+    let mut original_duty = state.duties.remove(&id).unwrap();
+    original_duty.status = DutyStatus::Done;
+    let team = original_duty.team.clone();
+    state.records.clear();
+    state.outbox.clear();
+    let dir = home.0.join("archive").join(&team);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("duties.jsonl");
+    let mut archive = serde_json::to_vec(&original_duty).unwrap();
+    archive.push(b'\n');
+    fs::write(&path, &archive).unwrap();
+    fs::write(dir.join("escalations.jsonl"), b"{}\n").unwrap();
+    let mut legacy = serde_json::to_value(&state).unwrap();
+    legacy["schema_version"] = 4.into();
+    legacy["archives"] = serde_json::json!({team.clone(): {"duties": archive.len(), "escalations": 3, "records": 0},
+        "empty": {"duties": 0, "escalations": 0, "records": 0}});
+    let original = serde_json::to_vec(&legacy).unwrap();
+    fs::write(home.0.join("state.json"), &original).unwrap();
+    let store = home.store();
+    let view = store.read_view().unwrap();
+    let adopted = &view.archives[&team];
+    assert_eq!(
+        adopted.duties,
+        ArchiveStream {
+            next: 2,
+            segments: vec![ArchiveSegment {
+                n: 1,
+                bytes: archive.len() as u64,
+                lo: None,
+                hi: None
+            }]
+        }
+    );
+    assert_eq!(adopted.escalations.segments[0].bytes, 3);
+    assert_eq!(adopted.records, ArchiveStream::default());
+    assert_eq!(view.archives["empty"], ArchiveLengths::default());
+    assert_eq!(
+        compact::full_duty(&store, &view, "worker", &id).unwrap(),
+        original_duty
+    );
+    assert_eq!(fs::read(home.0.join("state.json")).unwrap(), original);
+    store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
+    assert_eq!(fs::read(home.0.join("state.v4.json")).unwrap(), original);
+    assert_eq!(fs::read(&path).unwrap(), archive);
+    assert_eq!(store.read_current().unwrap().schema_version, 5);
+    let mut fresh = original_duty.clone();
+    fresh.id = "d-9999".into();
+    store
+        .transact(Duration::from_secs(5), |st| {
+            st.duties.insert(fresh.id.clone(), fresh.clone());
+            Ok(())
+        })
+        .unwrap();
+    compact::run(&store, &team, None).unwrap();
+    let stream = &store.read_current().unwrap().archives[&team].duties;
+    assert_eq!(stream.next, 2);
+    assert_eq!(stream.segments.len(), 1);
+    assert_eq!(stream.segments[0].lo, None);
+    assert_eq!(stream.segments[0].hi, None);
+    let new_bytes = fs::read(&path).unwrap();
+    assert_eq!(&new_bytes[..archive.len()], archive);
+    for duty in [&original_duty, &fresh] {
+        assert_eq!(
+            &compact::full_duty(&store, &store.read_view().unwrap(), "worker", &duty.id).unwrap(),
+            duty
+        );
+    }
+    let tiny = Store::open_with_archive_limit(&home.0, 8).unwrap();
+    let maintenance = compact::run(&tiny, &team, None).unwrap();
+    assert_eq!(maintenance["retained_bytes"]["duties"], new_bytes.len());
+    assert_eq!(maintenance["limit_bytes"], 8);
+    assert!(maintenance.get("expiry_deferred").is_none());
+    assert_eq!(fs::read(&path).unwrap(), new_bytes);
+    fresh.id = "d-10000".into();
+    tiny.transact(Duration::from_secs(5), |st| {
+        st.duties.insert(fresh.id.clone(), fresh.clone());
+        Ok(())
+    })
+    .unwrap();
+    compact::run(&tiny, &team, None).unwrap();
+    assert!(!path.exists());
+    assert_eq!(
+        store.read_current().unwrap().archives[&team]
+            .duties
+            .segments[0]
+            .n,
+        2
+    );
+    assert_eq!(
+        compact::full_duty(&store, &store.read_view().unwrap(), "worker", &id)
+            .unwrap_err()
+            .reason,
+        Reason::NotFound
+    );
 }
