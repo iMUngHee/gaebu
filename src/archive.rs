@@ -227,7 +227,6 @@ fn inspect_heal_with<S: Segment>(
 }
 
 /// Read-only checks; the returned index excludes every segment heal may expire.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn precheck_heal<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
     let (retained, _) = inspect_heal_with(base, segments, open_optional)?;
     if let Some(last) = segments.last().filter(|_| retained < segments.len()) {
@@ -240,7 +239,6 @@ pub(crate) fn precheck_heal<S: Segment>(base: &Path, segments: &[S]) -> Result<u
 }
 
 #[derive(Debug, Default)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct Healed {
     pub segments: Vec<u64>,
     pub unlisted_files: u64,
@@ -254,7 +252,6 @@ std::thread_local! {
     pub(crate) static FAILED_HEAL_SYNC: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Healed> {
     #[cfg(test)]
     let mut calls = 0;

@@ -312,3 +312,44 @@ lookups can hold this lock long enough for another operation's 5-second wait
 budget to expire. Unix writes sync archive files and directory links before
 publishing state, and sync directories after atomic replacements. Windows
 retains file-sync/rename durability; physical power-loss behavior is untested.
+
+### Healing an archive hole
+
+`gaebu schedule archive --heal` is an explicit, destructive recovery operation for
+an absent listed segment behind a present older file. It deletes every segment
+file numbered below the newest missing listed segment, including unlisted files,
+oldest first. The surviving files become a valid retained suffix and the missing
+prefix is normalized as expired. A missing last segment can expire the whole list;
+future appends still use the monotonic `next`. Back up the files first when their
+history matters: the command cannot distinguish reordered deletions after a power
+loss from actual loss of a middle segment.
+
+The current commander or Schedule manager can request it through CLI or MCP
+`schedule_archive {"heal": true}`. Without the flag, holes remain `store_corrupt`;
+automatic sweeps never heal. Before deleting, the command validates metadata and
+all remaining rows, digests, chain commitments, bounds and cross-segment duplicate
+item IDs/dispatch tokens. Damage unrelated to the hole aborts before any unlink.
+Schema 1 migration ignores heal and reports zero removals; schema 2 adopts in place.
+
+`healed` reports listed `segments`, committed `bytes` and `rows`, plus separate
+`unlisted_files` and actual `unlisted_bytes`. `expired` counts already-missing
+segments and normal limit expiry, excluding listed entries counted in `healed`.
+After a published normalization their segment/row sums equal the bookkeeping that
+left the list. Removed detail is expired, never evidence of completion; retained
+complete tombstones still satisfy their dependants.
+
+A failed sync or unlink stops healing and returns success with `heal_deferred`
+and observed `hole_remaining`. The pass retires nothing and leaves the document
+unchanged; `healed` still reports actual deletions. `hole_remaining` can be false
+when only the final directory sync failed. Retry `--heal`; a plain run works once
+the hole is gone. A later save error includes the number of files already removed
+and, for an incomplete heal, the reason and retry instruction. Those files remain
+removed; a retry counts them as already expired.
+
+Runtime `gaebu compact --heal` / MCP `compact {"heal": true}` requires the commander
+and targets the caller team's three streams. All streams are pre-checked before
+the first deletion. A partial heal skips only its stream and preserves its hot
+candidates; other streams can still be maintained. Runtime reports use the same
+listed/unlisted distinction, with committed bytes instead of Schedule row counts.
+Windows directory flushing remains pending in `PLATFORMS.md`; this command offers
+explicit recovery without changing the storage schema.

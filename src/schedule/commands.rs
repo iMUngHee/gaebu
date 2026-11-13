@@ -27,6 +27,8 @@ pub(super) struct Input {
     #[serde(default)]
     pub all: bool,
     #[serde(default)]
+    pub heal: bool,
+    #[serde(default)]
     pub explicit: bool,
     #[serde(skip)]
     pub owner_bu_set: bool,
@@ -112,6 +114,9 @@ pub enum ScheduleCmd {
         session: Option<String>,
     },
     Archive {
+        /// Delete older history to turn a missing-segment hole into an expired prefix.
+        #[arg(long)]
+        heal: bool,
         #[arg(long)]
         expected_revision: Option<u64>,
     },
@@ -216,7 +221,7 @@ pub fn tools() -> Vec<Value> {
     let spec = json!({"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":string},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false});
     [
         ("schedule_show","Read compact open work, all history, or one full Schedule item",json!({"item":string,"all":{"type":"boolean"}}),vec![]),
-        ("schedule_archive","Archive eligible terminal Schedule items and enforce the byte limit, permanently deleting old segments. expired reports removed segments/rows; retained_bytes and limit_bytes show bounds; expiry_deferred reports deletion failures.",json!({"expected_revision":revision}),vec![]),
+        ("schedule_archive","Archive eligible terminal Schedule items and enforce the byte limit, permanently deleting old segments. expired reports removed segments/rows; retained_bytes and limit_bytes show bounds; expiry_deferred reports deletion failures. heal=true explicitly deletes older history to repair holes; healed separates listed and unlisted removals, heal_deferred/hole_remaining report partial recovery.",json!({"expected_revision":revision,"heal":{"type":"boolean"}}),vec![]),
         ("schedule_move","Move the commander team's missing Schedule registration to an existing file",json!({"path":string}),vec!["path"]),
         ("schedule_add","Add an operational work item without changing PM",json!({"title":string,"scope":strings,"owner_bu":{"type":["string","null"]},"priority":{"type":"integer","minimum":0,"maximum":65535},"depends_on":strings,"pm_ref":pm,"expected_revision":revision}),vec!["title","scope"]),
         ("schedule_update","Update operational priority or an undispatched item contract",json!({"item":string,"title":string,"scope":strings,"owner_bu":{"type":["string","null"]},"priority":{"type":"integer","minimum":0,"maximum":65535},"depends_on":strings,"pm_ref":pm,"expected_revision":revision}),vec!["item"]),
@@ -323,8 +328,11 @@ pub fn run_cli(cmd: ScheduleCmd, json_output: bool, pager: &dyn Pager) -> Result
             }
             call(&store, pager, &caller, "schedule_show", &args)
         }
-        ScheduleCmd::Archive { expected_revision } => {
-            let mut args = json!({});
+        ScheduleCmd::Archive {
+            expected_revision,
+            heal,
+        } => {
+            let mut args = json!({"heal":heal});
             if let Some(revision) = expected_revision {
                 args["expected_revision"] = json!(revision);
             }

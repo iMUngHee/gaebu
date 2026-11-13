@@ -2912,3 +2912,371 @@ fn schedule_next_action_follows_the_most_urgent_stage() {
     assert_eq!(item["stage"], "ready");
     assert_eq!(shown["next_action"], item["next_action"]);
 }
+
+fn heal_fixture(count: usize) -> (Fixture, Vec<String>) {
+    let f = Fixture::with_limit(32 * 1024);
+    let ids = (0..count)
+        .map(|n| {
+            let id = f.add(&format!("heal row {n}: {}", "x".repeat(5000)), &[]);
+            f.complete(&id);
+            id
+        })
+        .collect();
+    assert_eq!(f.document().archive.as_ref().unwrap().segments.len(), count);
+    (f, ids)
+}
+
+#[test]
+fn schedule_archive_heal_recovers_a_hole() {
+    let (f, ids) = heal_fixture(5);
+    let mut before = f.document();
+    let head = before.archive.as_ref().unwrap().clone();
+    // Keep one complete tombstone referenced while its detail is healed away.
+    let entry: Value =
+        serde_json::from_slice(&fs::read(f.segment_path(head.segments[0].n)).unwrap()).unwrap();
+    before.retired.push(schedule::Retired {
+        id: ids[0].clone(),
+        state: schedule::RetiredState::Complete,
+        digest: entry["digest"].as_str().unwrap().into(),
+        last_dispatch: 0,
+        depends_on: vec![],
+    });
+    f.write(&before);
+    let anchor = f.add("keep completion evidence", &[&ids[0]]);
+    fs::remove_file(f.segment_path(head.segments[2].n)).unwrap();
+    let saved = fs::read(&f.path).unwrap();
+    assert_eq!(
+        f.call("schedule_archive", json!({})).unwrap_err().reason,
+        Reason::StoreCorrupt
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), saved);
+    let result = f.call("schedule_archive", json!({"heal":true})).unwrap();
+    assert_eq!(result["healed"]["segments"], 2);
+    assert_eq!(result["healed"]["rows"], 2);
+    assert_eq!(result["expired"]["segments"], 1);
+    let all = f.call("schedule_show", json!({"all":true})).unwrap();
+    assert_eq!(all["counts"]["expired"], 3);
+    assert_eq!(all["counts"]["retired"], 2);
+    assert_eq!(
+        f.document().archive.as_ref().unwrap().base,
+        head.segments[2].chain
+    );
+    assert!(
+        f.call("schedule_show", json!({"item":ids[1]}))
+            .unwrap_err()
+            .message
+            .contains("expired from the archive")
+    );
+    assert_eq!(
+        f.call(
+            "schedule_add",
+            json!({"title":"refuse expired","scope":[],"depends_on":[ids[1]]})
+        )
+        .unwrap_err()
+        .reason,
+        Reason::Conflict
+    );
+    f.call(
+        "schedule_complete",
+        json!({"item":anchor,"evidence":"dependency remains complete"}),
+    )
+    .unwrap();
+    let second = f.call("schedule_archive", json!({"heal":true})).unwrap();
+    assert_eq!(second["healed"]["segments"], 0);
+}
+
+#[test]
+fn heal_reports_listed_and_unlisted_separately() {
+    let (f, _) = heal_fixture(4);
+    let mut document = f.document();
+    let head = document.archive.as_mut().unwrap();
+    let expired: Vec<_> = head.segments.drain(..2).collect();
+    head.base = expired[1].chain.clone();
+    head.expired_rows = 2;
+    fs::remove_file(f.segment_path(1)).unwrap();
+    fs::remove_file(f.segment_path(4)).unwrap();
+    let unlisted_bytes = fs::metadata(f.segment_path(2)).unwrap().len();
+    let committed = head.segments[0].bytes;
+    f.write(&document);
+    let result = f.call("schedule_archive", json!({"heal":true})).unwrap();
+    assert_eq!(
+        result["healed"],
+        json!({"segments":1,"bytes":committed,"rows":1,"unlisted_files":1,"unlisted_bytes":unlisted_bytes})
+    );
+    assert_eq!(result["expired"]["segments"], 1);
+    assert!(f.document().archive.unwrap().segments.is_empty());
+}
+
+#[test]
+fn heal_handles_missing_last_segment() {
+    let (f, _) = heal_fixture(3);
+    let before = f.document().archive.unwrap();
+    fs::remove_file(f.segment_path(before.segments.last().unwrap().n)).unwrap();
+    let result = f.call("schedule_archive", json!({"heal":true})).unwrap();
+    assert_eq!(result["healed"]["segments"], 2);
+    assert_eq!(result["expired"]["segments"], 1);
+    let empty = f.document().archive.unwrap();
+    assert!(empty.segments.is_empty());
+    assert_eq!(empty.next, before.next);
+    let next = f.add("next", &[]);
+    f.complete(&next);
+    assert_eq!(f.document().archive.unwrap().segments[0].n, before.next);
+}
+
+#[test]
+fn heal_does_not_mask_other_corruption() {
+    for damage in ["next", "bounds", "short", "newline", "chain", "digest"] {
+        let (f, _) = heal_fixture(4);
+        let mut document = f.document();
+        let head = document.archive.as_mut().unwrap();
+        let first = f.segment_path(head.segments[0].n);
+        let missing = f.segment_path(head.segments[1].n);
+        let last = f.segment_path(head.segments[3].n);
+        fs::remove_file(missing).unwrap();
+        match damage {
+            "next" => head.next = head.segments.last().unwrap().n,
+            "bounds" => head.segments[3].lo = head.segments[3].hi + 1,
+            "short" => {
+                let mut bytes = fs::read(&last).unwrap();
+                bytes.pop();
+                fs::write(&last, bytes).unwrap();
+            }
+            "newline" => {
+                let mut bytes = fs::read(&last).unwrap();
+                *bytes.last_mut().unwrap() = b'!';
+                fs::write(&last, bytes).unwrap();
+            }
+            "chain" => head.segments[3].chain = "a".repeat(64),
+            "digest" => {
+                let bytes = fs::read_to_string(&last).unwrap();
+                let entry: Value = serde_json::from_str(&bytes).unwrap();
+                let digest = entry["digest"].as_str().unwrap();
+                let replacement = if digest.starts_with('0') { "1" } else { "0" };
+                let changed =
+                    bytes.replacen(digest, &format!("{}{}", replacement, &digest[1..]), 1);
+                fs::write(&last, changed).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        f.write(&document);
+        let original = fs::read(&first).unwrap();
+        let result = f
+            .call("schedule_archive", json!({"heal":true}))
+            .unwrap_err();
+        assert_eq!(
+            result.reason,
+            if matches!(damage, "next" | "bounds") {
+                Reason::InvalidArgument
+            } else {
+                Reason::StoreCorrupt
+            },
+            "{damage}"
+        );
+        assert_eq!(fs::read(first).unwrap(), original, "{damage}");
+        assert!(last.exists(), "{damage}");
+    }
+}
+
+#[test]
+fn automatic_paths_never_heal() {
+    let (f, _) = heal_fixture(3);
+    let before = f.document().archive.unwrap();
+    fs::remove_file(f.segment_path(before.segments[1].n)).unwrap();
+    let old = fs::read(f.segment_path(before.segments[0].n)).unwrap();
+    let item = f.add("automatic defers", &[]);
+    f.complete(&item);
+    assert_eq!(f.document().archive.unwrap(), before);
+    assert!(
+        f.document()
+            .items
+            .iter()
+            .any(|i| i.id == item && i.completion.is_some())
+    );
+    assert_eq!(fs::read(f.segment_path(before.segments[0].n)).unwrap(), old);
+}
+
+#[test]
+fn heal_on_adopted_archives_is_a_noop() {
+    for schema in [1, 2] {
+        let (f, _) = heal_fixture(1);
+        let mut document = f.document();
+        let head = document.archive.as_ref().unwrap().clone();
+        if schema == 1 {
+            let entry: Value =
+                serde_json::from_slice(&fs::read(f.archive_path()).unwrap()).unwrap();
+            document.retired = vec![schedule::Retired {
+                id: entry["item"]["id"].as_str().unwrap().into(),
+                state: schedule::RetiredState::Complete,
+                digest: entry["digest"].as_str().unwrap().into(),
+                last_dispatch: 0,
+                depends_on: vec![],
+            }];
+            document.schema_version = 1;
+            document.archive = None;
+            f.write(&document);
+        } else {
+            let mut old = serde_json::to_value(&document).unwrap();
+            old["schema_version"] = json!(2);
+            old["archive"] = json!({"bytes":head.retained_bytes(),"rows":head.retained_rows(),"chain":head.segments[0].chain,"last_item":head.last_item,"last_dispatch":head.last_dispatch});
+            fs::write(
+                &f.path,
+                format!("<!-- gaebu-schedule -->\n```json\n{old}\n```\n"),
+            )
+            .unwrap();
+        }
+        let result = f.call("schedule_archive", json!({"heal":true})).unwrap();
+        assert_eq!(
+            result["healed"],
+            json!({"segments":0,"bytes":0,"rows":0,"unlisted_files":0,"unlisted_bytes":0})
+        );
+        assert_eq!(f.document().schema_version, 3);
+    }
+}
+
+#[test]
+fn heal_precheck_rejects_cross_segment_duplicates() {
+    use sha2::{Digest, Sha256};
+    for duplicate_token in [false, true] {
+        let f = Fixture::with_limit(32 * 1024);
+        for n in 0..4 {
+            let item = f.add(&format!("duplicate test {n}: {}", "x".repeat(5000)), &[]);
+            let issued = f.dispatch(&item, "work").unwrap();
+            f.done(issued["duty"].as_str().unwrap());
+            f.complete(&item);
+        }
+        let mut document = f.document();
+        document.retired.clear();
+        let head = document.archive.as_mut().unwrap();
+        assert_eq!(head.segments.len(), 4);
+        let mut entries: Vec<Value> = head
+            .segments
+            .iter()
+            .map(|s| serde_json::from_slice(&fs::read(f.segment_path(s.n)).unwrap()).unwrap())
+            .collect();
+        if duplicate_token {
+            entries[3]["item"]["dispatches"][0] = entries[2]["item"]["dispatches"][0].clone();
+        } else {
+            entries[3]["item"] = entries[2]["item"].clone();
+        }
+        let mut previous = head.segments[1].chain.clone();
+        for (index, entry) in entries.iter_mut().enumerate().skip(2) {
+            let item: schedule::Item = serde_json::from_value(entry["item"].clone()).unwrap();
+            entry["digest"] =
+                json!(&gaebu::evidence::sha256_hex(&serde_json::to_string(&item).unwrap())[..16]);
+            let bytes = format!("{}\n", entry).into_bytes();
+            let seed: Vec<_> = (0..32)
+                .map(|i| u8::from_str_radix(&previous[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+            let chain = format!("{:x}", Sha256::digest([seed, bytes.clone()].concat()));
+            let number = item.id.strip_prefix("w-").unwrap().parse::<u64>().unwrap();
+            let segment = &mut head.segments[index];
+            segment.bytes = bytes.len() as u64;
+            segment.chain = chain.clone();
+            segment.lo = number;
+            segment.hi = number;
+            fs::write(f.segment_path(segment.n), bytes).unwrap();
+            previous = chain;
+        }
+        fs::remove_file(f.segment_path(head.segments[1].n)).unwrap();
+        let oldest = f.segment_path(head.segments[0].n);
+        let original = fs::read(&oldest).unwrap();
+        f.write(&document);
+        let error = f
+            .call("schedule_archive", json!({"heal":true}))
+            .unwrap_err();
+        assert_eq!(error.reason, Reason::StoreCorrupt);
+        assert_eq!(
+            error.message,
+            if duplicate_token {
+                "duplicate dispatch token"
+            } else {
+                "duplicate archive item id"
+            }
+        );
+        assert_eq!(fs::read(oldest).unwrap(), original);
+    }
+}
+
+#[test]
+#[ignore = "subprocess entry point with isolated environment"]
+fn heal_cli_child() {
+    let args: Vec<_> = std::env::var("GAEBU_TEST_CLI_ARGS")
+        .unwrap()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let expected = std::env::var("GAEBU_TEST_CLI_EXIT")
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert_eq!(
+        gaebu::cli::run_with(args.iter().map(std::ffi::OsString::from), &QuietPager),
+        expected
+    );
+}
+
+#[test]
+fn heal_flag_reaches_both_commands() {
+    for via_cli in [false, true] {
+        let (f, _) = heal_fixture(3);
+        let head = f.document().archive.unwrap();
+        fs::remove_file(f.segment_path(head.segments[1].n)).unwrap();
+        if via_cli {
+            for (flag, expected) in [("", 1), ("--heal", 0)] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", "heal_cli_child", "--nocapture"])
+                    .env("GAEBU_HOME", f.store.home())
+                    .env(
+                        "GAEBU_TEST_CLI_ARGS",
+                        format!("gaebu schedule archive {flag}"),
+                    )
+                    .env("GAEBU_TEST_CLI_EXIT", expected.to_string())
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    text,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if flag == "--heal" {
+                    assert!(text.contains("\"healed\""), "{text}");
+                }
+            }
+        } else {
+            f.store
+                .session("root-session")
+                .update_sighting(|sighting| {
+                    sighting.tool = Some(Tool::Codex);
+                    sighting.last_seen = Some(now_ms());
+                })
+                .unwrap();
+            let result = f.mcp("schedule_archive", json!({"heal":true}));
+            assert_eq!(result["healed"]["segments"], 1);
+            assert_eq!(result["expired"]["segments"], 1);
+        }
+        f.call("schedule_show", json!({"all":true})).unwrap();
+    }
+}
+
+#[test]
+fn heal_preserves_allocator_maxima_from_expired_history() {
+    let mut f = Fixture::with_limit(32 * 1024);
+    let low = f.add(&"l".repeat(5000), &[]);
+    let high = f.add(&"h".repeat(5000), &[]);
+    f.complete(&high);
+    f.complete(&low);
+    f.reopen_limit(8192);
+    f.call("schedule_archive", json!({})).unwrap();
+    let head = f.document().archive.unwrap();
+    assert_eq!(head.expired_rows, 1);
+    assert_eq!(head.last_item, 2);
+    assert_eq!(head.segments[0].hi, 1);
+    let result = f.call("schedule_archive", json!({"heal":true})).unwrap();
+    assert_eq!(result["healed"]["segments"], 0);
+    assert_eq!(
+        f.call("schedule_show", json!({"item":low})).unwrap()["id"],
+        low
+    );
+}

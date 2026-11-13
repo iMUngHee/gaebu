@@ -562,6 +562,7 @@ pub(super) fn operate<T>(
                 Path::new(&reg.path),
                 false,
                 store.archive_limit(),
+                None,
             )?;
         }
         document.save(Path::new(&reg.path), Instant::now() + CLI_DEADLINE)?;

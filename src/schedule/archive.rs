@@ -195,6 +195,7 @@ pub(super) fn sweep(
     schedule_path: &Path,
     strict: bool,
     limit: u64,
+    heal: Option<&mut crate::archive::Healed>,
 ) -> Result<Value> {
     let migrated = document.schedule.schema_version == 1;
     if migrated {
@@ -249,6 +250,25 @@ pub(super) fn sweep(
         .archive
         .clone()
         .ok_or_else(|| invalid("missing archive head"))?;
+    let healed = if let Some(report) = heal {
+        if !migrated {
+            precheck_heal(schedule_path, &document.schedule)?;
+            *report = crate::archive::heal_holes(&path(schedule_path), &head.segments)?;
+        }
+        Some(report)
+    } else {
+        None
+    };
+    if let Some(report) = &healed
+        && let Some(reason) = &report.deferred
+    {
+        return Ok(
+            json!({"retired":[],"pruned":[],"deferred":[],"retired_total":retired_total(&document.schedule),
+            "expired":{"segments":0,"rows":0},"retained_bytes":head.retained_bytes(),"limit_bytes":limit,
+            "healed":heal_counts(&head,report),"heal_deferred":reason,"hole_remaining":report.hole_remaining}),
+        );
+    }
+    let healed_counts = healed.as_ref().map(|report| heal_counts(&head, report));
     let mut retired = vec![];
     let mut deferred = vec![];
     let mut bytes = vec![];
@@ -370,10 +390,107 @@ pub(super) fn sweep(
     }
 
     let mut result = json!({"retired":ids,"pruned":pruned,"deferred":deferred,"retired_total":retired_total(&document.schedule),"expired":{"segments":expired_segments,"rows":expired_rows},"retained_bytes":retained_bytes,"limit_bytes":limit});
+    if let Some(counts) = healed_counts {
+        result["expired"]["segments"] = json!(expired_segments - counts.segments);
+        result["expired"]["rows"] = json!(expired_rows - counts.rows);
+        result["healed"] = json!(counts);
+    }
     if let Some(reason) = expiry_deferred {
         result["expiry_deferred"] = json!(reason);
     }
     Ok(result)
+}
+
+#[derive(Serialize)]
+struct HealCounts {
+    segments: u64,
+    bytes: u64,
+    rows: u64,
+    unlisted_files: u64,
+    unlisted_bytes: u64,
+}
+
+fn heal_counts(head: &ArchiveHead, healed: &crate::archive::Healed) -> HealCounts {
+    let mut counts = HealCounts {
+        segments: 0,
+        bytes: 0,
+        rows: 0,
+        unlisted_files: healed.unlisted_files,
+        unlisted_bytes: healed.unlisted_bytes,
+    };
+    for segment in head
+        .segments
+        .iter()
+        .filter(|segment| healed.segments.contains(&segment.n))
+    {
+        counts.segments += 1;
+        counts.bytes += segment.bytes;
+        counts.rows += segment.rows;
+    }
+    counts
+}
+
+fn precheck_heal(schedule_path: &Path, schedule: &Schedule) -> Result<()> {
+    let head = schedule
+        .archive
+        .as_ref()
+        .ok_or_else(|| invalid("missing archive head"))?;
+    validate_head(head, &schedule.id)?;
+    let retained = crate::archive::precheck_heal(&path(schedule_path), &head.segments)?;
+    let (mut ids, mut tokens) = (BTreeSet::new(), BTreeSet::new());
+    let mut maxima = (0, 0);
+    for index in retained..head.segments.len() {
+        for item in verify_segment(schedule_path, schedule, index)?
+            .into_iter()
+            .flatten()
+        {
+            check_unique_item(&item, &mut ids, &mut tokens)?;
+            let (number, dispatch) = validate_item(&item, &mut BTreeSet::new())?;
+            maxima.0 = maxima.0.max(number);
+            maxima.1 = maxima.1.max(dispatch);
+        }
+    }
+    if retained == 0 && head.expired_rows == 0 && maxima != (head.last_item, head.last_dispatch) {
+        return Err(Error::new(
+            Reason::StoreCorrupt,
+            "archive allocator commitment does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn check_unique_item(
+    item: &Item,
+    ids: &mut BTreeSet<String>,
+    tokens: &mut BTreeSet<String>,
+) -> Result<()> {
+    if !ids.insert(item.id.clone()) {
+        return Err(Error::new(
+            Reason::StoreCorrupt,
+            "duplicate archive item id",
+        ));
+    }
+    for dispatch in &item.dispatches {
+        if !tokens.insert(dispatch.token.clone()) {
+            return Err(Error::new(Reason::StoreCorrupt, "duplicate dispatch token"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn heal_error(mut error: Error, healed: &crate::archive::Healed) -> Error {
+    let removed = healed.segments.len() as u64 + healed.unlisted_files;
+    if removed > 0 {
+        error.message.push_str(&format!(
+            "; heal had removed {removed} segment(s) of the Schedule archive"
+        ));
+    }
+    if let Some(reason) = &healed.deferred {
+        error.message.push_str(&format!(
+            "; heal of the Schedule archive is incomplete ({reason}), run --heal again"
+        ));
+    }
+    error
 }
 
 fn legacy_load(
@@ -586,20 +703,10 @@ fn load_observed(
             continue;
         }
         for item in items.into_iter().flatten() {
-            if !ids.insert(item.id.clone()) {
-                return Err(Error::new(
-                    Reason::StoreCorrupt,
-                    "duplicate archive item id",
-                ));
-            }
+            check_unique_item(&item, &mut ids, &mut tokens)?;
             let (number, dispatch) = validate_item(&item, &mut BTreeSet::new())?;
             maxima.0 = maxima.0.max(number);
             maxima.1 = maxima.1.max(dispatch);
-            for dispatch in &item.dispatches {
-                if !tokens.insert(dispatch.token.clone()) {
-                    return Err(Error::new(Reason::StoreCorrupt, "duplicate dispatch token"));
-                }
-            }
             loaded.items.push(item);
         }
     }
@@ -764,6 +871,7 @@ mod tests {
             &schedule_path,
             true,
             64 * 1024 * 1024,
+            None,
         )
         .unwrap();
         let snapshot = document.clone();
@@ -792,6 +900,7 @@ mod tests {
                         schedule_path,
                         true,
                         64 * 1024 * 1024,
+                        None,
                     )
                     .unwrap();
                     done_tx.send(()).unwrap();
@@ -851,6 +960,7 @@ mod tests {
                 &schedule_path,
                 true,
                 64 * 1024 * 1024,
+                None,
             )
             .unwrap();
             document
@@ -911,6 +1021,7 @@ mod tests {
                 &schedule_path,
                 true,
                 limit,
+                None,
             )
             .unwrap();
         }
@@ -1001,6 +1112,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         let head = document.schedule.archive.as_ref().unwrap();
@@ -1081,6 +1193,154 @@ mod tests {
         fs::remove_dir_all(store.home()).unwrap();
     }
 
+    fn registered_heal_fixture(
+        count: u64,
+    ) -> (crate::store::Store, PathBuf, crate::identity::Caller) {
+        let (store, schedule_path, _) = segmented_fixture(count, 8192);
+        store
+            .transact(crate::store::CLI_DEADLINE, |st| {
+                crate::ops::dev_seed(
+                    st,
+                    now_ms(),
+                    &crate::ops::SeedSpec {
+                        team: "heal-test".into(),
+                        project: "project".into(),
+                        commander_alias: "root".into(),
+                        commander_session: Some("root-session".into()),
+                        commander_tool: Some(Tool::Codex),
+                        members: vec![],
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let caller = crate::identity::Caller {
+            session_id: "root-session".into(),
+            tool: Some(Tool::Codex),
+            source: crate::identity::Source::PagerNative,
+        };
+        runtime::register(&store, &caller, &schedule_path, false).unwrap();
+        (store, schedule_path, caller)
+    }
+
+    #[test]
+    fn partial_heal_reports_and_resumes() {
+        let (store, schedule_path, caller) = registered_heal_fixture(4);
+        let mut document = read_document(&schedule_path).unwrap();
+        let head = document.schedule.archive.as_ref().unwrap().clone();
+        assert_eq!(head.segments.len(), 4);
+        fs::remove_file(crate::archive::segment_path(
+            &path(&schedule_path),
+            head.segments[2].n,
+        ))
+        .unwrap();
+        document.schedule.items.push(terminal(5));
+        document.schedule.next_item = 6;
+        document
+            .save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)
+            .unwrap();
+        let original = fs::read(&schedule_path).unwrap();
+        let failed = crate::archive::segment_path(&path(&schedule_path), head.segments[1].n);
+        crate::archive::FAILED_UNLINK.with_borrow_mut(|value| *value = Some(failed));
+        let args = commands::Input::parse(&json!({"heal":true})).unwrap();
+        let result = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap();
+        crate::archive::FAILED_UNLINK.with_borrow_mut(|value| *value = None);
+        assert_eq!(result["healed"]["segments"], 1);
+        assert_eq!(result["expired"]["segments"], 0);
+        assert_eq!(result["hole_remaining"], true);
+        assert!(result["heal_deferred"].is_string());
+        assert_eq!(result["retired"], json!([]));
+        assert_eq!(fs::read(&schedule_path).unwrap(), original);
+        let retry = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap();
+        assert_eq!(retry["healed"]["segments"], 1);
+        assert_eq!(retry["expired"]["segments"], 2);
+        assert_eq!(retry["retired"], json!(["w-5"]));
+        let final_ = read_document(&schedule_path).unwrap();
+        assert_eq!(
+            load(&schedule_path, &final_.schedule).unwrap().items.len(),
+            2
+        );
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_reports_listed_and_unlisted_separately() {
+        let (store, schedule_path, caller) = registered_heal_fixture(4);
+        let mut document = read_document(&schedule_path).unwrap();
+        let head = document.schedule.archive.as_mut().unwrap();
+        let expired: Vec<_> = head.segments.drain(..2).collect();
+        head.base = expired[1].chain.clone();
+        head.expired_rows = 2;
+        fs::remove_file(crate::archive::segment_path(&path(&schedule_path), 1)).unwrap();
+        fs::remove_file(crate::archive::segment_path(&path(&schedule_path), 4)).unwrap();
+        let bytes = fs::metadata(crate::archive::segment_path(&path(&schedule_path), 2))
+            .unwrap()
+            .len();
+        document
+            .save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)
+            .unwrap();
+        let original = fs::read(&schedule_path).unwrap();
+        crate::archive::FAILED_UNLINK.with_borrow_mut(|value| {
+            *value = Some(crate::archive::segment_path(&path(&schedule_path), 3))
+        });
+        let args = commands::Input::parse(&json!({"heal":true})).unwrap();
+        let result = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap();
+        crate::archive::FAILED_UNLINK.with_borrow_mut(|value| *value = None);
+        assert_eq!(
+            result["healed"],
+            json!({"segments":0,"bytes":0,"rows":0,"unlisted_files":1,"unlisted_bytes":bytes})
+        );
+        assert!(result["heal_deferred"].is_string());
+        assert_eq!(fs::read(&schedule_path).unwrap(), original);
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_then_failed_publish_is_consistent() {
+        for unlisted in [false, true] {
+            let (store, schedule_path, caller) = registered_heal_fixture(4);
+            let mut document = read_document(&schedule_path).unwrap();
+            if unlisted {
+                let head = document.schedule.archive.as_mut().unwrap();
+                let expired: Vec<_> = head.segments.drain(..2).collect();
+                head.base = expired[1].chain.clone();
+                head.expired_rows = 2;
+                fs::remove_file(crate::archive::segment_path(&path(&schedule_path), 1)).unwrap();
+            }
+            let head = document.schedule.archive.as_ref().unwrap().clone();
+            let missing = if unlisted { 4 } else { 3 };
+            fs::remove_file(crate::archive::segment_path(&path(&schedule_path), missing)).unwrap();
+            document.schedule.revision = u64::MAX;
+            let json = serde_json::to_string(&document.schedule).unwrap();
+            fs::write(&schedule_path, format!("{MARKER}\n```json\n{json}\n```\n")).unwrap();
+            let args = commands::Input::parse(&json!({"heal":true})).unwrap();
+            let error = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("heal had removed 2 segment(s) of the Schedule archive"),
+                "{error}"
+            );
+            let mut recovered = read_document(&schedule_path).unwrap();
+            assert_eq!(recovered.schedule.archive.as_ref().unwrap(), &head);
+            assert_eq!(
+                load(&schedule_path, &recovered.schedule)
+                    .unwrap()
+                    .items
+                    .len(),
+                if unlisted { 0 } else { 1 }
+            );
+            recovered.schedule.revision = 0;
+            recovered
+                .save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)
+                .unwrap();
+            let retry = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap();
+            assert_eq!(retry["healed"]["segments"], 0);
+            assert_eq!(retry["expired"]["segments"], if unlisted { 2 } else { 3 });
+            fs::remove_dir_all(store.home()).unwrap();
+        }
+    }
+
     fn failed_publish_case(limit: u64) {
         let (store, schedule_path, mut document) =
             segmented_fixture(if limit == 8 { 1 } else { 3 }, 4096);
@@ -1095,6 +1355,7 @@ mod tests {
             &schedule_path,
             true,
             limit,
+            None,
         )
         .unwrap();
         assert!(result["expired"]["segments"].as_u64().unwrap() > 0);
@@ -1128,6 +1389,7 @@ mod tests {
             &schedule_path,
             true,
             limit,
+            None,
         )
         .unwrap();
         recovered
@@ -1185,6 +1447,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         assert_eq!(result["expired"]["segments"], 0);
@@ -1202,6 +1465,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         assert_eq!(result["expired"]["segments"], 1);
@@ -1220,6 +1484,7 @@ mod tests {
             &schedule_path,
             true,
             2000,
+            None,
         )
         .unwrap();
         assert!(result["expiry_deferred"].is_string());
@@ -1240,6 +1505,7 @@ mod tests {
             &schedule_path,
             true,
             2000,
+            None,
         )
         .unwrap();
         assert!(result.get("expiry_deferred").is_none());
@@ -1264,6 +1530,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         assert_eq!(result["expired"]["segments"], 0);
@@ -1285,6 +1552,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         retry
@@ -1306,6 +1574,7 @@ mod tests {
             &schedule_path,
             true,
             8,
+            None,
         )
         .unwrap();
         assert!(!path(&schedule_path).exists());
@@ -1336,6 +1605,7 @@ mod tests {
                     &schedule_path,
                     true,
                     8,
+                    None,
                 )?;
                 writer.save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)?;
                 writer.schedule.items.push(terminal(3));
@@ -1347,6 +1617,7 @@ mod tests {
                     &schedule_path,
                     true,
                     8,
+                    None,
                 )?;
                 writer.save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)?;
             }
@@ -1386,6 +1657,7 @@ mod tests {
                     &schedule_path,
                     true,
                     2000,
+                    None,
                 )?;
                 writer.save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)?;
             }
@@ -1412,6 +1684,7 @@ mod tests {
                     &schedule_path,
                     true,
                     8,
+                    None,
                 )?;
                 writer.save(&schedule_path, Instant::now() + crate::store::CLI_DEADLINE)?;
             }
