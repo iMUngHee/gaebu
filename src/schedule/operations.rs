@@ -8,11 +8,20 @@ use serde_json::{Value, json};
 
 pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -> Result<Value> {
     let auto = name != "schedule_archive";
-    operate(store, caller, args, auto, |st, actor, team, document| {
+    let mut healed = crate::archive::Healed::default();
+    let result = operate(store, caller, args, auto, |st, actor, team, document| {
         if name == "schedule_archive" {
             authorize_manager(st, actor, team, &[])?;
             let path = Path::new(&st.schedules[team].path);
-            return archive::sweep(st, team, document, path, true, store.archive_limit());
+            return archive::sweep(
+                st,
+                team,
+                document,
+                path,
+                true,
+                store.archive_limit(),
+                args.heal.then_some(&mut healed),
+            );
         }
         if name == "schedule_add" {
             let title = args.text("title")?.to_owned();
@@ -185,7 +194,8 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
             }
             _ => Err(invalid("unknown schedule mutation")),
         }
-    })
+    });
+    result.map_err(|error| archive::heal_error(error, &healed))
 }
 
 fn authorize_recovery(st: &State, actor: &Actor, team: &str, item: &Item) -> Result<()> {

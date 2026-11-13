@@ -9,6 +9,30 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.5.1 — 2026-11-14
+
+### Added
+
+- Explicit `compact --heal` and `schedule archive --heal` recover missing-segment
+  holes by permanently deleting older listed and unlisted segment files. Back up
+  history first when it must be kept. The commands pre-check all surviving data
+  before deletion; ordinary and automatic maintenance never heal.
+- `healed` separates listed committed segments/bytes (and Schedule rows) from
+  unlisted file counts/actual bytes. `expired` excludes listed heal removals after
+  normalization. Partial failures return `heal_deferred` and `hole_remaining`,
+  retain waiting hot rows, and can be retried. Later errors name prior removals.
+- Runtime heal requires the current commander and checks all three caller-team
+  streams before deleting; Schedule heal keeps commander/manager authorization.
+- Windows directory flushing in `store::sync_dir` is recorded in `PLATFORMS.md`
+  for native implementation and verification. Healing is the explicit recovery
+  path while a power loss can reorder deletions there.
+
+### Compatibility
+
+- Runtime schema 5 and Schedule schema 3 are unchanged. Schema 1 Schedule
+  migration ignores heal and reports zeros; legacy archives keep their normal
+  upgrade path. Upgrade and reconnect resident MCP servers to use the new flag.
+
 ## 0.5.0 — 2026-11-14
 
 ### Changed

@@ -56,7 +56,21 @@ unlink/sync deferral and publication failure. These do not simulate physical pow
 loss. Mutation checks cover both implementations; an equal-length extra fsync
 mutation in the shared helper is equivalent for retained content.
 
+## 0.5.1 explicit archive healing
+
+Linux: hole recovery, read-only pre-checks, listed/unlisted accounting, partial
+unlink/sync failures, retry, legacy migration and failed publication are covered
+by the helper and Schedule tests. These are synthetic filesystem failures, not
+physical power-loss tests.
+
 ## Pending checks
+
+- Windows: implement directory flush in `store::sync_dir` by opening the directory
+  with backup semantics and flushing it; verify on a native Windows filesystem
+  with the archive tests. Until then power loss can leave an archive hole; recover
+  explicitly with `gaebu compact --heal` or `gaebu schedule archive --heal`.
+- macOS and Windows: run the 0.5.1 heal/pre-check/partial-failure tests natively.
+  Only Linux was executed locally; integration owns the three-platform CI gate.
 
 - macOS and Windows: run 0.5.0 segmented archives, lowered-limit maintenance,
   delete-pending open retries, migration and repair on native filesystems. Only

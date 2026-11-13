@@ -122,6 +122,13 @@ enforce a lowered limit even without new rows and remove unpublished leftovers.
 A sole oversized newest segment remains until a successor can replace it.
 See [Schedule storage](docs/schedules.md) for expiry and recovery behavior.
 
+0.5.1 adds explicit `gaebu compact --heal` (commander) and
+`gaebu schedule archive --heal` (commander or Schedule manager) for missing-segment
+holes. Healing permanently deletes older history, including unlisted older segment
+files. It reports listed and unlisted removals separately and can be retried after a
+partial failure. Ordinary commands and automatic maintenance never heal. Storage
+schemas remain unchanged; see [hole recovery](docs/schedules.md#healing-an-archive-hole).
+
 ### Claude Code
 
 Register the hook for `SessionStart`, `UserPromptSubmit` and `Stop`:

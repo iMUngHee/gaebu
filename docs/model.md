@@ -356,6 +356,14 @@ Schema 2 adopts its sidecar as segment 1 in place. Schema 1 rewrites verified
 legacy rows before schema 3 publication, with expiry deferred to a later write.
 See [Schedule storage](schedules.md) for limits, recovery and move requirements.
 
+Explicit Schedule `--heal` verifies the surviving suffix before deleting older
+listed and unlisted segment files below a hole. It normalizes the removed prefix
+through the existing schema 3 expiry rules. Listed committed rows/bytes and actual
+unlisted file bytes are reported separately; a partial heal publishes no document
+change and retires no waiting items. A retained complete tombstone still satisfies
+its dependants after its detail is healed away. Automatic sweeps never heal. See
+[hole recovery](schedules.md#healing-an-archive-hole) for authorization and reports.
+
 ## Schema 5 migration
 
 The first write or repair of schema 1/2/3/4 backs up the exact original bytes to
