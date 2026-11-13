@@ -450,6 +450,7 @@ fn verify_segment(
     let mut ids = BTreeSet::new();
     let mut tokens = BTreeSet::new();
     let mut max_dispatch = 0;
+    let live: BTreeSet<_> = schedule.items.iter().map(|item| item.id.as_str()).collect();
     let result =
         crate::archive::scan_segment(&path(schedule_path), &head.segments, index, |line| {
             let entry: Entry = serde_json::from_slice(line)
@@ -457,7 +458,7 @@ fn verify_segment(
             if entry.schedule_id != schedule.id
                 || entry.digest != digest(&entry.item)?
                 || !ids.insert(entry.item.id.clone())
-                || schedule.items.iter().any(|item| item.id == entry.item.id)
+                || live.contains(entry.item.id.as_str())
             {
                 return Err(invalid("invalid archive identity or digest"));
             }
@@ -896,6 +897,148 @@ mod tests {
         legacy.schedule.schema_version = 1;
         legacy.schedule.archive = None;
         legacy
+    }
+
+    #[test]
+    fn archive_metadata_rejects_invalid_legacy_and_current_heads() {
+        let (store, _, document) = segmented_fixture(1, 64 * 1024);
+        let original = serde_json::to_value(&document.schedule).unwrap();
+        let base = crate::evidence::sha256_hex(&document.schedule.id);
+        let empty = json!({"bytes":0,"rows":0,"chain":base,"last_item":0,"last_dispatch":0});
+        let nonempty = json!({"bytes":100,"rows":1,"chain":base,"last_item":1,"last_dispatch":0});
+        for (head, field, value) in [
+            (empty.clone(), "bytes", json!(1)),
+            (empty.clone(), "last_item", json!(1)),
+            (empty.clone(), "last_dispatch", json!(1)),
+            (empty.clone(), "chain", json!("a".repeat(64))),
+            (empty.clone(), "chain", json!("f")),
+            (empty, "chain", json!("g".repeat(64))),
+            (nonempty.clone(), "chain", json!("f")),
+            (nonempty.clone(), "chain", json!("g".repeat(64))),
+            (nonempty.clone(), "bytes", json!(0)),
+            (nonempty, "last_item", json!(0)),
+        ] {
+            let mut bad = original.clone();
+            bad["schema_version"] = json!(2);
+            bad["archive"] = head;
+            bad["archive"][field] = value;
+            assert!(serde_json::from_value::<Schedule>(bad).is_err(), "{field}");
+        }
+        let valid = document.schedule.archive.as_ref().unwrap();
+        for field in ["base", "next", "last_item"] {
+            let mut bad = serde_json::to_value(valid).unwrap();
+            bad[field] = if field == "base" {
+                json!("bad")
+            } else {
+                json!(0)
+            };
+            let bad: ArchiveHead = serde_json::from_value(bad).unwrap();
+            assert!(
+                validate_head(&bad, &document.schedule.id).is_err(),
+                "{field}"
+            );
+        }
+        let mut all_expired = empty_head(&document.schedule.id);
+        all_expired.expired_rows = 1;
+        all_expired.last_item = 1;
+        assert!(validate_head(&all_expired, &document.schedule.id).is_err());
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn expiry_results_count_missing_and_deleted_prefixes() {
+        let (store, schedule_path, mut document) = segmented_fixture(4, 4096);
+        let before = document.schedule.archive.as_ref().unwrap().clone();
+        fs::remove_file(crate::archive::segment_path(
+            &path(&schedule_path),
+            before.segments[0].n,
+        ))
+        .unwrap();
+        let result = sweep(
+            &State::default(),
+            "team",
+            &mut document,
+            &schedule_path,
+            true,
+            8,
+        )
+        .unwrap();
+        let head = document.schedule.archive.as_ref().unwrap();
+        assert_eq!(
+            result["expired"]["segments"],
+            (before.segments.len() - 1) as u64
+        );
+        assert_eq!(
+            result["expired"]["rows"],
+            before.retained_rows() - head.retained_rows()
+        );
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn segment_rows_must_fit_each_committed_bound() {
+        let (store, schedule_path, document) = segmented_fixture(3, 4096);
+        for (index, lo, hi) in [(0, 2, 3), (1, 1, 1)] {
+            let mut bad = document.schedule.clone();
+            let head = bad.archive.as_mut().unwrap();
+            head.segments[index].lo = lo;
+            head.segments[index].hi = hi;
+            assert_eq!(
+                verify_segment(&schedule_path, &bad, index)
+                    .unwrap_err()
+                    .reason,
+                Reason::StoreCorrupt
+            );
+        }
+        assert_eq!(
+            lookup(&schedule_path, &document.schedule, "w-4")
+                .unwrap_err()
+                .message,
+            "schedule item not found"
+        );
+        let newest = crate::archive::segment_path(
+            &path(&schedule_path),
+            document
+                .schedule
+                .archive
+                .as_ref()
+                .unwrap()
+                .segments
+                .last()
+                .unwrap()
+                .n,
+        );
+        let mut bytes = fs::read(&newest).unwrap();
+        bytes[0] = b'!';
+        fs::write(newest, bytes).unwrap();
+        assert_eq!(
+            lookup(&schedule_path, &document.schedule, "w-1")
+                .unwrap()
+                .id,
+            "w-1"
+        );
+        assert_eq!(
+            lookup(&schedule_path, &document.schedule, "w-4")
+                .unwrap_err()
+                .message,
+            "schedule item not found"
+        );
+        fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn current_schema_read_errors_are_not_retried() {
+        let (store, schedule_path, document) = segmented_fixture(1, 4096);
+        let mut calls = 0;
+        let error =
+            read_with_migration_retry(&schedule_path, &document.schedule, |_| -> Result<()> {
+                calls += 1;
+                Err(Error::new(Reason::StoreCorrupt, "original"))
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.message, "original");
+        fs::remove_dir_all(store.home()).unwrap();
     }
 
     fn failed_publish_case(limit: u64) {

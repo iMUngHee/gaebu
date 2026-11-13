@@ -9,6 +9,46 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.5.0 — 2026-11-14
+
+### Changed
+
+- Archive expiry permanently deletes the oldest history by default once each
+  Schedule or team/stream exceeds 64 MiB. Set `GAEBU_ARCHIVE_LIMIT_MIB` to a
+  positive integer, raise it before upgrading, or back up the files when history
+  must be kept. The newest segment is retained, including a sole oversized
+  legacy segment. Failed deletion/sync defers enforcement and is reported.
+- Schedule schema 3 and runtime schema 5 list numbered JSONL segments. Existing
+  archive filenames remain segment 1; later files use `.<n>.jsonl`. New writes
+  validate and trim the last committed prefix before append or rollover.
+  Explicit `schedule archive` and `compact` apply a lowered limit without new
+  rows and remove unlisted files left by failed publication or repair.
+- Missing oldest prefixes, including a wholly missing archive, are treated as
+  expired history. A missing file behind an older retained file is corruption.
+  Schedule item detail reports expiry; dependencies on expired tombstone-less
+  items are refused rather than assumed complete. Retained tombstones still
+  satisfy dependencies and duty guards even after their detail rows expire.
+- Schedule lookup scans candidate segments by item bounds; `--all` and moves
+  verify all retained segments and duplicate identities. Moves require every
+  listed segment at the destination. `counts.retired` counts retained rows;
+  `counts.expired` counts expired rows. Runtime expired duty lookup returns
+  `not_found`: `duty not found in hot state or retained team archive`.
+- Maintenance results report `expired`, `retained_bytes`, `limit_bytes`, and
+  optional `expiry_deferred`. Runtime `over_limit` identifies individual team
+  streams still above their limit; retained byte totals can span several teams.
+
+### Compatibility
+
+- Schema 2 Schedules and schema 4 runtime archives adopt segment 1 in place,
+  without rewriting archive data. Schema 1 Schedule migration rewrites only its
+  verified tombstone rows and postpones expiry until a later write. Runtime
+  migration preserves the exact original as `state.v4.json` (or its earlier
+  schema backup), publishing both generations as schema 5.
+- Older binaries refuse the new document/state formats. Upgrade writers and
+  reconnect long-running MCP processes before continuing coordinated work.
+  Windows has no portable directory fsync; a power-loss reorder may leave a
+  missing middle segment, reported as `store_corrupt`.
+
 ## 0.4.1 — 2026-11-14
 
 ### Changed

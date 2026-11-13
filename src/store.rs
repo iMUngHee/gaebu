@@ -545,7 +545,7 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
                     .map(|(team, a)| {
                         (
                             team,
-                            crate::model::ArchiveLengths {
+                            crate::model::TeamArchives {
                                 duties: adopt(a.duties),
                                 escalations: adopt(a.escalations),
                                 records: adopt(a.records),

@@ -345,16 +345,16 @@ the CLI's five-second lock/publication budget. The 10,000-entry
 `runtime_compact::archive_large_cost` test reports observed host costs, not a portable
 latency bound.
 
-Schedule documents use a separate schema 2 archive head: committed bytes, rows,
-SHA-256 chain and allocator maxima. Tombstones are retained only for live
-`depends_on` references or any hot linked duty; tombstone dependencies do not
-retain other tombstones. The sidecar remains unbounded. All historical Schedule
-reads verify their snapshot's complete prefix; uncommitted tails are ignored.
-Pruned complete dependencies are normalized at add/update and reported as
-`satisfied`; cancelled dependencies are refused. A first Schedule write upgrades
-schema 1 by rewriting exactly its verified tombstone rows. A 0.4.0 binary refuses
-the `archive` field. See [Schedule storage](schedules.md) for the commitment,
-recovery, locking and compatibility contract.
+Schedule documents use a separate schema 3 segmented head: chain base, expired
+rows, monotonic next segment number, allocator maxima, and per-segment byte/row
+commitments and item bounds. Tombstones remain only for live dependencies or hot
+linked duties and do not pin segments. Missing oldest prefixes mean expired
+history; holes remain corruption. Item lookup verifies candidate segments while
+full reads verify retained history and duplicate identities. Expired dependencies
+without tombstones are refused; retained complete tombstones still satisfy them.
+Schema 2 adopts its sidecar as segment 1 in place. Schema 1 rewrites verified
+legacy rows before schema 3 publication, with expiry deferred to a later write.
+See [Schedule storage](schedules.md) for limits, recovery and move requirements.
 
 ## Schema 5 migration
 

@@ -733,9 +733,7 @@ fn retired_total(schedule: &Schedule) -> u64 {
     schedule
         .archive
         .as_ref()
-        .map_or(schedule.retired.len() as u64, |head| {
-            head.expired_rows + head.retained_rows()
-        })
+        .map_or(schedule.retired.len() as u64, ArchiveHead::retained_rows)
 }
 
 fn item_number(id: &str) -> Result<u64> {

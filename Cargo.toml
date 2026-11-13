@@ -1,6 +1,6 @@
 [package]
 name = "gaebu"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Command tree, duties, leases and position cards for independent coding-agent sessions"

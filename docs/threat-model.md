@@ -134,8 +134,8 @@ current state. A state written by a newer schema is refused as unsupported,
 with no fallback and no repair over it. The schema-2 migration keeps the
 schema-1 original in `state.v1.json` and writes the previous generation as v2
 first, so a gaebu 0.1 binary fails closed rather than reading a stale v1 state.
-The schema-4 migration preserves schema-1/2/3 originals and publishes both
-runtime generations as schema 4, so older binaries cannot discard archive
+The schema-5 migration preserves schema-1/2/3/4 originals and publishes both
+runtime generations as schema 5, so older binaries cannot discard archive
 boundaries. Per-session logs use their own locks. Those mechanisms coordinate
 cooperative writers and do not prevent a same-user process bypassing the engine.
 
@@ -207,3 +207,22 @@ directives.
 Notices are an attention budget, not a delivery guarantee for every change:
 Record changes reach a member on its next card, not through pager. Dedupe
 compares text only while a notice is still queued.
+
+### Archive expiry and missing files
+
+The default 64 MiB limit applies separately to each Schedule and team/stream and
+automatically deletes old segments irreversibly. Set `GAEBU_ARCHIVE_LIMIT_MIB`
+or back up history before upgrading when deletion is unacceptable. The newest
+segment is retained even when oversized, and failed unlink/sync defers expiry.
+Missing oldest prefixes, including a wholly absent archive, are interpreted as
+expired history; accidental loss there is not distinguishable from expiry.
+Missing files behind retained older files remain corruption. Bookkeeping may
+outlive expired files after a failed publication or repair. Directory syncs order
+deletions on Unix; Windows lacks that portable guarantee and power loss may leave
+a detected hole. Explicit maintenance removes files outside current bookkeeping;
+this also discards unpublished generations left by failed writes or repair.
+
+Expiry never proves completion. Retained Schedule tombstones keep their guard
+meaning, while expired detail and tombstone-less dependencies are refused.
+Runtime expired duty lookup is indistinguishable from an unknown duty ID. Older
+binaries must not be mixed with schema 3 Schedule/schema 5 state writers.

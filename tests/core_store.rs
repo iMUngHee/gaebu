@@ -815,7 +815,7 @@ fn state_v4_archives_become_segment_one() {
     );
     assert_eq!(adopted.escalations.segments[0].bytes, 3);
     assert_eq!(adopted.records, ArchiveStream::default());
-    assert_eq!(view.archives["empty"], ArchiveLengths::default());
+    assert_eq!(view.archives["empty"], TeamArchives::default());
     assert_eq!(
         compact::full_duty(&store, &view, "worker", &id).unwrap(),
         original_duty

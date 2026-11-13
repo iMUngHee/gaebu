@@ -999,6 +999,20 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     "archived duties: {}, escalations: {}, records: {}",
                     result["duties"], result["escalations"], result["records"]
                 );
+                println!("expired history: {}", result["expired"]);
+                println!(
+                    "retained bytes: {} (limit per team/stream: {})",
+                    result["retained_bytes"], result["limit_bytes"]
+                );
+                if let Some(deferred) = result.get("expiry_deferred") {
+                    println!("expiry deferred: {deferred}");
+                }
+                if result["over_limit"]
+                    .as_array()
+                    .is_some_and(|entries| !entries.is_empty())
+                {
+                    println!("archives still over limit: {}", result["over_limit"]);
+                }
             }
             Ok(())
         }
