@@ -125,7 +125,7 @@ pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> 
     if document.schedule.id != registration.schedule_id {
         return Err(conflict("schedule identity changed"));
     }
-    archive::load(&path, &document.schedule)?;
+    archive::require_all_segments(&path, &document.schedule)?;
     store.transact(CLI_DEADLINE, |st| {
         let actor = identity::actor(st, caller)?;
         commander(st, &actor, &team)?;
@@ -357,7 +357,14 @@ fn guard_duty(st: &State, team: &str, document: &Document, duty: &Duty) -> Resul
             Path::new(&st.schedules[team].path),
             &document.schedule,
             &reference.item_id,
-        )?;
+        )
+        .map_err(|error| {
+            if error.reason == Reason::NotFound {
+                conflict("schedule item is retired")
+            } else {
+                error
+            }
+        })?;
         return Err(if item.cancellation.is_some() {
             Error::new(Reason::Cancelled, "schedule item cancelled")
         } else {
@@ -546,7 +553,14 @@ pub(super) fn operate<T>(
     let result = f(&st, &actor, &team, &mut document)?;
     if before != document.schedule {
         if auto_archive {
-            archive::sweep(&st, &team, &mut document, Path::new(&reg.path), false)?;
+            archive::sweep(
+                &st,
+                &team,
+                &mut document,
+                Path::new(&reg.path),
+                false,
+                store.archive_limit(),
+            )?;
         }
         document.save(Path::new(&reg.path), Instant::now() + CLI_DEADLINE)?;
     }

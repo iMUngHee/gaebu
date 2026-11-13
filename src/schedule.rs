@@ -190,8 +190,7 @@ fn strict_hold<'de, D: serde::Deserializer<'de>>(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Schedule {
     pub schema_version: u32,
     pub id: String,
@@ -208,11 +207,134 @@ pub struct Schedule {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArchiveHead {
+    pub base: String,
+    pub expired_rows: u64,
+    pub next: u64,
+    pub last_item: u64,
+    pub last_dispatch: u64,
+    pub segments: Vec<ArchiveSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveSegment {
+    pub n: u64,
     pub bytes: u64,
     pub rows: u64,
     pub chain: String,
-    pub last_item: u64,
-    pub last_dispatch: u64,
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl crate::archive::Segment for ArchiveSegment {
+    fn number(&self) -> u64 {
+        self.n
+    }
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl ArchiveHead {
+    pub fn retained_rows(&self) -> u64 {
+        self.segments.iter().map(|s| s.rows).sum()
+    }
+    pub fn retained_bytes(&self) -> u64 {
+        self.segments.iter().map(|s| s.bytes).sum()
+    }
+}
+
+impl<'de> Deserialize<'de> for Schedule {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyHead {
+            bytes: u64,
+            rows: u64,
+            chain: String,
+            last_item: u64,
+            last_dispatch: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Head {
+            Current(ArchiveHead),
+            Legacy(LegacyHead),
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Stored {
+            schema_version: u32,
+            id: String,
+            revision: u64,
+            next_item: u64,
+            next_dispatch: u64,
+            items: Vec<Item>,
+            #[serde(default)]
+            retired: Vec<Retired>,
+            #[serde(default)]
+            archive: Option<Head>,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let mut schema_version = stored.schema_version;
+        let archive = match (schema_version, stored.archive) {
+            (2, Some(Head::Legacy(head))) => {
+                let base = crate::evidence::sha256_hex(&stored.id);
+                if head.chain.len() != 64
+                    || !head.chain.bytes().all(|b| b.is_ascii_hexdigit())
+                    || (head.rows == 0
+                        && (head.bytes != 0
+                            || head.last_item != 0
+                            || head.last_dispatch != 0
+                            || head.chain != base))
+                    || (head.rows > 0 && (head.bytes == 0 || head.last_item == 0))
+                {
+                    return Err(D::Error::custom("invalid legacy archive head"));
+                }
+                let segments = if head.rows == 0 {
+                    vec![]
+                } else {
+                    vec![ArchiveSegment {
+                        n: 1,
+                        bytes: head.bytes,
+                        rows: head.rows,
+                        chain: head.chain,
+                        lo: 1,
+                        hi: head.last_item,
+                    }]
+                };
+                schema_version = 3;
+                Some(ArchiveHead {
+                    base,
+                    expired_rows: 0,
+                    next: if segments.is_empty() { 1 } else { 2 },
+                    last_item: head.last_item,
+                    last_dispatch: head.last_dispatch,
+                    segments,
+                })
+            }
+            (2, _) | (_, Some(Head::Legacy(_))) => {
+                return Err(D::Error::custom(
+                    "schedule schema and archive shape disagree",
+                ));
+            }
+            (_, Some(Head::Current(head))) => Some(head),
+            (_, None) => None,
+        };
+        Ok(Self {
+            schema_version,
+            id: stored.id,
+            revision: stored.revision,
+            next_item: stored.next_item,
+            next_dispatch: stored.next_dispatch,
+            items: stored.items,
+            retired: stored.retired,
+            archive,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,7 +457,7 @@ impl Document {
     fn empty(id: String) -> Self {
         Self {
             schedule: Schedule {
-                schema_version: 2,
+                schema_version: 3,
                 archive: Some(archive::empty_head(&id)),
                 id,
                 revision: 0,
@@ -373,7 +495,7 @@ fn nonempty(text: &str, field: &str) -> Result<()> {
 }
 
 fn validate(schedule: &Schedule) -> Result<()> {
-    if !matches!(schedule.schema_version, 1 | 2) {
+    if !matches!(schedule.schema_version, 1 | 3) {
         return Err(Error::new(
             Reason::StoreUnsupported,
             "unsupported schedule schema",
@@ -386,14 +508,8 @@ fn validate(schedule: &Schedule) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut tokens = BTreeSet::new();
     let (mut max_item, mut max_dispatch) = match (&schedule.archive, schedule.schema_version) {
-        (Some(head), 2) => {
-            if head.chain.len() != 64
-                || !head.chain.bytes().all(|b| b.is_ascii_hexdigit())
-                || (head.rows == 0 && head != &archive::empty_head(&schedule.id))
-                || (head.rows > 0 && (head.bytes == 0 || head.last_item == 0))
-            {
-                return Err(invalid("invalid schedule archive head"));
-            }
+        (Some(head), 3) => {
+            archive::validate_head(head, &schedule.id)?;
             (head.last_item, head.last_dispatch)
         }
         (None, 1) => (0, 0),
@@ -444,7 +560,7 @@ fn validate(schedule: &Schedule) -> Result<()> {
     let mut pending = BTreeMap::new();
     let mut dependants: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut archived_dependencies = ids.clone();
-    if schedule.schema_version == 2 {
+    if schedule.schema_version == 3 {
         for retired in &schedule.retired {
             for dependency in &retired.depends_on {
                 if item_number(dependency).is_ok_and(|number| number < schedule.next_item) {
@@ -607,7 +723,7 @@ fn item_index(schedule: &Schedule, id: &str) -> Result<usize> {
 }
 
 fn absent_retired(schedule: &Schedule, id: &str) -> bool {
-    schedule.schema_version == 2
+    schedule.schema_version == 3
         && item_number(id).is_ok_and(|number| number < schedule.next_item)
         && !schedule.items.iter().any(|item| item.id == id)
         && !schedule.retired.iter().any(|item| item.id == id)
@@ -617,7 +733,9 @@ fn retired_total(schedule: &Schedule) -> u64 {
     schedule
         .archive
         .as_ref()
-        .map_or(schedule.retired.len() as u64, |head| head.rows)
+        .map_or(schedule.retired.len() as u64, |head| {
+            head.expired_rows + head.retained_rows()
+        })
 }
 
 fn item_number(id: &str) -> Result<u64> {
