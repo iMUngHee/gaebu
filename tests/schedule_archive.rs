@@ -2474,6 +2474,11 @@ fn expired_item_reports_expiry() {
             .reason,
         Reason::Conflict
     );
+    let maintenance = f.call("schedule_archive", json!({})).unwrap();
+    assert_eq!(
+        maintenance["retired_total"],
+        f.document().archive.unwrap().retained_rows()
+    );
 }
 
 #[test]
@@ -2858,4 +2863,24 @@ fn recovered_duty_linked_to_expired_item_is_retired() {
     assert_eq!(error.reason, Reason::Conflict);
     assert_eq!(error.message, "schedule item is retired");
     assert_eq!(fs::read(f.store.home().join("state.json")).unwrap(), before);
+}
+
+#[test]
+fn schedule_next_action_follows_the_most_urgent_stage() {
+    let f = Fixture::new();
+    f.call(
+        "schedule_add",
+        json!({"title":"choose an owner","scope":[]}),
+    )
+    .unwrap();
+    let ready = f.add("ready", &[]);
+    let shown = f.call("schedule_show", json!({})).unwrap();
+    let item = shown["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == ready)
+        .unwrap();
+    assert_eq!(item["stage"], "ready");
+    assert_eq!(shown["next_action"], item["next_action"]);
 }

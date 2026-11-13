@@ -26,7 +26,7 @@ pub struct State {
     pub schedules: BTreeMap<String, ScheduleRegistration>,
     /// Retained JSONL segments and monotonic allocators, keyed by runtime team id.
     #[serde(default)]
-    pub archives: BTreeMap<String, ArchiveLengths>,
+    pub archives: BTreeMap<String, TeamArchives>,
     pub teams: BTreeMap<String, Team>,
     pub bus: BTreeMap<String, Bu>,
     pub members: BTreeMap<String, Member>,
@@ -65,7 +65,7 @@ impl Default for State {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ArchiveLengths {
+pub struct TeamArchives {
     pub duties: ArchiveStream,
     pub escalations: ArchiveStream,
     pub records: ArchiveStream,

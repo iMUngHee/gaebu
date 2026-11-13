@@ -1,5 +1,10 @@
 # Schedules and nested units
 
+**Archive expiry permanently deletes old history by default above 64 MiB per
+Schedule.** Raise `GAEBU_ARCHIVE_LIMIT_MIB` (positive integer) or back up all
+segments before upgrading when history must be kept. The newest segment stays;
+a sole oversized legacy segment expires only after its successor is written.
+
 A Schedule keeps operational work between the project's PM items and the duties
 issued to individual agents. PM owns the goal, plan and project lifecycle;
 Schedule owns execution order, dependencies, assignment and review acceptance;
@@ -163,7 +168,7 @@ gaebu compact
 MCP exposes the same operations as `schedule_show` (`item` or `all`, mutually
 exclusive), `schedule_archive`, and `compact`. Archive is restricted to the
 commander or current Schedule manager; it reports retired IDs, pruned tombstone
-IDs (`pruned`), deferred items with reasons, and `retired_total` (all archived rows). Completion, cancellation, and later Schedule writes also
+IDs (`pruned`), deferred items with reasons, and `retired_total` (retained archived rows). Completion, cancellation, and later Schedule writes also
 try to retire eligible items without adding a second revision increment.
 
 Retirement requires completion or cancellation, no item hold, known terminal
@@ -201,7 +206,7 @@ fence. CLI/MCP preserve surrounding prose, refuse unknown fields and stale
 revisions, and replace the file under a fixed sidecar OS lock. Unknown legacy
 prose is refused without overwrite; it is not silently imported.
 
-Runtime schema 4 retains schema 3's qualified local member/unit references with runtime and
+Runtime schema 5 retains schema 3's qualified local member/unit references with runtime and
 team origin. A Schedule copied from another computer cannot accidentally bind
 its `m-3` to an unrelated local `m-3`. Unknown joins stay unresolved. The
 supported write path is CLI/MCP against one registered canonical file; separate
@@ -209,44 +214,70 @@ machines concurrently editing separate copies and manual edits bypassing its
 locks are outside that coordination contract. The engine supports cooperative
 agents; it does not forcibly interrupt a process already executing a command.
 
-Finished items move to `<schedule filename>.archive.jsonl`. Schema 2 documents
-commit its byte length, row count, SHA-256 chain, highest item number and highest
-dispatch number in `archive`. The chain starts at SHA-256 of the UTF-8 Schedule
-ID; each row hashes the preceding 32 hash bytes followed by the exact JSONL line,
-including its newline. Allocators must exceed the committed maxima even when
-all tombstones have been pruned. Readers verify every row and the entire head
-in the document snapshot's prefix. Interrupted-publish tails are ignored and
-truncated by the next archive write, after checking length and the boundary newline.
-A missing, shortened or unterminated committed prefix is `store_corrupt`; it is
-never recreated or extended. An automatic sweep defers retirement on failure.
+Finished items move to numbered sidecar segments. Segment 1 is
+`<schedule filename>.archive.jsonl`; later files are
+`<schedule filename>.archive.<n>.jsonl`. Schema 3 records `base`, `expired_rows`,
+monotonic `next`, global `last_item`/`last_dispatch`, and the ordered `segments`.
+Each segment records `n`, committed `bytes`, `rows`, SHA-256 `chain`, and item
+bounds `lo`/`hi`. The oldest chain starts from `base`, initially SHA-256 of the
+Schedule ID; each row hashes the preceding 32 bytes and exact JSONL line with
+its newline. Expiry advances `base`; allocator maxima survive expired files.
 
-A sweep retains only tombstones named by live items' `depends_on` or linked by
-any hot runtime duty, regardless of team. Cancelled tombstones' own dependencies
-do not retain their predecessors. An unreferenced tombstone can disappear in
-the sweep that creates it. `counts.retired` and `retired_total` count all archived
-rows, rather than the retained tombstones. Mutation of a pruned item is refused
-with `schedule item <id> is retired; read it with gaebu schedule show <id>`.
+A segment rolls after its committed size reaches one eighth of the byte limit.
+A completed enforcement keeps at most the limit plus one append batch and at
+most 17 segments. The newest segment is always retained. A sole oversized legacy
+segment or a reduced limit can leave it above the limit until a successor is
+written. A failed unlink/sync defers enforcement; failed publication can leave
+unlisted files. These exceptions are visible through `retained_bytes`,
+`limit_bytes`, and optional `expiry_deferred`. `expired` reports removed segment
+and row counts. Explicit maintenance removes unlisted numbered files and applies
+the current limit without requiring another completed item.
 
-The 2 MiB document and 2,000-live-item limits remain. Tombstone growth is bounded
-by live dependency references plus hot linked duties; the sidecar remains
-append-only and unbounded, without rotation. Only retired-item detail, `--all`,
-move verification, add/update of a pruned dependency, and a recovered duty whose
-tombstone was pruned scan the archive. Each scan is linear in committed history.
-Normal duty guards and compaction eligibility do not scan it. Recovery guards
-preserve the original complete/cancelled refusal. Boundary and recovery lookups
-hold the Schedule lock followed by `state.lock`, delaying other teams' writers;
-large archives can exceed another caller's 5-second lock wait. Keep the Schedule
-and sidecar together in backups and moves.
+Every write pass first syncs the directory, normalizes an absent oldest prefix,
+validates the last committed boundary, and trims any unpublished tail, including
+before rollover and maintenance without rows. Expiry deletes oldest first and
+syncs the directory before the first unlink and after each unlink. Bookkeeping
+for a deletion remains until the sync succeeds. `next` survives an empty list,
+so a later writer cannot reuse a published filename still named by an old reader.
+A missing oldest prefix, including the whole list, means expired history; a
+missing middle or last segment while an older file exists is `store_corrupt`.
+Accidental loss of the oldest files is indistinguishable from expiry.
 
-0.4.1 reads schema 1 through its digest-addressed tombstones, then migrates on
-the first Schedule write under the Schedule lock. It rewrites the sidecar to
-exactly the verified tombstone rows by synced temporary file, rename and parent
-directory sync, dropping unreferenced and interrupted-publish rows. A crash
-between rename and document publication can safely rerun migration. No pruning
-runs against schema 1. A 0.4.0 binary refuses schema 2 during JSON decoding with
-`invalid_argument` for the unknown `archive` field; upgrade all Schedule writers.
+Item lookup visits candidate segments newest first and verifies each visited
+segment completely. `--all` verifies every retained segment and rejects duplicate
+item IDs/dispatch tokens across them; duplicate identities within a segment
+remain corruption. A reader rechecks expiry after its scan so already-read rows
+that expired during the scan are omitted. `counts.retired` describes retained
+rows and `counts.expired` expired rows; without `--all` both use bookkeeping only.
+`retired_total` uses the same retained row count; expired rows are reported separately.
 
-To move a registration, first move the document and its archive sidecar, then
+An expired item detail returns `not_found` with
+`schedule item <id> expired from the archive`. A new dependency on an expired,
+tombstone-less item returns a conflict asking the caller to omit it if complete;
+it is never silently satisfied. A retained completion tombstone still satisfies
+its dependants and guards even after the detail row expires. Recovered duties
+whose linked item expired without a tombstone get `schedule item is retired`.
+Mutation and dispatch replay retain the existing retired-item refusals.
+
+The 2 MiB document and 2,000-live-item limits remain. Tombstones stay only for
+live dependencies or hot linked duties; their own dependencies pin neither
+other tombstones nor archive segments. Historical lookup, dependency resolution
+and recovery guards read candidate segments. Normal duty guards and compaction
+eligibility do not scan archives. Locked lookups acquire the Schedule lock before
+`state.lock`; synchronous filesystem work can still exceed another caller's
+five-second lock budget. Windows has no portable directory sync; a power loss
+can undo deletions out of order and a resulting hole is reported as corruption.
+
+Schema 2 adopts its existing head/file as segment 1 in memory and writes schema 3
+on the next change. Empty legacy archives require no segment or sidecar. Schema 1
+keeps its tombstone verification path; the first write rewrites exactly those
+rows by synced temporary file/rename, and performs no expiry until a later write.
+A schema-1 reader crossing migration and expiry rereads the document once and
+rebuilds the whole response from the newer document. If its schema did not change,
+the original error is returned. Older binaries refuse the new archive shape;
+upgrade every writer.
+
+To move a registration, first move the document and every listed archive segment, then
 have the commander run:
 
 ```sh
@@ -254,8 +285,8 @@ gaebu schedule move /new/absolute/path/schedule.md
 ```
 
 The old document must be absent. The new file must retain the registered
-Schedule identity; its whole committed archive prefix must verify at the new
-path even when every tombstone was pruned. This
+Schedule identity; every listed archive segment must exist and verify at the new
+path, even an oldest segment that the normal reader would classify as expired. This
 changes the registration only; it does not copy or rename files. Writers that
 waited with an older registration are refused before publishing changes.
 

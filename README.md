@@ -98,30 +98,29 @@ rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
 cargo +stable-x86_64-pc-windows-gnu install --git https://github.com/iMUngHee/gaebu --locked
 ```
 
-### Upgrading to 0.4
+### Upgrading to 0.5
 
-0.4 stores schema 4. The first write migrates `~/.gaebu/state.json`, keeping
-the original in `state.v1.json`, `state.v2.json`, or `state.v3.json` without
-replacing an existing backup. Current and previous generations become schema 4
-so older binaries cannot fall back and discard archive commit boundaries. Install the new binary
-and restart sessions running `gaebu mcp` before continuing coordinated work.
-See [the migration contract](docs/model.md#schema-4-migration).
+**Old archive history is permanently deleted by default above 64 MiB per
+Schedule or team/stream.** Set `GAEBU_ARCHIVE_LIMIT_MIB` to a positive integer
+before opening a store, raise it or back up the files if history must be kept.
+Each archive rolls at one eighth of that limit; the newest segment is retained
+and a failed deletion is reported for retry rather than silently discarded.
 
-Finished Schedule items retire to a JSONL sidecar. Keep it beside the Schedule
-when backing up or moving the file; `schedule move <path>` updates a missing
-file's registration after the move. Default `schedule show` and cards omit full
-dispatch contracts and finished work; use `schedule show <item>` for the full
-contract or `schedule show --all` for history. Cancelled items with live duties
-remain visible for cleanup. `gaebu compact` archives old terminal runtime
-history while preserving `duty show`/`duty_get`. Schedule schema 2 commits the
-archive prefix and prunes tombstones unless a live dependency or hot linked duty
-needs them. Retired counts include pruned history, which stays readable by ID.
-Add/update drops pruned complete dependencies and reports them as `satisfied`;
-cancelled dependencies are refused. The sidecar remains unbounded and historical
-reads scan its committed prefix. Boundary/recovery scans hold Schedule then state
-locks. 0.4.1 upgrades schema 1 on the first Schedule write by rewriting verified
-tombstone rows; 0.4.0 refuses schema 2's `archive` field. Upgrade all writers and
-restart resident MCP processes. Runtime schema remains 4.
+Runtime state uses schema 5 and Schedule documents use schema 3. The first
+runtime write preserves the exact old state in its versioned backup (including
+`state.v4.json`) and publishes both generations in the new schema. Existing
+JSONL files become segment 1 in place; later files use `.<n>.jsonl`. Upgrade
+writers and reconnect persistent `gaebu mcp` processes before continuing work.
+See [the migration contract](docs/model.md#schema-5-migration).
+
+Keep all listed archive segments with a Schedule when backing up or moving it.
+`schedule move` requires every listed file; run `schedule archive` first to
+normalize expired prefixes. `schedule show --all` reports retained history and
+`counts.expired`; an expired item is never assumed complete. Retained completion
+tombstones still satisfy dependencies. `gaebu compact` and `schedule archive`
+enforce a lowered limit even without new rows and remove unpublished leftovers.
+A sole oversized newest segment remains until a successor can replace it.
+See [Schedule storage](docs/schedules.md) for expiry and recovery behavior.
 
 ### Claude Code
 

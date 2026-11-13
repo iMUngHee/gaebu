@@ -47,7 +47,21 @@ a negated `is_some_and` that newer toolchains accept; `src/identity.rs` uses
 in place keeps the inode, and macOS then kills the upgraded binary with
 SIGKILL on its stale code-signature cache.
 
+## 0.5.0 segmented archives
+
+Linux: shared helper, Schedule and runtime segment/expiry/migration tests run
+locally with fmt, strict clippy and the complete Rust suite. Forced interleavings
+cover Schedule readers during prefix expiry; unit-only failure injection covers
+unlink/sync deferral and publication failure. These do not simulate physical power
+loss. Mutation checks cover both implementations; an equal-length extra fsync
+mutation in the shared helper is equivalent for retained content.
+
 ## Pending checks
+
+- macOS and Windows: run 0.5.0 segmented archives, lowered-limit maintenance,
+  delete-pending open retries, migration and repair on native filesystems. Only
+  Linux was executed locally; parent integration owns the three-platform CI gate.
+
 
 - macOS and Windows: run the 0.4.1 Schedule schema-2 commitment, pruning,
   migration and held-snapshot truncation tests; only Linux was run locally.
