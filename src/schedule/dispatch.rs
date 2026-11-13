@@ -10,7 +10,7 @@ use crate::{
 use serde_json::{Value, json};
 
 pub(super) fn reserve_input(store: &Store, caller: &Caller, args: &Input) -> Result<Value> {
-    operate(store, caller, args, |st, actor, team, document| {
+    operate(store, caller, args, true, |st, actor, team, document| {
         let index = item_index(&document.schedule, args.text("item")?)?;
         let item = &document.schedule.items[index];
         authorize_master(st, actor, team, item)?;
@@ -195,7 +195,7 @@ pub(super) fn human_hold(
         Ok(ev)
     };
     let first = verify()?;
-    operate(store, caller, args, |_st, _actor, _team, document| {
+    operate(store, caller, args, true, |_st, _actor, _team, document| {
         let ev = verify()?;
         if ev.sha256 != first.sha256 || ev.prompt_seq != first.prompt_seq {
             return Err(Error::new(Reason::NoUserEvidence, "current prompt changed"));

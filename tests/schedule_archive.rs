@@ -198,6 +198,40 @@ impl Fixture {
     }
 }
 
+fn commit_fixture(f: &Fixture, document: &mut schedule::Schedule) {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(f.archive_path()).unwrap();
+    let mut chain = Sha256::digest(document.id.as_bytes()).to_vec();
+    let mut rows = 0;
+    let mut last_item = 0;
+    let mut last_dispatch = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let entry: Value = serde_json::from_slice(line).unwrap();
+        let item: schedule::Item = serde_json::from_value(entry["item"].clone()).unwrap();
+        last_item = last_item.max(item.id.strip_prefix("w-").unwrap().parse::<u64>().unwrap());
+        for dispatch in item.dispatches {
+            last_dispatch = last_dispatch.max(
+                dispatch
+                    .token
+                    .strip_prefix("x-")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap(),
+            );
+        }
+        chain = Sha256::digest([chain.as_slice(), line].concat()).to_vec();
+        rows += 1;
+    }
+    document.archive = Some(schedule::ArchiveHead {
+        bytes: bytes.len() as u64,
+        rows,
+        chain: chain.iter().map(|byte| format!("{byte:02x}")).collect(),
+        last_item,
+        last_dispatch,
+    });
+    f.write(document);
+}
+
 #[test]
 fn complete_retires() {
     let f = Fixture::new();
@@ -452,6 +486,7 @@ fn retired_token_replay_never_issues_duty() {
 fn crash_between_writes() {
     let f = Fixture::new();
     let item = f.add("crash", &[]);
+
     fs::create_dir(f.archive_path()).unwrap();
     f.complete(&item);
     let committed_item = fs::read(&f.path).unwrap();
@@ -514,6 +549,7 @@ fn corrupt_archive_hash_and_missing_line_are_rejected() {
 fn revision_and_io_failure() {
     let f = Fixture::new();
     let item = f.add("done", &[]);
+
     fs::create_dir(f.archive_path()).unwrap();
     let revision = f.document().revision;
     f.complete(&item);
@@ -749,6 +785,7 @@ fn bu_close_refuses_a_replaced_schedule_identity() {
     let child = f.child_bu();
     let mut document = f.document();
     document.id = "replaced-schedule".into();
+    document.archive.as_mut().unwrap().chain = gaebu::evidence::sha256_hex(&document.id);
     f.write(&document);
     let error = schedule::transaction(&f.store, &f.root, |st, actor| {
         ops::bu_close(st, now_ms(), actor, &child)
@@ -789,7 +826,8 @@ fn measured_shape() {
     let actual = fs::read(&f.path).unwrap().len();
     let mut open_only = f.document();
     assert_eq!(open_only.items.len(), 32);
-    assert_eq!(open_only.retired.len(), 44);
+    assert!(open_only.retired.is_empty());
+    assert_eq!(open_only.archive.as_ref().unwrap().rows, 44);
     open_only.retired.clear();
     let baseline = format!(
         "# Test\n<!-- gaebu-schedule -->\n```json\n{}\n```\n",
@@ -812,6 +850,7 @@ fn tombstone_validation_rejects_malformed_metadata_and_repeated_dependencies() {
     let f = Fixture::new();
     let first = f.add("first", &[]);
     let cancelled = f.add("cancelled", &[&first]);
+    f.add("keep tombstones", &[&first, &cancelled]);
     f.complete(&first);
     f.call(
         "schedule_cancel",
@@ -848,10 +887,11 @@ fn tombstone_validation_rejects_malformed_metadata_and_repeated_dependencies() {
 }
 
 #[test]
-fn append_preserves_unreferenced_archive_rows() {
+fn append_truncates_uncommitted_archive_rows() {
     for wrong_schedule in [true, false] {
         let f = Fixture::new();
         let item = f.add("complete", &[]);
+
         fs::create_dir(f.archive_path()).unwrap();
         f.complete(&item);
         let schedule = f.document();
@@ -868,7 +908,7 @@ fn append_preserves_unreferenced_archive_rows() {
                 .unwrap()
                 .lines()
                 .count(),
-            2
+            1
         );
         assert_eq!(
             f.call("schedule_show", json!({"item":item.id})).unwrap()["title"],
@@ -950,6 +990,7 @@ fn corrupt_archive_tombstone_disagreement_is_rejected() {
     let first = f.add("first", &[]);
     let second = f.add("second", &[]);
     let cancelled = f.add("cancelled", &[&first]);
+    f.add("keep tombstones", &[&first, &second, &cancelled]);
     f.complete(&first);
     f.complete(&second);
     f.call(
@@ -986,6 +1027,7 @@ fn dependencies_accept_only_the_named_predecessor() {
     let pending = f.add("pending", &[]);
     let dependent = f.add("dependent", &[&pending]);
     // Keep the completed item active to exercise the active completion join.
+
     fs::create_dir(f.archive_path()).unwrap();
     f.complete(&complete);
     assert_eq!(
@@ -1079,6 +1121,7 @@ fn move_registration_checks_foreign_paths_and_old_path_errors() {
 fn tombstone_ids_reject_zero_and_non_item_ids_without_dependency_errors() {
     let f = Fixture::new();
     let item = f.add("only item", &[]);
+    f.add("keep tombstone", &[&item]);
     f.complete(&item);
     let original = f.document();
     for id in ["w-0", "bad", "w-18446744073709551616"] {
@@ -1095,6 +1138,7 @@ fn tombstone_ids_reject_zero_and_non_item_ids_without_dependency_errors() {
 fn corrupt_archive_completion_marker_cannot_disagree_with_complete_tombstone() {
     let f = Fixture::new();
     let item = f.add("complete", &[]);
+    f.add("keep tombstone", &[&item]);
     f.complete(&item);
     let original: Value =
         serde_json::from_str(&fs::read_to_string(f.archive_path()).unwrap()).unwrap();
@@ -1114,6 +1158,7 @@ fn corrupt_archive_completion_marker_cannot_disagree_with_complete_tombstone() {
         changed.retired[0].digest = digest;
         f.write(&changed);
         fs::write(f.archive_path(), format!("{entry}\n")).unwrap();
+        commit_fixture(&f, &mut changed);
         assert_eq!(
             f.call("schedule_show", json!({"item":item.id}))
                 .unwrap_err()
@@ -1363,6 +1408,7 @@ fn corrupt_archive_dependencies_are_validated_per_item() {
     let f = Fixture::new();
     let item = f.add("archived", &[]);
     let other = f.add("other", &[]);
+    f.add("keep tombstones", &[&item, &other]);
     f.complete(&item);
     f.complete(&other);
     let original = f.document();
@@ -1386,6 +1432,7 @@ fn corrupt_archive_dependencies_are_validated_per_item() {
         document.retired[0].digest = digest;
         f.write(&document);
         fs::write(f.archive_path(), format!("{entry}\n{}\n", entries[1])).unwrap();
+        commit_fixture(&f, &mut document);
         assert_eq!(
             f.call("schedule_show", json!({"item":item}))
                 .unwrap_err()
@@ -1464,4 +1511,805 @@ fn automatic_compaction_skips_a_replaced_registration() {
     let st = f.store.read_current().unwrap();
     assert_eq!(st.records.len(), 65);
     assert!(st.archives.is_empty());
+}
+
+#[test]
+fn prune_drops_unreferenced_tombstones() {
+    let f = Fixture::new();
+    let item = f.add("cancel", &[]);
+    let next = f.document().next_item;
+    f.call("schedule_cancel", json!({"item":item,"reason":"stop"}))
+        .unwrap();
+    let document = f.document();
+    assert!(document.retired.is_empty());
+    assert_eq!(document.archive.unwrap().rows, 1);
+    assert_eq!(document.next_item, next);
+}
+
+fn age_duty(f: &Fixture, duty: &str) {
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.get_mut(duty).unwrap().updated_at = now_ms() - 25 * 60 * 60 * 1000;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn prune_waits_for_hot_linked_duty() {
+    let f = Fixture::new();
+    let item = f.add("done", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    assert_eq!(f.document().retired[0].id, item);
+    // Retention considers every team, even if the linked duty has been moved.
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.get_mut(duty).unwrap().team = "another-team".into();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.call("schedule_archive", json!({})).unwrap()["pruned"],
+        json!([])
+    );
+    let st = f.store.read_current().unwrap();
+    let team = st.members[&f.worker_id].team.clone();
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.duties.get_mut(duty).unwrap().team = team;
+            Ok(())
+        })
+        .unwrap();
+    age_duty(&f, duty);
+    assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+    assert_eq!(
+        f.call("schedule_archive", json!({})).unwrap()["pruned"],
+        json!([item])
+    );
+    assert!(f.document().retired.is_empty());
+}
+
+#[test]
+fn recovery_after_prune_keeps_guard_and_compaction() {
+    for cancelled in [false, true] {
+        let f = Fixture::new();
+        let item = f.add("restore duty", &[]);
+        let dispatch = f.dispatch(&item, "work").unwrap();
+        let duty = dispatch["duty"].as_str().unwrap();
+        f.done(duty);
+        if cancelled {
+            f.call("schedule_cancel", json!({"item":item,"reason":"stop"}))
+                .unwrap();
+        } else {
+            f.complete(&item);
+        }
+        let guard = || {
+            schedule::transaction(&f.store, &f.worker, |st, _| {
+                st.duties.get_mut(duty).unwrap().note = Some("change after retirement".into());
+                Ok(())
+            })
+            .unwrap_err()
+        };
+        let before = guard();
+        assert_eq!(
+            before.reason,
+            if cancelled {
+                Reason::Cancelled
+            } else {
+                Reason::Conflict
+            }
+        );
+        age_duty(&f, duty);
+        assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+        let previous = fs::read(f.store.home().join("state.prev.json")).unwrap();
+        f.call("schedule_archive", json!({})).unwrap();
+        assert!(f.document().retired.is_empty());
+        // Restore the actual previous generation saved by compaction.
+        fs::write(f.store.home().join("state.prev.json"), previous).unwrap();
+        fs::write(f.store.home().join("state.json"), b"{").unwrap();
+        f.store.repair().unwrap();
+        assert!(f.store.read_current().unwrap().duties.contains_key(duty));
+        let after = guard();
+        assert_eq!(after.reason, before.reason);
+        assert_eq!(after.message, before.message);
+        assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+        assert!(!f.store.read_current().unwrap().duties.contains_key(duty));
+    }
+}
+
+#[test]
+fn prune_keeps_only_live_referenced() {
+    let f = Fixture::new();
+    let a = f.add("A", &[]);
+    let b = f.add("B", &[&a]);
+    f.call("schedule_cancel", json!({"item":a,"reason":"stop"}))
+        .unwrap();
+    let c = f.add("C", &[&b]);
+    f.call("schedule_cancel", json!({"item":b,"reason":"stop"}))
+        .unwrap();
+    let document = f.document();
+    assert_eq!(document.retired.len(), 1);
+    assert_eq!(document.retired[0].id, b);
+    assert_eq!(document.retired[0].depends_on, vec![a]);
+    assert_eq!(document.items[0].id, c);
+    assert_eq!(
+        f.call("schedule_show", json!({"all":true})).unwrap()["counts"]["retired"],
+        2
+    );
+}
+
+#[test]
+fn pruned_item_reads_from_archive() {
+    let f = Fixture::new();
+    let item = f.add("full contract", &[]);
+    f.complete(&item);
+    assert!(f.document().retired.is_empty());
+    let shown = f.call("schedule_show", json!({"item":item})).unwrap();
+    assert_eq!(shown["title"], "full contract");
+    assert_eq!(shown["completion"]["evidence"], "reviewed");
+    let all = f.call("schedule_show", json!({"all":true})).unwrap();
+    assert_eq!(all["items"][0], shown);
+    assert_eq!(all["counts"]["retired"], 1);
+    assert_eq!(
+        f.call("schedule_archive", json!({})).unwrap()["retired_total"],
+        1
+    );
+}
+
+#[test]
+fn committed_prefix_detects_damage() {
+    for damage in [
+        "stale",
+        "delete row",
+        "missing",
+        "duplicate",
+        "schedule",
+        "rows",
+        "maxima",
+        "dependency",
+    ] {
+        let f = Fixture::new();
+        let item = f.add("cancelled committed", &[]);
+        let mut terminal = f.document().items[0].clone();
+        terminal.completion = Some(schedule::Completion {
+            by: terminal.owner_bu.clone().unwrap(),
+            at: now_ms(),
+            evidence: "stale".into(),
+        });
+        let stale = json!({"schedule_id":f.document().id,"digest":gaebu::evidence::sha256_hex(&serde_json::to_string(&terminal).unwrap())[..16],"item":terminal});
+        fs::write(f.archive_path(), format!("{stale}\n")).unwrap();
+        f.call("schedule_cancel", json!({"item":item,"reason":"stop"}))
+            .unwrap();
+        let other = f.add("other", &[]);
+        f.complete(&other);
+        let bytes = fs::read(f.archive_path()).unwrap();
+        let mut document = f.document();
+        match damage {
+            "stale" => {
+                let mut corrupted = bytes.clone();
+                corrupted[0] = b'!';
+                fs::write(f.archive_path(), corrupted).unwrap();
+                // A stale complete row beyond the commitment cannot rescue corruption.
+                use std::io::Write;
+                writeln!(
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(f.archive_path())
+                        .unwrap(),
+                    "{stale}"
+                )
+                .unwrap();
+            }
+            "delete row" => {
+                let first = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+                fs::write(f.archive_path(), &bytes[first..]).unwrap();
+            }
+            "missing" => fs::remove_file(f.archive_path()).unwrap(),
+            "duplicate" => {
+                let first = bytes.split_inclusive(|byte| *byte == b'\n').next().unwrap();
+                fs::write(f.archive_path(), [first, first].concat()).unwrap();
+                commit_fixture(&f, &mut document);
+            }
+            "schedule" => {
+                let text = String::from_utf8(bytes)
+                    .unwrap()
+                    .replace(&document.id, "foreign-schedule");
+                fs::write(f.archive_path(), text).unwrap();
+                commit_fixture(&f, &mut document);
+            }
+            "dependency" => {
+                let mut entries: Vec<Value> = String::from_utf8(bytes)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                entries[0]["item"]["depends_on"] = json!([format!("w-{}", document.next_item)]);
+                let item: schedule::Item =
+                    serde_json::from_value(entries[0]["item"].clone()).unwrap();
+                entries[0]["digest"] = json!(
+                    &gaebu::evidence::sha256_hex(&serde_json::to_string(&item).unwrap())[..16]
+                );
+                fs::write(
+                    f.archive_path(),
+                    format!("{}\n{}\n", entries[0], entries[1]),
+                )
+                .unwrap();
+                commit_fixture(&f, &mut document);
+            }
+            "rows" => {
+                document.archive.as_mut().unwrap().rows += 1;
+                f.write(&document);
+            }
+            _ => {
+                document.archive.as_mut().unwrap().last_dispatch += 1;
+                document.next_dispatch += 1;
+                f.write(&document);
+            }
+        }
+        assert_eq!(
+            f.call("schedule_show", json!({"item":item}))
+                .unwrap_err()
+                .reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        assert_eq!(
+            f.call("schedule_show", json!({"all":true}))
+                .unwrap_err()
+                .reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        let revision = f.document().revision;
+        assert_eq!(
+            f.call(
+                "schedule_add",
+                json!({"title":"duplicate","scope":[],"depends_on":[item,item]})
+            )
+            .unwrap_err()
+            .reason,
+            Reason::InvalidArgument
+        );
+        assert_eq!(
+            f.call(
+                "schedule_add",
+                json!({"title":"dependent","scope":[],"depends_on":[item]})
+            )
+            .unwrap_err()
+            .reason,
+            Reason::StoreCorrupt,
+            "{damage}"
+        );
+        assert_eq!(f.document().revision, revision);
+    }
+}
+
+#[test]
+fn sweep_refuses_damaged_committed_prefix() {
+    for damage in ["missing", "short", "newline"] {
+        let f = Fixture::new();
+        let first = f.add("first", &[]);
+        f.complete(&first);
+        let item = f.add("defer", &[]);
+        let head = f.document().archive;
+        let mut bytes = fs::read(f.archive_path()).unwrap();
+        match damage {
+            "missing" => fs::remove_file(f.archive_path()).unwrap(),
+            "short" => {
+                bytes.truncate(bytes.len() - 2);
+                fs::write(f.archive_path(), &bytes).unwrap();
+            }
+            _ => {
+                *bytes.last_mut().unwrap() = b' ';
+                fs::write(f.archive_path(), &bytes).unwrap();
+            }
+        }
+        let damaged = fs::read(f.archive_path()).ok();
+        f.complete(&item);
+        assert_eq!(f.document().items[0].id, item);
+        assert!(f.document().items[0].completion.is_some());
+        assert_eq!(f.document().archive, head);
+        assert_eq!(
+            f.call("schedule_archive", json!({})).unwrap_err().reason,
+            Reason::StoreCorrupt
+        );
+        assert_eq!(fs::read(f.archive_path()).ok(), damaged);
+        assert_eq!(f.document().archive, head);
+    }
+}
+
+#[test]
+fn allocators_reject_regression_after_prune() {
+    let f = Fixture::new();
+    let item = f.add("allocated", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    age_duty(&f, duty);
+    schedule::compact(&f.store, &f.root).unwrap();
+    f.call("schedule_archive", json!({})).unwrap();
+    let original = f.document();
+    assert!(original.retired.is_empty());
+    let head = original.archive.as_ref().unwrap();
+    assert_eq!(head.last_item, 1);
+    assert_eq!(head.last_dispatch, 1);
+    for dispatch in [false, true] {
+        for n in [0, 1] {
+            let mut document = original.clone();
+            if dispatch {
+                document.next_dispatch = n;
+            } else {
+                document.next_item = n;
+            }
+            f.write(&document);
+            assert_eq!(
+                schedule::read_document(&f.path).unwrap_err().reason,
+                Reason::InvalidArgument
+            );
+            assert!(f.call("schedule_add", json!({"title":"refuse"})).is_err());
+            assert!(f.dispatch(&item, "work").is_err());
+        }
+    }
+}
+
+#[test]
+fn uncommitted_tail_is_ignored_and_truncated() {
+    let f = Fixture::new();
+    let item = f.add("committed", &[]);
+    f.complete(&item);
+    let original = fs::read(f.archive_path()).unwrap();
+    let mut row: Value = serde_json::from_slice(&original).unwrap();
+    row["item"]["id"] = json!("w-999");
+    let stored: schedule::Item = serde_json::from_value(row["item"].clone()).unwrap();
+    row["digest"] =
+        json!(&gaebu::evidence::sha256_hex(&serde_json::to_string(&stored).unwrap())[..16]);
+    use std::io::Write;
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(f.archive_path())
+            .unwrap(),
+        "{row}"
+    )
+    .unwrap();
+    assert_eq!(
+        f.call("schedule_show", json!({"all":true})).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"item":"w-999"}))
+            .unwrap_err()
+            .reason,
+        Reason::NotFound
+    );
+    f.call("schedule_archive", json!({})).unwrap();
+    assert_eq!(fs::read(f.archive_path()).unwrap(), original);
+    assert_eq!(
+        fs::metadata(f.archive_path()).unwrap().len(),
+        f.document().archive.unwrap().bytes
+    );
+}
+
+#[test]
+fn pruned_dependency_resolves_at_boundary() {
+    for cancelled in [false, true] {
+        let f = Fixture::new();
+        let predecessor = f.add("predecessor", &[]);
+        if cancelled {
+            f.call(
+                "schedule_cancel",
+                json!({"item":predecessor,"reason":"stop"}),
+            )
+            .unwrap();
+        } else {
+            f.complete(&predecessor);
+        }
+        let update = f.add("update target", &[]);
+        for operation in ["schedule_add", "schedule_update"] {
+            let before = f.document().revision;
+            let mut args =
+                json!({"title":"dependent","scope":["src/**"],"depends_on":[predecessor]});
+            if operation == "schedule_update" {
+                args["item"] = json!(update);
+            }
+            let result = f.call(operation, args);
+            if cancelled {
+                let error = result.unwrap_err();
+                assert_eq!(error.reason, Reason::Conflict);
+                assert!(error.message.contains(&predecessor));
+                assert_eq!(f.document().revision, before);
+            } else {
+                let value = result.unwrap();
+                assert_eq!(value["satisfied"], json!([predecessor]));
+                assert_eq!(value["item"]["depends_on"], json!([]));
+                let id = value["item"]["id"].as_str().unwrap();
+                assert!(
+                    f.document()
+                        .items
+                        .iter()
+                        .find(|item| item.id == id)
+                        .unwrap()
+                        .depends_on
+                        .is_empty()
+                );
+            }
+            for deps in [
+                json!([predecessor, predecessor]),
+                json!(["w-999"]),
+                json!(["invalid"]),
+                json!([update]),
+            ] {
+                // Self references apply to update; add's next id differs.
+                if operation == "schedule_add" && deps == json!([update]) {
+                    continue;
+                }
+                let before = f.document().revision;
+                let mut args = json!({"title":"refuse","scope":["src/**"],"depends_on":deps});
+                if operation == "schedule_update" {
+                    args["item"] = json!(update);
+                }
+                assert_eq!(
+                    f.call(operation, args).unwrap_err().reason,
+                    Reason::InvalidArgument
+                );
+                assert_eq!(f.document().revision, before);
+            }
+        }
+    }
+    for tombstone in [false, true] {
+        let f = Fixture::new();
+        let predecessor = f.add("cancelled", &[]);
+        if tombstone {
+            f.add("retainer", &[&predecessor]);
+        } else {
+            fs::create_dir(f.archive_path()).unwrap();
+        }
+        f.call(
+            "schedule_cancel",
+            json!({"item":predecessor,"reason":"stop"}),
+        )
+        .unwrap();
+        let target = f.add("target", &[]);
+        for operation in ["schedule_add", "schedule_update"] {
+            let revision = f.document().revision;
+            let mut args = json!({"title":"refuse","scope":["src/**"],"depends_on":[predecessor]});
+            if operation == "schedule_update" {
+                args["item"] = json!(target);
+            }
+            let error = f.call(operation, args).unwrap_err();
+            assert_eq!(error.reason, Reason::Conflict);
+            assert!(error.message.contains(&predecessor));
+            assert_eq!(f.document().revision, revision);
+        }
+    }
+    let f = Fixture::new();
+    let predecessor = f.add("complete", &[]);
+    f.complete(&predecessor);
+    let item = f.add("immutable", &[]);
+    f.dispatch(&item, "work").unwrap();
+    fs::remove_file(f.archive_path()).unwrap();
+    let revision = f.document().revision;
+    let error = f
+        .call(
+            "schedule_update",
+            json!({"item":item,"depends_on":[predecessor]}),
+        )
+        .unwrap_err();
+    assert_eq!(error.reason, Reason::Conflict);
+    assert!(error.message.contains("immutable"));
+    assert_eq!(f.document().revision, revision);
+}
+
+#[test]
+fn pruned_item_refuses_mutation() {
+    let f = Fixture::new();
+    let item = f.add("pruned", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    age_duty(&f, duty);
+    schedule::compact(&f.store, &f.root).unwrap();
+    f.call("schedule_archive", json!({})).unwrap();
+    assert!(f.document().retired.is_empty());
+    let before = f.store.read_current().unwrap();
+    fs::remove_file(f.archive_path()).unwrap();
+    for operation in ["schedule_update", "schedule_cancel", "schedule_reconcile"] {
+        let args = match operation {
+            "schedule_update" => json!({"item":item,"priority":5}),
+            "schedule_cancel" => json!({"item":item,"reason":"stop"}),
+            _ => json!({"item":item,"token":dispatch["token"]}),
+        };
+        let error = f.call(operation, args).unwrap_err();
+        assert_eq!(error.reason, Reason::Conflict);
+        assert_eq!(
+            error.message,
+            format!("schedule item {item} is retired; read it with gaebu schedule show {item}")
+        );
+    }
+    assert_eq!(
+        f.store.read_current().unwrap().duties.len(),
+        before.duties.len()
+    );
+    for id in ["w-2", "w-999", "bad", "w-0"] {
+        assert_eq!(
+            f.call("schedule_update", json!({"item":id,"priority":5}))
+                .unwrap_err()
+                .reason,
+            Reason::NotFound
+        );
+    }
+}
+
+#[test]
+fn move_requires_committed_archive_after_prune() {
+    let f = Fixture::new();
+    let item = f.add("history", &[]);
+    f.complete(&item);
+    assert!(f.document().retired.is_empty());
+    let destination = f.path.with_file_name("moved.md");
+    fs::rename(&f.path, &destination).unwrap();
+    assert_eq!(
+        f.call("schedule_move", json!({"path":destination}))
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+    fs::rename(
+        f.archive_path(),
+        destination.with_file_name("moved.md.archive.jsonl"),
+    )
+    .unwrap();
+    f.call("schedule_move", json!({"path":destination}))
+        .unwrap();
+    assert_eq!(
+        f.call("schedule_show", json!({"item":item})).unwrap()["title"],
+        "history"
+    );
+}
+
+#[test]
+fn schema1_document_upgrades_on_first_write() {
+    let f = Fixture::new();
+    let item = f.add("legacy", &[]);
+    let live = f.add("retain", &[&item]);
+    f.complete(&item);
+    let mut legacy = f.document();
+    legacy.schema_version = 1;
+    legacy.archive = None;
+    let clean = fs::read(f.archive_path()).unwrap();
+    let mut stray: Value = serde_json::from_slice(&clean).unwrap();
+    stray["item"]["id"] = json!("w-999");
+    let stored: schedule::Item = serde_json::from_value(stray["item"].clone()).unwrap();
+    stray["digest"] =
+        json!(&gaebu::evidence::sha256_hex(&serde_json::to_string(&stored).unwrap())[..16]);
+    let mut foreign = stray.clone();
+    foreign["schedule_id"] = json!("foreign");
+    let dirty = [
+        clean.clone(),
+        format!("{stray}\n{foreign}\n").into_bytes(),
+        clean.clone(),
+        b"{torn tail".to_vec(),
+    ]
+    .concat();
+    fs::write(f.archive_path(), dirty).unwrap();
+    f.write(&legacy);
+    assert_eq!(
+        f.call("schedule_show", json!({"all":true})).unwrap()["counts"]["retired"],
+        1
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"item":item})).unwrap()["title"],
+        "legacy"
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"item":"w-999"}))
+            .unwrap_err()
+            .reason,
+        Reason::NotFound
+    );
+    f.call(
+        "schedule_update",
+        json!({"item":live,"priority":7,"depends_on":[]}),
+    )
+    .unwrap();
+    let upgraded = f.document();
+    assert_eq!(upgraded.schema_version, 2);
+    assert_eq!(upgraded.retired.len(), 1);
+    assert!(upgraded.items[0].depends_on.is_empty());
+    assert_eq!(fs::read(f.archive_path()).unwrap(), clean);
+    assert_eq!(upgraded.archive.as_ref().unwrap().rows, 1);
+    let mut verified = upgraded.clone();
+    commit_fixture(&f, &mut verified);
+    assert_eq!(upgraded.archive, verified.archive);
+    // The sidecar rename persisted but publication of the schema-2 document did not.
+    f.write(&legacy);
+    f.call(
+        "schedule_update",
+        json!({"item":live,"priority":7,"depends_on":[]}),
+    )
+    .unwrap();
+    assert_eq!(f.document().archive, upgraded.archive);
+    assert_eq!(fs::read(f.archive_path()).unwrap(), clean);
+    assert_eq!(
+        f.call("schedule_show", json!({"item":item})).unwrap()["title"],
+        "legacy"
+    );
+}
+
+#[test]
+fn tombstones_stay_bounded() {
+    let f = Fixture::new();
+    let mut tenth = 0;
+    for n in 1..=300 {
+        let item = f.add("bounded history", &[]);
+        f.call("schedule_cancel", json!({"item":item,"reason":"stop"}))
+            .unwrap();
+        assert!(f.document().retired.is_empty());
+        if n == 10 {
+            tenth = fs::metadata(&f.path).unwrap().len();
+        }
+    }
+    let last = fs::metadata(&f.path).unwrap().len();
+    eprintln!("300 cycles: cycle10={tenth} bytes, cycle300={last} bytes");
+    assert!(
+        last * 100 <= tenth * 105,
+        "cycle10={tenth}, cycle300={last}"
+    );
+    assert_eq!(f.document().archive.unwrap().rows, 300);
+}
+
+#[test]
+fn schema2_requires_coherent_head() {
+    let f = Fixture::new();
+    let original = f.document();
+    let mut missing = original.clone();
+    missing.archive = None;
+    f.write(&missing);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap_err().reason,
+        Reason::InvalidArgument
+    );
+    for chain in ["short".to_owned(), "z".repeat(64), "0".repeat(64)] {
+        let mut document = original.clone();
+        document.archive.as_mut().unwrap().chain = chain;
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument
+        );
+    }
+    for field in ["bytes", "rows", "last_item", "last_dispatch"] {
+        let mut document = original.clone();
+        let mut value = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
+        value[field] = json!(1);
+        document.archive = Some(serde_json::from_value(value).unwrap());
+        document.next_item = 2;
+        document.next_dispatch = 2;
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument,
+            "empty {field}"
+        );
+    }
+    f.write(&original);
+    let item = f.add("retire", &[]);
+    f.complete(&item);
+    let original = f.document();
+    for chain in ["short".to_owned(), "z".repeat(64)] {
+        let mut document = original.clone();
+        document.archive.as_mut().unwrap().chain = chain;
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument
+        );
+    }
+    for field in ["bytes", "last_item"] {
+        let mut document = original.clone();
+        let mut value = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
+        value[field] = json!(0);
+        document.archive = Some(serde_json::from_value(value).unwrap());
+        f.write(&document);
+        assert_eq!(
+            schedule::read_document(&f.path).unwrap_err().reason,
+            Reason::InvalidArgument,
+            "nonempty {field}"
+        );
+    }
+    let mut document = original.clone();
+    document.schema_version = 1;
+    f.write(&document);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap_err().reason,
+        Reason::InvalidArgument
+    );
+    document.schema_version = 3;
+    f.write(&document);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap_err().reason,
+        Reason::StoreUnsupported
+    );
+}
+
+#[test]
+fn live_dependencies_must_have_document_nodes() {
+    let f = Fixture::new();
+    let a = f.add("A", &[]);
+    let b = f.add("B", &[&a]);
+    let c = f.add("C", &[&b]);
+    f.call("schedule_cancel", json!({"item":a,"reason":"stop"}))
+        .unwrap();
+    f.call("schedule_cancel", json!({"item":b,"reason":"stop"}))
+        .unwrap();
+    let original = f.document();
+    assert_eq!(original.retired[0].depends_on, vec![a.clone()]);
+    let mut document = original.clone();
+    document
+        .items
+        .iter_mut()
+        .find(|item| item.id == c)
+        .unwrap()
+        .depends_on = vec![a];
+    f.write(&document);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap_err().reason,
+        Reason::InvalidArgument
+    );
+    let mut document = original;
+    document.retired[0].depends_on = vec![format!("w-{}", document.next_item)];
+    f.write(&document);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap_err().reason,
+        Reason::InvalidArgument
+    );
+}
+
+#[test]
+fn retained_dependencies_do_not_scan_archive() {
+    let f = Fixture::new();
+    let predecessor = f.add("complete", &[]);
+    let dependent = f.add("retainer", &[&predecessor]);
+    f.complete(&predecessor);
+    fs::remove_file(f.archive_path()).unwrap();
+    for operation in ["schedule_add", "schedule_update"] {
+        let mut args = json!({"title":"dependent","scope":["src/**"],"depends_on":[predecessor]});
+        if operation == "schedule_update" {
+            args["item"] = json!(dependent);
+        }
+        let result = f.call(operation, args).unwrap();
+        assert_eq!(result["satisfied"], json!([]));
+        assert_eq!(result["item"]["depends_on"], json!([predecessor]));
+    }
+}
+
+#[test]
+fn allocated_but_missing_dependency_is_refused() {
+    let f = Fixture::new();
+    let predecessor = f.add("complete", &[]);
+    f.complete(&predecessor);
+    let target = f.add("target", &[]);
+    let mut document = f.document();
+    let missing = format!("w-{}", document.next_item);
+    document.next_item += 1;
+    f.write(&document);
+    for operation in ["schedule_add", "schedule_update"] {
+        let mut args = json!({"title":"refuse","scope":["src/**"],"depends_on":[missing]});
+        if operation == "schedule_update" {
+            args["item"] = json!(target);
+        }
+        assert_eq!(
+            f.call(operation, args).unwrap_err().reason,
+            Reason::InvalidArgument
+        );
+        assert_eq!(f.document().revision, document.revision);
+    }
 }

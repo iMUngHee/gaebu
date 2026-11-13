@@ -269,7 +269,11 @@ remain hot; the allocator and runtime identity are preserved.
 
 A linked duty of an Active team retires only when the caller holds that
 team's Schedule observation with matching registration/document/reference ID
-and a tombstone for its item. Other Active teams' linked duties remain hot.
+and an item ID below `next_item` that is absent from the live item set, including
+pruned retired items. This gate does not read the Schedule archive. Other Active
+teams' linked duties remain hot. If recovery restores a hot duty after its
+tombstone was pruned, the duty guard verifies the committed Schedule archive
+and returns the same complete/cancelled refusal as the tombstone.
 Terminal linked duties of Cancelled teams can retire without their Schedule,
 because those teams cannot materialize another dispatch. Retention, holds and
 open escalations still apply to that exception.
@@ -312,6 +316,17 @@ synchronous archive I/O and parsing cannot be interrupted. Large histories or
 slow disks can exceed that budget and delay other writers. The 10,000-entry
 `runtime_compact::archive_large_cost` test reports observed costs on its host;
 it does not establish a portable latency bound.
+
+Schedule documents use a separate schema 2 archive head: committed bytes, rows,
+SHA-256 chain and allocator maxima. Tombstones are retained only for live
+`depends_on` references or any hot linked duty; tombstone dependencies do not
+retain other tombstones. The sidecar remains unbounded. All historical Schedule
+reads verify their snapshot's complete prefix; uncommitted tails are ignored.
+Pruned complete dependencies are normalized at add/update and reported as
+`satisfied`; cancelled dependencies are refused. A first Schedule write upgrades
+schema 1 by rewriting exactly its verified tombstone rows. A 0.4.0 binary refuses
+the `archive` field. See [Schedule storage](schedules.md) for the commitment,
+recovery, locking and compatibility contract.
 
 ## Schema 4 migration
 

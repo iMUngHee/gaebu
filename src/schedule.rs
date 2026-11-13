@@ -201,6 +201,18 @@ pub struct Schedule {
     pub items: Vec<Item>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<Retired>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveHead>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveHead {
+    pub bytes: u64,
+    pub rows: u64,
+    pub chain: String,
+    pub last_item: u64,
+    pub last_dispatch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,7 +335,8 @@ impl Document {
     fn empty(id: String) -> Self {
         Self {
             schedule: Schedule {
-                schema_version: 1,
+                schema_version: 2,
+                archive: Some(archive::empty_head(&id)),
                 id,
                 revision: 0,
                 next_item: 1,
@@ -360,7 +373,7 @@ fn nonempty(text: &str, field: &str) -> Result<()> {
 }
 
 fn validate(schedule: &Schedule) -> Result<()> {
-    if schedule.schema_version != 1 {
+    if !matches!(schedule.schema_version, 1 | 2) {
         return Err(Error::new(
             Reason::StoreUnsupported,
             "unsupported schedule schema",
@@ -372,8 +385,20 @@ fn validate(schedule: &Schedule) -> Result<()> {
     }
     let mut ids = BTreeSet::new();
     let mut tokens = BTreeSet::new();
-    let mut max_item = 0;
-    let mut max_dispatch = 0;
+    let (mut max_item, mut max_dispatch) = match (&schedule.archive, schedule.schema_version) {
+        (Some(head), 2) => {
+            if head.chain.len() != 64
+                || !head.chain.bytes().all(|b| b.is_ascii_hexdigit())
+                || (head.rows == 0 && head != &archive::empty_head(&schedule.id))
+                || (head.rows > 0 && (head.bytes == 0 || head.last_item == 0))
+            {
+                return Err(invalid("invalid schedule archive head"));
+            }
+            (head.last_item, head.last_dispatch)
+        }
+        (None, 1) => (0, 0),
+        _ => return Err(invalid("schedule schema and archive head disagree")),
+    };
     for retired in &schedule.retired {
         max_item = max_item.max(item_number(&retired.id)?);
         max_dispatch = max_dispatch.max(retired.last_dispatch);
@@ -418,11 +443,26 @@ fn validate(schedule: &Schedule) -> Result<()> {
         .collect();
     let mut pending = BTreeMap::new();
     let mut dependants: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (id, dependencies) in &nodes {
-        validate_dependencies(id, dependencies, &ids)?;
+    let mut archived_dependencies = ids.clone();
+    if schedule.schema_version == 2 {
+        for retired in &schedule.retired {
+            for dependency in &retired.depends_on {
+                if item_number(dependency).is_ok_and(|number| number < schedule.next_item) {
+                    archived_dependencies.insert(dependency);
+                }
+            }
+        }
+    }
+    for (index, (id, dependencies)) in nodes.iter().enumerate() {
+        let allowed = if index < schedule.items.len() {
+            &ids
+        } else {
+            &archived_dependencies
+        };
+        validate_dependencies(id, dependencies, allowed)?;
         let mut count = 0;
         for dependency in *dependencies {
-            if !complete.contains(dependency.as_str()) {
+            if ids.contains(dependency.as_str()) && !complete.contains(dependency.as_str()) {
                 count += 1;
                 dependants.entry(dependency).or_default().push(id);
             }
@@ -554,9 +594,9 @@ fn matching_origin(st: &State, team: &str, reference: &OriginRef) -> bool {
 }
 
 fn item_index(schedule: &Schedule, id: &str) -> Result<usize> {
-    if schedule.retired.iter().any(|item| item.id == id) {
+    if schedule.retired.iter().any(|item| item.id == id) || absent_retired(schedule, id) {
         return Err(conflict(format!(
-            "schedule item {id} is retired to the archive"
+            "schedule item {id} is retired; read it with gaebu schedule show {id}"
         )));
     }
     schedule
@@ -564,6 +604,20 @@ fn item_index(schedule: &Schedule, id: &str) -> Result<usize> {
         .iter()
         .position(|item| item.id == id)
         .ok_or_else(|| Error::new(Reason::NotFound, "schedule item not found"))
+}
+
+fn absent_retired(schedule: &Schedule, id: &str) -> bool {
+    schedule.schema_version == 2
+        && item_number(id).is_ok_and(|number| number < schedule.next_item)
+        && !schedule.items.iter().any(|item| item.id == id)
+        && !schedule.retired.iter().any(|item| item.id == id)
+}
+
+fn retired_total(schedule: &Schedule) -> u64 {
+    schedule
+        .archive
+        .as_ref()
+        .map_or(schedule.retired.len() as u64, |head| head.rows)
 }
 
 fn item_number(id: &str) -> Result<u64> {
