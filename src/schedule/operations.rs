@@ -12,7 +12,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
         if name == "schedule_archive" {
             authorize_manager(st, actor, team, &[])?;
             let path = Path::new(&st.schedules[team].path);
-            return archive::sweep(st, team, document, path, true);
+            return archive::sweep(st, team, document, path, true, store.archive_limit());
         }
         if name == "schedule_add" {
             let title = args.text("title")?.to_owned();
@@ -300,14 +300,21 @@ fn resolve_dependencies(
         }
     }
     validate_dependencies(id, deps, &allowed)?;
-    let archived = if deps
+    let mut archived = vec![];
+    for dependency in deps
         .iter()
-        .any(|dependency| absent_retired(schedule, dependency))
+        .filter(|dependency| absent_retired(schedule, dependency))
     {
-        archive::load(Path::new(&st.schedules[team].path), schedule)?
-    } else {
-        vec![]
-    };
+        match archive::lookup(Path::new(&st.schedules[team].path), schedule, dependency) {
+            Ok(item) => archived.push(item),
+            Err(error) if error.reason == Reason::NotFound => {
+                return Err(conflict(format!(
+                    "schedule dependency {dependency} expired from the archive; omit it if it was complete"
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let mut satisfied = vec![];
     for dependency in deps.iter() {
         if schedule

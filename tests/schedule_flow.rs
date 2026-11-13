@@ -136,8 +136,8 @@ fn markdown_roundtrip_preserves_prose_and_rejects_unknown_data() {
     let doc = schedule::read_document(&f.path).unwrap();
     assert_eq!(doc.schedule.items[0].title, "한글 작업");
     let changed = changed.replacen(
-        "\"schema_version\": 2",
-        "\"unknown_field\": true, \"schema_version\": 2",
+        "\"schema_version\": 3",
+        "\"unknown_field\": true, \"schema_version\": 3",
         1,
     );
     fs::write(&f.path, changed).unwrap();

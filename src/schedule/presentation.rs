@@ -14,30 +14,20 @@ pub(super) fn show(store: &Store, st: &State, team: &str, args: &commands::Input
             .get(team)
             .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
         let document = read_document(Path::new(&reg.path))?;
-        if document.schedule.id != reg.schedule_id {
-            return Err(conflict("schedule identity changed"));
-        }
-        if let Some(item) = document.schedule.items.iter().find(|item| &item.id == id) {
-            return Ok(item_view(
-                store,
-                st,
-                team,
-                &document.schedule,
-                item,
-                true,
-                false,
-            ));
-        }
-        let item = archive::lookup(Path::new(&reg.path), &document.schedule, id)?;
-        return Ok(item_view(
-            store,
-            st,
-            team,
+        return archive::read_with_migration_retry(
+            Path::new(&reg.path),
             &document.schedule,
-            &item,
-            true,
-            true,
-        ));
+            |schedule| {
+                if schedule.id != reg.schedule_id {
+                    return Err(conflict("schedule identity changed"));
+                }
+                if let Some(item) = schedule.items.iter().find(|item| &item.id == id) {
+                    return Ok(item_view(store, st, team, schedule, item, true, false));
+                }
+                let item = archive::lookup(Path::new(&reg.path), schedule, id)?;
+                Ok(item_view(store, st, team, schedule, &item, true, true))
+            },
+        );
     }
     view_mode(store, st, team, args.all)
 }
@@ -64,106 +54,119 @@ fn view_mode(store: &Store, st: &State, team: &str, all: bool) -> Result<Value> 
             );
         }
     };
-    let manager_id = reg
-        .manager
-        .as_ref()
-        .or_else(|| st.teams.get(team).map(|t| &t.commander));
-    let manager=manager_id.and_then(|id|st.members.get(id)).map(|m| {
+    archive::read_with_migration_retry(Path::new(&reg.path), &document.schedule, |schedule| {
+        if schedule.id != reg.schedule_id {
+            return Err(conflict("schedule identity changed"));
+        }
+        let manager_id = reg
+            .manager
+            .as_ref()
+            .or_else(|| st.teams.get(team).map(|t| &t.commander));
+        let manager=manager_id.and_then(|id|st.members.get(id)).map(|m| {
         let state=if m.status!=MemberStatus::Active || authz::bu_cancelled(st,&m.bu)
             || !authz::effective_grants(st,&m.id).iter().any(|g|g.verbs.contains(&Verb::Assign)&&!g.scope.is_empty()) {"unknown"}
             else if m.binding.state==BindingState::Bound && m.binding.session_id.as_deref().and_then(|id|store.last_seen(id)).is_some_and(|at|now_ms().saturating_sub(at)>7_200_000) {"quiet"}
             else {match m.binding.state {BindingState::Bound=>"bound",BindingState::Pending=>"pending",BindingState::Vacant=>"vacant"}};
         json!({"member":m.id,"alias":m.binding.alias,"mode":if reg.manager.is_some(){"delegated"}else{"commander"},"state":state})
     });
-    let mut items: Vec<Value> = document
-        .schedule
-        .items
-        .iter()
-        .map(|item| item_view(store, st, team, &document.schedule, item, false, false))
-        .collect();
-    items.sort_by_key(|item| {
-        (
-            item["priority"].as_u64().unwrap_or(100),
-            item["id"].as_str().unwrap_or("").to_owned(),
-        )
-    });
-    let stages = [
-        "unassigned",
-        "dependency_wait",
-        "ready",
-        "dispatching",
-        "awaiting_acceptance",
-        "working",
-        "blocked",
-        "vacant",
-        "review",
-        "complete",
-        "cancelled",
-        "held",
-        "unknown",
-    ];
-    let mut counts: BTreeMap<&str, usize> = stages.iter().map(|stage| (*stage, 0)).collect();
-    for item in &items {
-        if let Some(count) = item["stage"]
-            .as_str()
-            .and_then(|stage| counts.get_mut(stage))
-        {
-            *count += 1;
-        }
-    }
-    counts.insert("queued", counts["unassigned"] + counts["dependency_wait"]);
-    counts.insert("total", items.len());
-    counts.insert("retired", retired_total(&document.schedule) as usize);
-    if all {
-        for item in archive::load(Path::new(&reg.path), &document.schedule)? {
-            items.push(item_view(
-                store,
-                st,
-                team,
-                &document.schedule,
-                &item,
-                false,
-                true,
-            ));
-        }
-    } else {
-        items.retain(|item| {
-            item["stage"] != "complete"
-                && (item["stage"] != "cancelled"
-                    || item["dispatches"].as_array().is_some_and(|dispatches| {
-                        dispatches.iter().any(|dispatch| {
-                            matches!(
-                                dispatch["status"].as_str(),
-                                Some("proposed" | "accepted" | "blocked")
-                            )
-                        })
-                    }))
-        });
-    }
-    let next_action = [
-        "unknown",
-        "held",
-        "blocked",
-        "vacant",
-        "dispatching",
-        "review",
-        "ready",
-        "unassigned",
-        "dependency_wait",
-        "awaiting_acceptance",
-        "working",
-    ]
-    .iter()
-    .find_map(|stage| {
-        items
+        let mut items: Vec<Value> = schedule
+            .items
             .iter()
-            .find(|item| item["stage"] == *stage)
-            .and_then(|item| item["next_action"].as_str())
+            .map(|item| item_view(store, st, team, schedule, item, false, false))
+            .collect();
+        items.sort_by_key(|item| {
+            (
+                item["priority"].as_u64().unwrap_or(100),
+                item["id"].as_str().unwrap_or("").to_owned(),
+            )
+        });
+        let stages = [
+            "unassigned",
+            "dependency_wait",
+            "ready",
+            "dispatching",
+            "awaiting_acceptance",
+            "working",
+            "blocked",
+            "vacant",
+            "review",
+            "complete",
+            "cancelled",
+            "held",
+            "unknown",
+        ];
+        let mut counts: BTreeMap<&str, usize> = stages.iter().map(|stage| (*stage, 0)).collect();
+        for item in &items {
+            if let Some(count) = item["stage"]
+                .as_str()
+                .and_then(|stage| counts.get_mut(stage))
+            {
+                *count += 1;
+            }
+        }
+        counts.insert("queued", counts["unassigned"] + counts["dependency_wait"]);
+        counts.insert("total", items.len());
+        counts.insert(
+            "retired",
+            schedule
+                .archive
+                .as_ref()
+                .map_or(schedule.retired.len() as u64, ArchiveHead::retained_rows)
+                as usize,
+        );
+        counts.insert(
+            "expired",
+            schedule
+                .archive
+                .as_ref()
+                .map_or(0, |head| head.expired_rows) as usize,
+        );
+        if all {
+            let loaded = archive::load(Path::new(&reg.path), schedule)?;
+            counts.insert("retired", loaded.items.len());
+            counts.insert("expired", loaded.expired_rows as usize);
+            for item in loaded.items {
+                items.push(item_view(store, st, team, schedule, &item, false, true));
+            }
+        } else {
+            items.retain(|item| {
+                item["stage"] != "complete"
+                    && (item["stage"] != "cancelled"
+                        || item["dispatches"].as_array().is_some_and(|dispatches| {
+                            dispatches.iter().any(|dispatch| {
+                                matches!(
+                                    dispatch["status"].as_str(),
+                                    Some("proposed" | "accepted" | "blocked")
+                                )
+                            })
+                        }))
+            });
+        }
+        let next_action = [
+            "unknown",
+            "held",
+            "blocked",
+            "vacant",
+            "dispatching",
+            "review",
+            "ready",
+            "unassigned",
+            "dependency_wait",
+            "awaiting_acceptance",
+            "working",
+        ]
+        .iter()
+        .find_map(|stage| {
+            items
+                .iter()
+                .find(|item| item["stage"] == *stage)
+                .and_then(|item| item["next_action"].as_str())
+        })
+        .unwrap_or("지금 필요한 일정 판단이 없습니다");
+        Ok(
+            json!({"registered":true,"schedule_id":reg.schedule_id,"path":reg.path,"revision":schedule.revision,"manager":manager,"items":items,"counts":counts,"next_action":next_action}),
+        )
     })
-    .unwrap_or("지금 필요한 일정 판단이 없습니다");
-    Ok(
-        json!({"registered":true,"schedule_id":reg.schedule_id,"path":reg.path,"revision":document.schedule.revision,"manager":manager,"items":items,"counts":counts,"next_action":next_action}),
-    )
 }
 
 fn item_view(

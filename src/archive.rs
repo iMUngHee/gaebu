@@ -1,11 +1,6 @@
 //! Durable JSONL writes and streaming scans. Policy and commit boundaries belong
 //! to the caller; malformed, unreferenced lines may be left by interrupted writes.
 
-#![expect(
-    dead_code,
-    reason = "Segment primitives form the internal archive interface."
-)]
-
 use crate::{Error, Reason, Result};
 use serde::de::DeserializeOwned;
 use std::{
@@ -33,6 +28,7 @@ pub(crate) fn scan<T: DeserializeOwned>(path: &Path, mut visit: impl FnMut(T)) -
 }
 
 /// Read only a published prefix; incomplete lines are corruption, never leftovers.
+#[cfg(test)]
 pub(crate) fn scan_prefix(
     path: &Path,
     committed: u64,
@@ -291,6 +287,19 @@ pub(crate) struct Enforcement<S> {
     pub deferred: Option<String>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static FAILED_UNLINK:std::cell::RefCell<Option<PathBuf>>=const {std::cell::RefCell::new(None)};
+}
+
+fn unlink_segment(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAILED_UNLINK.with_borrow(|failed| failed.as_deref() == Some(path)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    fs::remove_file(path)
+}
+
 pub(crate) fn enforce_limit<S: Segment>(
     base: &Path,
     segments: &mut Vec<S>,
@@ -301,7 +310,7 @@ pub(crate) fn enforce_limit<S: Segment>(
         segments,
         limit,
         || crate::store::sync_dir(parent(base)?),
-        |path| fs::remove_file(path),
+        unlink_segment,
     )
 }
 
@@ -389,7 +398,7 @@ pub(crate) fn remove_unlisted<S: Segment>(base: &Path, segments: &[S]) -> Result
         return Ok(Some(error.message));
     }
     for path in extra.values() {
-        if let Err(error) = fs::remove_file(path)
+        if let Err(error) = unlink_segment(path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Ok(Some(error.to_string()));
@@ -651,6 +660,136 @@ mod tests {
         for n in [1, 9, 42] {
             assert!(!segment_path(&base, n).exists());
         }
+        std::fs::remove_dir_all(store.home()).unwrap();
+    }
+    #[test]
+    fn empty_archives_preserve_next_and_append_below_rollover() {
+        let (store, base) = fixture();
+        let empty: Vec<SegmentRecord> = vec![];
+        assert_eq!(prepare_segments(&base, &empty).unwrap(), 0);
+        let mut next = 7;
+        let new = append_segment(&base, &empty, &mut next, 8, b"one\n").unwrap();
+        assert_eq!((new.number, new.bytes, new.created, next), (7, 4, true, 8));
+        let segments = vec![SegmentRecord { n: 7, bytes: 4 }];
+        let next_append = append_segment(&base, &segments, &mut next, 8, b"two\n").unwrap();
+        assert_eq!(
+            (
+                next_append.number,
+                next_append.bytes,
+                next_append.created,
+                next
+            ),
+            (7, 8, false, 8)
+        );
+        assert_eq!(
+            std::fs::read(segment_path(&base, 7)).unwrap(),
+            b"one\ntwo\n"
+        );
+        assert!(!segment_path(&base, 8).exists());
+        std::fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn invalid_metadata_and_open_errors_refuse_without_writes() {
+        let (store, base) = fixture();
+        std::fs::write(&base, b"one\n").unwrap();
+        for segments in [
+            vec![SegmentRecord { n: 1, bytes: 0 }],
+            vec![
+                SegmentRecord { n: 1, bytes: 4 },
+                SegmentRecord { n: 1, bytes: 4 },
+            ],
+        ] {
+            assert_eq!(
+                prepare_segments(&base, &segments).unwrap_err().reason,
+                Reason::StoreCorrupt
+            );
+        }
+        let segments = vec![SegmentRecord { n: 1, bytes: 4 }];
+        for mut next in [0, 1] {
+            assert_eq!(
+                append_segment(&base, &segments, &mut next, 4, b"two\n")
+                    .unwrap_err()
+                    .reason,
+                Reason::StoreCorrupt
+            );
+        }
+        assert_eq!(std::fs::read(&base).unwrap(), b"one\n");
+        assert_eq!(
+            open_optional(&store.home().join("invalid\0path"))
+                .unwrap_err()
+                .reason,
+            Reason::StoreWriteFailed
+        );
+        for limit in [0, 1, 7] {
+            assert!(
+                crate::store::Store::open_with_archive_limit(
+                    store.home().join("invalid-limit"),
+                    limit
+                )
+                .is_err()
+            );
+        }
+        let small =
+            crate::store::Store::open_with_archive_limit(store.home().join("small"), 8).unwrap();
+        assert_eq!(small.archive_limit(), 8);
+        assert_eq!(store.archive_limit(), 64);
+        std::fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn enforcement_preserves_exact_bound_and_only_newest() {
+        for (count, limit, remaining) in [
+            (3, 4, 2),
+            (4, 4, 2),
+            (2, 4, 2),
+            (1, 1, 1),
+            (16, 1000, 16),
+            (17, 1000, 16),
+        ] {
+            let (store, base) = fixture();
+            let mut segments: Vec<_> = (1..=count)
+                .map(|n| {
+                    std::fs::write(segment_path(&base, n), b"x\n").unwrap();
+                    SegmentRecord { n, bytes: 2 }
+                })
+                .collect();
+            let result = enforce_limit(&base, &mut segments, limit).unwrap();
+            assert!(result.deferred.is_none());
+            assert_eq!(segments.len(), remaining);
+            assert_eq!(result.expired.len(), count as usize - remaining);
+            assert_eq!(segments.last().unwrap().n, count);
+            for segment in &segments {
+                assert!(segment_path(&base, segment.n).exists());
+            }
+            std::fs::remove_dir_all(store.home()).unwrap();
+        }
+    }
+
+    #[test]
+    fn unlink_failure_defers_enforcement_and_unlisted_cleanup() {
+        let (store, base) = fixture();
+        let mut segments: Vec<_> = (1..=2)
+            .map(|n| {
+                std::fs::write(segment_path(&base, n), b"x\n").unwrap();
+                SegmentRecord { n, bytes: 2 }
+            })
+            .collect();
+        let result = enforce_with(
+            &base,
+            &mut segments,
+            2,
+            || Ok(()),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap();
+        assert!(result.deferred.is_some());
+        assert!(result.expired.is_empty());
+        assert_eq!(segments.len(), 2);
+        assert!(base.exists());
+        std::fs::create_dir(segment_path(&base, 9)).unwrap();
+        assert!(remove_unlisted(&base, &segments).unwrap().is_some());
+        assert!(segment_path(&base, 9).is_dir());
         std::fs::remove_dir_all(store.home()).unwrap();
     }
 }

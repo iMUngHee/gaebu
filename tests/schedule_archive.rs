@@ -223,11 +223,19 @@ fn commit_fixture(f: &Fixture, document: &mut schedule::Schedule) {
         rows += 1;
     }
     document.archive = Some(schedule::ArchiveHead {
-        bytes: bytes.len() as u64,
-        rows,
-        chain: chain.iter().map(|byte| format!("{byte:02x}")).collect(),
+        base: gaebu::evidence::sha256_hex(&document.id),
+        expired_rows: 0,
+        next: 2,
         last_item,
         last_dispatch,
+        segments: vec![schedule::ArchiveSegment {
+            n: 1,
+            bytes: bytes.len() as u64,
+            rows,
+            chain: chain.iter().map(|byte| format!("{byte:02x}")).collect(),
+            lo: 1,
+            hi: last_item,
+        }],
     });
     f.write(document);
 }
@@ -540,7 +548,7 @@ fn corrupt_archive_hash_and_missing_line_are_rejected() {
         f.call("schedule_show", json!({"item":item}))
             .unwrap_err()
             .reason,
-        Reason::StoreCorrupt
+        Reason::NotFound
     );
     f.add("active remains usable", &[]);
 }
@@ -785,7 +793,7 @@ fn bu_close_refuses_a_replaced_schedule_identity() {
     let child = f.child_bu();
     let mut document = f.document();
     document.id = "replaced-schedule".into();
-    document.archive.as_mut().unwrap().chain = gaebu::evidence::sha256_hex(&document.id);
+    document.archive.as_mut().unwrap().base = gaebu::evidence::sha256_hex(&document.id);
     f.write(&document);
     let error = schedule::transaction(&f.store, &f.root, |st, actor| {
         ops::bu_close(st, now_ms(), actor, &child)
@@ -827,7 +835,7 @@ fn measured_shape() {
     let mut open_only = f.document();
     assert_eq!(open_only.items.len(), 32);
     assert!(open_only.retired.is_empty());
-    assert_eq!(open_only.archive.as_ref().unwrap().rows, 44);
+    assert_eq!(open_only.archive.as_ref().unwrap().retained_rows(), 44);
     open_only.retired.clear();
     let baseline = format!(
         "# Test\n<!-- gaebu-schedule -->\n```json\n{}\n```\n",
@@ -1522,7 +1530,7 @@ fn prune_drops_unreferenced_tombstones() {
         .unwrap();
     let document = f.document();
     assert!(document.retired.is_empty());
-    assert_eq!(document.archive.unwrap().rows, 1);
+    assert_eq!(document.archive.unwrap().retained_rows(), 1);
     assert_eq!(document.next_item, next);
 }
 
@@ -1740,7 +1748,7 @@ fn committed_prefix_detects_damage() {
                 commit_fixture(&f, &mut document);
             }
             "rows" => {
-                document.archive.as_mut().unwrap().rows += 1;
+                document.archive.as_mut().unwrap().segments[0].rows += 1;
                 f.write(&document);
             }
             _ => {
@@ -1748,6 +1756,18 @@ fn committed_prefix_detects_damage() {
                 document.next_dispatch += 1;
                 f.write(&document);
             }
+        }
+        if damage == "missing" {
+            assert_eq!(
+                f.call("schedule_show", json!({"item":item}))
+                    .unwrap_err()
+                    .reason,
+                Reason::NotFound
+            );
+            let all = f.call("schedule_show", json!({"all":true})).unwrap();
+            assert_eq!(all["counts"]["retired"], 0);
+            assert_eq!(all["counts"]["expired"], 2);
+            continue;
         }
         assert_eq!(
             f.call("schedule_show", json!({"item":item}))
@@ -1789,7 +1809,7 @@ fn committed_prefix_detects_damage() {
 
 #[test]
 fn sweep_refuses_damaged_committed_prefix() {
-    for damage in ["missing", "short", "newline"] {
+    for damage in ["short", "newline"] {
         let f = Fixture::new();
         let first = f.add("first", &[]);
         f.complete(&first);
@@ -1893,7 +1913,7 @@ fn uncommitted_tail_is_ignored_and_truncated() {
     assert_eq!(fs::read(f.archive_path()).unwrap(), original);
     assert_eq!(
         fs::metadata(f.archive_path()).unwrap().len(),
-        f.document().archive.unwrap().bytes
+        f.document().archive.unwrap().retained_bytes()
     );
 }
 
@@ -2121,11 +2141,11 @@ fn schema1_document_upgrades_on_first_write() {
     )
     .unwrap();
     let upgraded = f.document();
-    assert_eq!(upgraded.schema_version, 2);
+    assert_eq!(upgraded.schema_version, 3);
     assert_eq!(upgraded.retired.len(), 1);
     assert!(upgraded.items[0].depends_on.is_empty());
     assert_eq!(fs::read(f.archive_path()).unwrap(), clean);
-    assert_eq!(upgraded.archive.as_ref().unwrap().rows, 1);
+    assert_eq!(upgraded.archive.as_ref().unwrap().retained_rows(), 1);
     let mut verified = upgraded.clone();
     commit_fixture(&f, &mut verified);
     assert_eq!(upgraded.archive, verified.archive);
@@ -2163,11 +2183,11 @@ fn tombstones_stay_bounded() {
         last * 100 <= tenth * 105,
         "cycle10={tenth}, cycle300={last}"
     );
-    assert_eq!(f.document().archive.unwrap().rows, 300);
+    assert_eq!(f.document().archive.unwrap().retained_rows(), 300);
 }
 
 #[test]
-fn schema2_requires_coherent_head() {
+fn schema3_requires_coherent_head() {
     let f = Fixture::new();
     let original = f.document();
     let mut missing = original.clone();
@@ -2177,20 +2197,20 @@ fn schema2_requires_coherent_head() {
         schedule::read_document(&f.path).unwrap_err().reason,
         Reason::InvalidArgument
     );
-    for chain in ["short".to_owned(), "z".repeat(64), "0".repeat(64)] {
+    for base in ["short".to_owned(), "z".repeat(64), "0".repeat(64)] {
         let mut document = original.clone();
-        document.archive.as_mut().unwrap().chain = chain;
+        document.archive.as_mut().unwrap().base = base;
         f.write(&document);
         assert_eq!(
             schedule::read_document(&f.path).unwrap_err().reason,
             Reason::InvalidArgument
         );
     }
-    for field in ["bytes", "rows", "last_item", "last_dispatch"] {
+    for field in ["expired_rows", "last_item", "last_dispatch", "next"] {
         let mut document = original.clone();
-        let mut value = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
-        value[field] = json!(1);
-        document.archive = Some(serde_json::from_value(value).unwrap());
+        let mut head = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
+        head[field] = json!(if field == "next" { 0 } else { 1 });
+        document.archive = Some(serde_json::from_value(head).unwrap());
         document.next_item = 2;
         document.next_dispatch = 2;
         f.write(&document);
@@ -2206,18 +2226,18 @@ fn schema2_requires_coherent_head() {
     let original = f.document();
     for chain in ["short".to_owned(), "z".repeat(64)] {
         let mut document = original.clone();
-        document.archive.as_mut().unwrap().chain = chain;
+        document.archive.as_mut().unwrap().segments[0].chain = chain;
         f.write(&document);
         assert_eq!(
             schedule::read_document(&f.path).unwrap_err().reason,
             Reason::InvalidArgument
         );
     }
-    for field in ["bytes", "last_item"] {
+    for field in ["bytes", "rows", "n", "lo", "hi"] {
         let mut document = original.clone();
-        let mut value = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
-        value[field] = json!(0);
-        document.archive = Some(serde_json::from_value(value).unwrap());
+        let mut head = serde_json::to_value(document.archive.as_ref().unwrap()).unwrap();
+        head["segments"][0][field] = json!(0);
+        document.archive = Some(serde_json::from_value(head).unwrap());
         f.write(&document);
         assert_eq!(
             schedule::read_document(&f.path).unwrap_err().reason,
@@ -2232,7 +2252,7 @@ fn schema2_requires_coherent_head() {
         schedule::read_document(&f.path).unwrap_err().reason,
         Reason::InvalidArgument
     );
-    document.schema_version = 3;
+    document.schema_version = 4;
     f.write(&document);
     assert_eq!(
         schedule::read_document(&f.path).unwrap_err().reason,
@@ -2308,8 +2328,534 @@ fn allocated_but_missing_dependency_is_refused() {
         }
         assert_eq!(
             f.call(operation, args).unwrap_err().reason,
-            Reason::InvalidArgument
+            Reason::Conflict
         );
         assert_eq!(f.document().revision, document.revision);
     }
+}
+
+impl Fixture {
+    fn with_limit(limit: u64) -> Self {
+        let mut f = Self::new();
+        f.reopen_limit(limit);
+        f
+    }
+    fn reopen_limit(&mut self, limit: u64) {
+        self.store = Store::open_with_archive_limit(self.store.home().to_owned(), limit).unwrap();
+    }
+    fn segment_path(&self, n: u64) -> PathBuf {
+        if n == 1 {
+            self.archive_path()
+        } else {
+            self.path
+                .with_file_name(format!("schedule.md.archive.{n}.jsonl"))
+        }
+    }
+    fn archive_disk_bytes(&self) -> u64 {
+        fs::read_dir(self.path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("schedule.md.archive") && name.ends_with(".jsonl")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum()
+    }
+    fn retire_batch(&self, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|n| {
+                let id = self.add(&format!("row {n}: {}", "x".repeat(200)), &[]);
+                self.complete(&id);
+                id
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn schedule_archive_stays_under_limit() {
+    let f = Fixture::with_limit(4096);
+    let anchor = f.add("anchor", &[]);
+    let live = f.add("depends on anchor", &[&anchor]);
+    f.complete(&anchor);
+    let mut batch = 0;
+    let mut written = 0;
+    for n in 0..70 {
+        let id = f.add(&format!("bounded {n}: {}", "x".repeat(200)), &[]);
+        f.complete(&id);
+        let head = f.document().archive.unwrap();
+        let newest = head.segments.last().unwrap().bytes;
+        batch = batch.max(newest);
+        written += newest;
+        assert!(f.archive_disk_bytes() <= 4096 + batch);
+        assert!(head.segments.len() <= 17);
+        assert!(f.document().retired.iter().any(|r| r.id == anchor));
+    }
+    assert!(written > 4096 * 10);
+    assert_eq!(
+        f.call("schedule_show", json!({"item":live})).unwrap()["stage"],
+        "ready"
+    );
+    let error = f.call("schedule_show", json!({"item":anchor})).unwrap_err();
+    assert_eq!(error.reason, Reason::NotFound);
+    assert!(error.message.contains("expired from the archive"));
+}
+
+#[test]
+fn segments_roll_and_chain_continues() {
+    let f = Fixture::with_limit(2048);
+    let first = f.add("has dispatch", &[]);
+    let dispatch = f.dispatch(&first, "attempt").unwrap();
+    f.done(dispatch["duty"].as_str().unwrap());
+    f.complete(&first);
+    let mut previous = f.document().archive.unwrap();
+    let mut deleted = false;
+    for _ in 0..16 {
+        f.retire_batch(1);
+        let head = f.document().archive.unwrap();
+        assert!(head.next > previous.next);
+        if let Some(old) = previous
+            .segments
+            .iter()
+            .rfind(|old| !head.segments.iter().any(|s| s.n == old.n))
+        {
+            assert_eq!(head.base, old.chain);
+            deleted = true;
+        }
+        f.call("schedule_show", json!({"all":true})).unwrap();
+        previous = head;
+    }
+    assert!(deleted);
+    assert!(previous.last_dispatch >= 1);
+    let original = f.document();
+    let mut bad = original.clone();
+    bad.next_dispatch = 1;
+    f.write(&bad);
+    assert!(schedule::read_document(&f.path).is_err());
+    bad = original;
+    bad.next_item = previous.last_item;
+    f.write(&bad);
+    assert!(schedule::read_document(&f.path).is_err());
+}
+
+#[test]
+fn expired_item_reports_expiry() {
+    let f = Fixture::with_limit(2048);
+    let ids = f.retire_batch(20);
+    let expired = &ids[0];
+    assert!(!f.document().retired.iter().any(|r| &r.id == expired));
+    let error = f
+        .call("schedule_show", json!({"item":expired}))
+        .unwrap_err();
+    assert_eq!(error.reason, Reason::NotFound);
+    assert_eq!(
+        error.message,
+        format!("schedule item {expired} expired from the archive")
+    );
+    let all = f.call("schedule_show", json!({"all":true})).unwrap();
+    assert!(all["counts"]["expired"].as_u64().unwrap() > 0);
+    assert_eq!(
+        all["counts"]["retired"].as_u64().unwrap(),
+        all["items"].as_array().unwrap().len() as u64
+    );
+    let error = f
+        .call(
+            "schedule_add",
+            json!({"title":"depend","scope":[],"depends_on":[expired]}),
+        )
+        .unwrap_err();
+    assert_eq!(error.reason, Reason::Conflict);
+    assert!(error.message.contains("omit it if it was complete"));
+    assert_eq!(
+        f.call("schedule_update", json!({"item":expired,"priority":3}))
+            .unwrap_err()
+            .reason,
+        Reason::Conflict
+    );
+}
+
+#[test]
+fn lookup_skips_segments_by_bounds() {
+    let mut f = Fixture::with_limit(8192);
+    let early = f.add("low id retires late", &[]);
+    let middle = f.add("higher id retires early", &[]);
+    f.complete(&middle);
+    f.reopen_limit(2048);
+    f.complete(&early);
+    let newest = f.add("newest", &[]);
+    f.complete(&newest);
+    let mut document = f.document();
+    let head = document.archive.as_mut().unwrap();
+    assert!(head.segments.len() >= 3);
+    head.segments[0].lo = 1;
+    head.segments[0].hi = head.last_item;
+    let corrupt = head.segments[0].n;
+    f.write(&document);
+    let path = f.segment_path(corrupt);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = b'!';
+    fs::write(path, bytes).unwrap();
+    assert_eq!(
+        f.call("schedule_show", json!({"item":newest})).unwrap()["title"],
+        "newest"
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"item":early})).unwrap()["title"],
+        "low id retires late"
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"item":middle}))
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+    assert_eq!(
+        f.call("schedule_show", json!({"all":true}))
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+}
+
+#[test]
+fn explicit_maintenance_enforces_limit_without_new_rows() {
+    let mut f = Fixture::with_limit(64 * 1024);
+    f.reopen_limit(4096);
+    f.retire_batch(10);
+    f.reopen_limit(64 * 1024);
+    // The already small segments remain independent after the limit increases.
+    f.retire_batch(2);
+    let before = f.document().archive.unwrap();
+    assert!(before.segments.len() > 1);
+    f.reopen_limit(1024);
+    let result = f.call("schedule_archive", json!({})).unwrap();
+    assert!(result["retired"].as_array().unwrap().is_empty());
+    assert!(result["expired"]["segments"].as_u64().unwrap() > 0);
+    let head = f.document().archive.unwrap();
+    assert!(head.retained_bytes() <= 1024 || head.segments.len() == 1);
+    assert_eq!(f.archive_disk_bytes(), head.retained_bytes());
+    assert_eq!(result["retained_bytes"], head.retained_bytes());
+    assert_eq!(result["limit_bytes"], 1024);
+    let original = fs::read(&f.path).unwrap();
+    f.call("schedule_archive", json!({})).unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+}
+
+#[test]
+fn maintenance_removes_unlisted_sidecar_files() {
+    let f = Fixture::with_limit(2048);
+    f.retire_batch(6);
+    let head = f.document().archive.unwrap();
+    for n in [1, head.next, head.next + 9] {
+        if !head.segments.iter().any(|s| s.n == n) {
+            fs::write(f.segment_path(n), b"unpublished").unwrap();
+        }
+    }
+    let result = f.call("schedule_archive", json!({})).unwrap();
+    assert!(result.get("expiry_deferred").is_none());
+    assert_eq!(
+        f.archive_disk_bytes(),
+        f.document().archive.unwrap().retained_bytes()
+    );
+    let bytes = fs::read(&f.path).unwrap();
+    f.call("schedule_archive", json!({})).unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), bytes);
+}
+
+#[test]
+fn listed_segments_have_no_uncommitted_tail() {
+    use std::io::Write;
+    let mut f = Fixture::with_limit(64 * 1024);
+    f.retire_batch(1);
+    for pass in 0..3 {
+        let before = f.document().archive.unwrap();
+        let last = before.segments.last().unwrap();
+        let path = f.segment_path(last.n);
+        let prefix = fs::read(&path).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{uncommitted tail}")
+            .unwrap();
+        if pass < 2 {
+            f.reopen_limit(2048);
+            f.retire_batch(1);
+        } else {
+            f.call("schedule_archive", json!({})).unwrap();
+        }
+        let head = f.document().archive.unwrap();
+        if path.exists() {
+            assert_eq!(&fs::read(&path).unwrap()[..prefix.len()], prefix.as_slice());
+        }
+        for s in &head.segments {
+            assert_eq!(fs::metadata(f.segment_path(s.n)).unwrap().len(), s.bytes);
+        }
+        let largest = head.segments.iter().map(|s| s.bytes).max().unwrap_or(0);
+        assert!(f.archive_disk_bytes() <= f.store.archive_limit() + largest);
+    }
+}
+
+#[test]
+fn segment_count_is_capped_across_limits() {
+    let mut f = Fixture::with_limit(64 * 1024);
+    f.reopen_limit(8192);
+    f.retire_batch(8);
+    f.reopen_limit(1024 * 1024);
+    // Each batch exceeds the large segment threshold, so the count gate is independent of bytes.
+    for n in 0..20 {
+        let id = f.add(&format!("large {n}: {}", "x".repeat(14000)), &[]);
+        f.complete(&id);
+        assert!(f.document().archive.unwrap().segments.len() <= 17);
+    }
+    assert!(f.document().archive.unwrap().segments.len() >= 2);
+}
+
+#[test]
+fn missing_prefix_is_expired_but_holes_are_corrupt() {
+    for missing in ["prefix", "all", "middle", "last"] {
+        let f = Fixture::with_limit(4096);
+        f.retire_batch(4);
+        let head = f.document().archive.unwrap();
+        assert!(head.segments.len() >= 3);
+        let indices: Vec<_> = match missing {
+            "prefix" => vec![0],
+            "all" => (0..head.segments.len()).collect(),
+            "middle" => vec![1],
+            _ => vec![head.segments.len() - 1],
+        };
+        for index in indices {
+            fs::remove_file(f.segment_path(head.segments[index].n)).unwrap();
+        }
+        let before = fs::read(&f.path).unwrap();
+        if matches!(missing, "middle" | "last") {
+            assert_eq!(
+                f.call("schedule_show", json!({"all":true}))
+                    .unwrap_err()
+                    .reason,
+                Reason::StoreCorrupt
+            );
+            assert_eq!(
+                f.call("schedule_archive", json!({})).unwrap_err().reason,
+                Reason::StoreCorrupt
+            );
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+        } else {
+            let shown = f.call("schedule_show", json!({"all":true})).unwrap();
+            assert!(shown["counts"]["expired"].as_u64().unwrap() > head.expired_rows);
+            f.call("schedule_archive", json!({})).unwrap();
+            let normalized = f.document().archive.unwrap();
+            assert_eq!(normalized.next, head.next);
+            let id = f.retire_batch(1).pop().unwrap();
+            assert!(f.document().archive.unwrap().segments.last().unwrap().n >= head.next - 1);
+            assert_eq!(
+                f.call("schedule_show", json!({"item":id})).unwrap()["stage"],
+                "complete"
+            );
+        }
+    }
+}
+
+#[test]
+fn segment_number_survives_empty_normalization() {
+    let mut f = Fixture::with_limit(8);
+    let first = f.retire_batch(1).pop().unwrap();
+    let old_reader = f.document();
+    let second = f.add("next", &[]);
+    let surviving = f.document();
+    f.complete(&second);
+    assert!(!f.segment_path(1).exists());
+    f.write(&surviving);
+    f.call("schedule_archive", json!({})).unwrap();
+    let empty = f.document().archive.unwrap();
+    assert!(empty.segments.is_empty());
+    assert_eq!(empty.next, 2);
+    f.reopen_limit(8);
+    f.complete(&second);
+    let latest = f.document();
+    assert!(latest.archive.as_ref().unwrap().segments[0].n >= 2);
+    f.write(&old_reader);
+    let old = f.call("schedule_show", json!({"all":true})).unwrap();
+    assert!(old["items"].as_array().unwrap().is_empty());
+    assert_eq!(old["counts"]["expired"], 1);
+    assert_eq!(
+        f.call("schedule_show", json!({"item":first}))
+            .unwrap_err()
+            .reason,
+        Reason::NotFound
+    );
+    f.write(&latest);
+}
+
+#[test]
+fn unpublished_segment_is_reused() {
+    use std::io::Write;
+    let f = Fixture::with_limit(4096);
+    f.retire_batch(1);
+    let head = f.document().archive.unwrap();
+    let last = head.segments.last().unwrap();
+    let prefix = fs::read(f.segment_path(last.n)).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(f.segment_path(last.n))
+        .unwrap()
+        .write_all(b"{tail")
+        .unwrap();
+    fs::write(f.segment_path(head.next), b"unpublished garbage").unwrap();
+    f.retire_batch(1);
+    let after = f.document().archive.unwrap();
+    assert_eq!(after.segments.last().unwrap().n, head.next);
+    assert_eq!(fs::read(f.segment_path(last.n)).unwrap(), prefix);
+    let bytes = fs::read(f.segment_path(head.next)).unwrap();
+    assert!(serde_json::from_slice::<Value>(&bytes).is_ok());
+    assert_eq!(after.next, head.next + 1);
+}
+
+#[test]
+fn sweep_refuses_damaged_segment() {
+    for roll in [false, true] {
+        for damage in ["short", "newline", "missing"] {
+            let mut f = Fixture::with_limit(4096);
+            f.retire_batch(4);
+            let head = f.document().archive.unwrap();
+            assert!(head.segments.len() > 1);
+            f.reopen_limit(if roll { 8 } else { 1024 * 1024 });
+            let last = head.segments.last().unwrap();
+            let path = f.segment_path(last.n);
+            let mut bytes = fs::read(&path).unwrap();
+            match damage {
+                "short" => {
+                    bytes.pop();
+                    fs::write(&path, &bytes).unwrap();
+                }
+                "newline" => {
+                    *bytes.last_mut().unwrap() = b'x';
+                    fs::write(&path, &bytes).unwrap();
+                }
+                _ => fs::remove_file(&path).unwrap(),
+            }
+            let damaged = fs::read(&path).ok();
+            let item = f.add("must stay hot", &[]);
+            f.complete(&item);
+            assert_eq!(f.document().archive.unwrap(), head);
+            assert!(
+                f.document()
+                    .items
+                    .iter()
+                    .any(|i| i.id == item && i.completion.is_some())
+            );
+            assert_eq!(
+                f.call("schedule_archive", json!({})).unwrap_err().reason,
+                Reason::StoreCorrupt
+            );
+            assert_eq!(fs::read(&path).ok(), damaged);
+            assert!(!f.segment_path(head.next).exists());
+        }
+    }
+}
+
+#[test]
+fn schema2_document_reads_and_upgrades() {
+    for nonempty in [false, true] {
+        let f = Fixture::new();
+        if nonempty {
+            f.retire_batch(1);
+        }
+        let document = f.document();
+        let head = document.archive.as_ref().unwrap();
+        let mut old = serde_json::to_value(&document).unwrap();
+        old["schema_version"] = json!(2);
+        old["archive"] = json!({"bytes":head.retained_bytes(),"rows":head.retained_rows(),"chain":head.segments.last().map_or(&head.base,|s|&s.chain),"last_item":head.last_item,"last_dispatch":head.last_dispatch});
+        fs::write(
+            &f.path,
+            format!("<!-- gaebu-schedule -->\n```json\n{old}\n```\n"),
+        )
+        .unwrap();
+        let original = fs::read(f.archive_path()).ok();
+        f.call("schedule_show", json!({"all":true})).unwrap();
+        assert_eq!(fs::read(f.archive_path()).ok(), original);
+        f.add("first write upgrades", &[]);
+        assert_eq!(f.document().schema_version, 3);
+        assert_eq!(fs::read(f.archive_path()).ok(), original);
+        if nonempty {
+            assert_eq!(f.document().archive.unwrap().segments[0].n, 1);
+        } else {
+            assert!(f.document().archive.unwrap().segments.is_empty());
+            assert!(original.is_none());
+        }
+    }
+}
+
+#[test]
+fn move_requires_every_listed_segment() {
+    let f = Fixture::with_limit(4096);
+    f.retire_batch(4);
+    let head = f.document().archive.unwrap();
+    assert!(head.segments.len() > 1);
+    let destination = f.path.with_file_name("moved.md");
+    fs::rename(&f.path, &destination).unwrap();
+    let destination_segment = |n| {
+        if n == 1 {
+            destination.with_file_name("moved.md.archive.jsonl")
+        } else {
+            destination.with_file_name(format!("moved.md.archive.{n}.jsonl"))
+        }
+    };
+    for segment in head.segments.iter().skip(1) {
+        fs::copy(f.segment_path(segment.n), destination_segment(segment.n)).unwrap();
+    }
+    assert_eq!(
+        f.call("schedule_move", json!({"path":destination}))
+            .unwrap_err()
+            .reason,
+        Reason::StoreCorrupt
+    );
+    fs::copy(
+        f.segment_path(head.segments[0].n),
+        destination_segment(head.segments[0].n),
+    )
+    .unwrap();
+    f.call("schedule_move", json!({"path":destination}))
+        .unwrap();
+    assert_eq!(
+        f.call("schedule_show", json!({"all":true})).unwrap()["counts"]["retired"],
+        head.retained_rows()
+    );
+}
+
+#[test]
+fn recovered_duty_linked_to_expired_item_is_retired() {
+    let f = Fixture::with_limit(4096);
+    let item = f.add("recover after expiry", &[]);
+    let dispatch = f.dispatch(&item, "work").unwrap();
+    let duty = dispatch["duty"].as_str().unwrap();
+    f.done(duty);
+    f.complete(&item);
+    age_duty(&f, duty);
+    assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+    let previous = fs::read(f.store.home().join("state.prev.json")).unwrap();
+    f.call("schedule_archive", json!({})).unwrap();
+    assert!(!f.document().retired.iter().any(|r| r.id == item));
+    f.retire_batch(20);
+    assert_eq!(
+        f.call("schedule_show", json!({"item":item}))
+            .unwrap_err()
+            .reason,
+        Reason::NotFound
+    );
+    fs::write(f.store.home().join("state.prev.json"), previous).unwrap();
+    fs::write(f.store.home().join("state.json"), b"{").unwrap();
+    f.store.repair().unwrap();
+    assert!(f.store.read_current().unwrap().duties.contains_key(duty));
+    let before = fs::read(f.store.home().join("state.json")).unwrap();
+    let error = schedule::transaction(&f.store, &f.worker, |st, _| {
+        st.duties.get_mut(duty).unwrap().note = Some("must refuse".into());
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.reason, Reason::Conflict);
+    assert_eq!(error.message, "schedule item is retired");
+    assert_eq!(fs::read(f.store.home().join("state.json")).unwrap(), before);
 }
