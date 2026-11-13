@@ -275,6 +275,7 @@ pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Heal
             crate::store::sync_dir(parent(base)?)
         },
         unlink_segment,
+        open_optional,
     )
 }
 
@@ -283,9 +284,10 @@ fn heal_with<S: Segment>(
     segments: &[S],
     mut sync: impl FnMut() -> Result<()>,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
+    mut open: impl FnMut(&Path) -> Result<Option<File>>,
 ) -> Result<Healed> {
     let mut result = Healed::default();
-    let (retained, hole) = inspect_heal_with(base, segments, open_optional)?;
+    let (retained, hole) = inspect_heal_with(base, segments, &mut open)?;
     if !hole {
         return Ok(result);
     }
@@ -323,7 +325,13 @@ fn heal_with<S: Segment>(
     if let Err(error) = delete {
         result.deferred = Some(error.message);
     }
-    result.hole_remaining = inspect_heal_with(base, segments, open_optional)?.1;
+    result.hole_remaining = match inspect_heal_with(base, segments, &mut open) {
+        Ok((_, hole)) => hole,
+        Err(error) => {
+            result.deferred.get_or_insert(error.message);
+            true
+        }
+    };
     Ok(result)
 }
 
@@ -608,6 +616,7 @@ mod tests {
                     .push(segment_number(&base, path.file_name().unwrap()).unwrap());
                 fs::remove_file(path)
             },
+            open_optional,
         )
         .unwrap();
         assert_eq!(*events.borrow(), [0, 2, 0, 3, 0, 4, 0]);
@@ -623,8 +632,14 @@ mod tests {
         }
         assert_eq!(fs::read(unrelated).unwrap(), b"keep");
         for list in [&segments[..], &segments[3..], &segments[..0]] {
-            let result =
-                heal_with(&base, list, || panic!("no hole"), |_| panic!("no hole")).unwrap();
+            let result = heal_with(
+                &base,
+                list,
+                || panic!("no hole"),
+                |_| panic!("no hole"),
+                open_optional,
+            )
+            .unwrap();
             assert!(result.segments.is_empty());
         }
         fs::remove_dir_all(store.home()).unwrap();
@@ -658,6 +673,7 @@ mod tests {
                         fs::remove_file(path)
                     }
                 },
+                open_optional,
             )
             .unwrap();
             assert!(result.deferred.is_some());
@@ -708,12 +724,62 @@ mod tests {
                 fs::remove_file(path)?;
                 Err(std::io::ErrorKind::NotFound.into())
             },
+            open_optional,
         )
         .unwrap();
         assert!(result.segments.is_empty());
         assert!(result.deferred.is_none());
         assert!(!result.hole_remaining);
         fs::remove_dir_all(store.home()).unwrap();
+    }
+
+    #[test]
+    fn heal_preserves_removal_report_when_reinspection_fails() {
+        for partial in [false, true] {
+            let (store, base) = fixture();
+            let segments = [
+                SegmentRecord { n: 3, bytes: 2 },
+                SegmentRecord { n: 4, bytes: 2 },
+            ];
+            for n in [2, 3] {
+                fs::write(segment_path(&base, n), b"x\n").unwrap();
+            }
+            let calls = std::cell::Cell::new(0);
+            let result = heal_with(
+                &base,
+                &segments,
+                || Ok(()),
+                |path| {
+                    if partial && path == segment_path(&base, 3) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "first unlink failure",
+                        ))
+                    } else {
+                        fs::remove_file(path)
+                    }
+                },
+                |path| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() > 2 {
+                        Err(Error::new(Reason::StoreWriteFailed, "reinspection failed"))
+                    } else {
+                        open_optional(path)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(result.segments, if partial { vec![] } else { vec![3] });
+            assert_eq!((result.unlisted_files, result.unlisted_bytes), (1, 2));
+            assert!(result.hole_remaining);
+            let reason = result.deferred.unwrap();
+            if partial {
+                assert_eq!(reason, "first unlink failure");
+            } else {
+                assert_eq!(reason, "reinspection failed");
+            }
+            fs::remove_dir_all(store.home()).unwrap();
+        }
     }
 
     #[test]
