@@ -162,8 +162,8 @@ gaebu compact
 
 MCP exposes the same operations as `schedule_show` (`item` or `all`, mutually
 exclusive), `schedule_archive`, and `compact`. Archive is restricted to the
-commander or current Schedule manager; it reports retired IDs and deferred
-items with reasons. Completion, cancellation, and later Schedule writes also
+commander or current Schedule manager; it reports retired IDs, pruned tombstone
+IDs (`pruned`), deferred items with reasons, and `retired_total` (all archived rows). Completion, cancellation, and later Schedule writes also
 try to retire eligible items without adding a second revision increment.
 
 Retirement requires completion or cancellation, no item hold, known terminal
@@ -171,7 +171,13 @@ worker attempts and no remaining leases in their scope. Unmaterialized attempts
 must be explicitly abandoned first. Automatic archive I/O failures defer
 retirement while preserving the successful operation; explicit archive reports
 the error. Completed tombstones still satisfy dependencies; cancelled ones do
-not. `schedule show <item>` retains the complete original contract and evidence.
+not. A new or changed dependency on a cancelled live item or tombstone is refused
+with a conflict naming the ID; existing cancelled edges stay valid. For a pruned
+ID, add/update verifies the archive after validating the submitted dependency list
+and update immutability. Complete dependencies are permanently satisfied, omitted
+from the stored list, and reported in `satisfied`; cancelled ones are refused.
+Unknown IDs and repeated/self dependencies remain invalid. A refusal preserves
+the revision. `schedule show <item>` retains the complete original contract and evidence.
 
 ## The operations pane
 
@@ -203,14 +209,42 @@ machines concurrently editing separate copies and manual edits bypassing its
 locks are outside that coordination contract. The engine supports cooperative
 agents; it does not forcibly interrupt a process already executing a command.
 
-Finished items move to `<schedule filename>.archive.jsonl`, while the marked
-JSON keeps compact tombstones and monotonic item/dispatch allocators. The 2 MiB
-document limit still applies; the 2,000-item limit counts active items only.
-The archive is required for historical detail and `--all`, but open work does
-not need to read it. Missing or corrupt referenced archive entries are errors,
-never silently missing history. Keep the Schedule and sidecar together in
-backups and file moves. Tombstones still grow; this is not an unlimited-history
-document format.
+Finished items move to `<schedule filename>.archive.jsonl`. Schema 2 documents
+commit its byte length, row count, SHA-256 chain, highest item number and highest
+dispatch number in `archive`. The chain starts at SHA-256 of the UTF-8 Schedule
+ID; each row hashes the preceding 32 hash bytes followed by the exact JSONL line,
+including its newline. Allocators must exceed the committed maxima even when
+all tombstones have been pruned. Readers verify every row and the entire head
+in the document snapshot's prefix. Interrupted-publish tails are ignored and
+truncated by the next archive write, after checking length and the boundary newline.
+A missing, shortened or unterminated committed prefix is `store_corrupt`; it is
+never recreated or extended. An automatic sweep defers retirement on failure.
+
+A sweep retains only tombstones named by live items' `depends_on` or linked by
+any hot runtime duty, regardless of team. Cancelled tombstones' own dependencies
+do not retain their predecessors. An unreferenced tombstone can disappear in
+the sweep that creates it. `counts.retired` and `retired_total` count all archived
+rows, rather than the retained tombstones. Mutation of a pruned item is refused
+with `schedule item <id> is retired; read it with gaebu schedule show <id>`.
+
+The 2 MiB document and 2,000-live-item limits remain. Tombstone growth is bounded
+by live dependency references plus hot linked duties; the sidecar remains
+append-only and unbounded, without rotation. Only retired-item detail, `--all`,
+move verification, add/update of a pruned dependency, and a recovered duty whose
+tombstone was pruned scan the archive. Each scan is linear in committed history.
+Normal duty guards and compaction eligibility do not scan it. Recovery guards
+preserve the original complete/cancelled refusal. Boundary and recovery lookups
+hold the Schedule lock followed by `state.lock`, delaying other teams' writers;
+large archives can exceed another caller's 5-second lock wait. Keep the Schedule
+and sidecar together in backups and moves.
+
+0.4.1 reads schema 1 through its digest-addressed tombstones, then migrates on
+the first Schedule write under the Schedule lock. It rewrites the sidecar to
+exactly the verified tombstone rows by synced temporary file, rename and parent
+directory sync, dropping unreferenced and interrupted-publish rows. A crash
+between rename and document publication can safely rerun migration. No pruning
+runs against schema 1. A 0.4.0 binary refuses schema 2 during JSON decoding with
+`invalid_argument` for the unknown `archive` field; upgrade all Schedule writers.
 
 To move a registration, first move the document and its archive sidecar, then
 have the commander run:
@@ -220,7 +254,8 @@ gaebu schedule move /new/absolute/path/schedule.md
 ```
 
 The old document must be absent. The new file must retain the registered
-Schedule identity and every tombstone must resolve in its new archive. This
+Schedule identity; its whole committed archive prefix must verify at the new
+path even when every tombstone was pruned. This
 changes the registration only; it does not copy or rename files. Writers that
 waited with an older registration are refused before publishing changes.
 
