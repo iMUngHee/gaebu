@@ -1222,6 +1222,9 @@ mod tests {
             source: crate::identity::Source::PagerNative,
         };
         runtime::register(&store, &caller, &schedule_path, false).unwrap();
+        // Registration canonicalizes the path; injected failures match the
+        // registered spelling (macOS temp aliases, Windows verbatim prefixes).
+        let schedule_path = fs::canonicalize(schedule_path).unwrap();
         (store, schedule_path, caller)
     }
 
