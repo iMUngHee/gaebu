@@ -15,8 +15,9 @@ the state, and anything to do after upgrading.
 
 - Explicit `compact --heal` and `schedule archive --heal` recover missing-segment
   holes by permanently deleting older listed and unlisted segment files. Back up
-  history first when it must be kept. The commands pre-check all surviving data
-  before deletion; ordinary and automatic maintenance never heal.
+  history first when it must be kept. Both commands pre-check metadata and retained
+  boundaries; Schedule also verifies surviving rows and chains before deletion.
+  Ordinary and automatic maintenance never heal.
 - `healed` separates listed committed segments/bytes (and Schedule rows) from
   unlisted file counts/actual bytes. `expired` excludes listed heal removals after
   normalization. Partial failures return `heal_deferred` and `hole_remaining`,

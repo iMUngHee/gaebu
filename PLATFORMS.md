@@ -60,8 +60,8 @@ mutation in the shared helper is equivalent for retained content.
 
 Linux: hole recovery, read-only pre-checks, listed/unlisted accounting, partial
 unlink/sync failures, retry, legacy migration and failed publication are covered
-by the helper and Schedule tests. These are synthetic filesystem failures, not
-physical power-loss tests.
+by the helper, Schedule and runtime tests. These are synthetic filesystem failures,
+not physical power-loss tests.
 
 ## Pending checks
 
