@@ -1595,7 +1595,10 @@ fn prune_waits_for_hot_linked_duty() {
         })
         .unwrap();
     age_duty(&f, duty);
-    assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+    assert_eq!(
+        schedule::compact(&f.store, &f.root, false).unwrap()["duties"],
+        1
+    );
     assert_eq!(
         f.call("schedule_archive", json!({})).unwrap()["pruned"],
         json!([item])
@@ -1634,7 +1637,10 @@ fn recovery_after_prune_keeps_guard_and_compaction() {
             }
         );
         age_duty(&f, duty);
-        assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+        assert_eq!(
+            schedule::compact(&f.store, &f.root, false).unwrap()["duties"],
+            1
+        );
         let previous = fs::read(f.store.home().join("state.prev.json")).unwrap();
         f.call("schedule_archive", json!({})).unwrap();
         assert!(f.document().retired.is_empty());
@@ -1646,7 +1652,10 @@ fn recovery_after_prune_keeps_guard_and_compaction() {
         let after = guard();
         assert_eq!(after.reason, before.reason);
         assert_eq!(after.message, before.message);
-        assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+        assert_eq!(
+            schedule::compact(&f.store, &f.root, false).unwrap()["duties"],
+            1
+        );
         assert!(!f.store.read_current().unwrap().duties.contains_key(duty));
     }
 }
@@ -1873,7 +1882,7 @@ fn allocators_reject_regression_after_prune() {
     f.done(duty);
     f.complete(&item);
     age_duty(&f, duty);
-    schedule::compact(&f.store, &f.root).unwrap();
+    schedule::compact(&f.store, &f.root, false).unwrap();
     f.call("schedule_archive", json!({})).unwrap();
     let original = f.document();
     assert!(original.retired.is_empty());
@@ -2059,7 +2068,7 @@ fn pruned_item_refuses_mutation() {
     f.done(duty);
     f.complete(&item);
     age_duty(&f, duty);
-    schedule::compact(&f.store, &f.root).unwrap();
+    schedule::compact(&f.store, &f.root, false).unwrap();
     f.call("schedule_archive", json!({})).unwrap();
     assert!(f.document().retired.is_empty());
     let before = f.store.read_current().unwrap();
@@ -2867,7 +2876,10 @@ fn recovered_duty_linked_to_expired_item_is_retired() {
     f.done(duty);
     f.complete(&item);
     age_duty(&f, duty);
-    assert_eq!(schedule::compact(&f.store, &f.root).unwrap()["duties"], 1);
+    assert_eq!(
+        schedule::compact(&f.store, &f.root, false).unwrap()["duties"],
+        1
+    );
     let previous = fs::read(f.store.home().join("state.prev.json")).unwrap();
     f.call("schedule_archive", json!({})).unwrap();
     assert!(!f.document().retired.iter().any(|r| r.id == item));
