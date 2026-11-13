@@ -9,6 +9,49 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.4.1 — 2026-11-14
+
+### Changed
+
+- Schedule schema 2 commits archive bytes, rows, SHA-256 chain and allocator
+  maxima. Historical reads verify the complete committed prefix; unpublished
+  tails are ignored and truncated by the next archive write. Missing, short or
+  unterminated committed prefixes refuse writes without extending the file.
+- Sweeps prune tombstones unless a live dependency or any hot linked duty
+  references them, including tombstones created in that sweep. Tombstones do
+  not retain their predecessors. `counts.retired` and `retired_total` count all
+  archived rows; `schedule archive` also reports `pruned` IDs. Pruned items
+  remain readable by ID and refuse mutation or dispatch replay. Restored duties
+  retain the same complete/cancelled guard and compaction behavior.
+- Add/update normalizes dependencies on pruned complete items after input and
+  immutability validation, omits them from storage and reports `satisfied` IDs.
+  New or changed cancelled dependencies are refused, including live items and
+  retained tombstones. Existing cancelled edges remain valid. Moving a Schedule
+  requires its committed sidecar even when all tombstones were pruned.
+
+### Upgrading
+
+Runtime schema remains 4. Upgrade all Schedule writers and restart resident MCP
+processes. 0.4.1 reads Schedule schema 1 and upgrades it on the first Schedule
+write, rewriting the sidecar to exactly the verified tombstone rows by synced
+temporary file and rename. Unreferenced rows, foreign-schedule rows and
+interrupted-publish duplicates are dropped. A crash between rename and document
+publication can rerun migration. A 0.4.0 binary refuses schema 2 with
+`invalid_argument` (unknown `archive` field) during decoding. Back up the Schedule
+together with `<filename>.archive.jsonl`, and runtime state with `archive/`.
+
+The 2 MiB document and 2,000-live-item limits remain. Tombstones are bounded by
+live dependency references plus hot linked duties; the sidecar is append-only
+and unbounded, without rotation. Retired-item detail, `--all`, move verification,
+pruned dependency resolution and recovered-duty guards each scan the committed
+prefix linearly. Boundary and recovery scans hold the Schedule lock followed by
+`state.lock`, delaying writers in other teams and potentially exhausting their
+5-second lock wait. A Linux debug fixture of 10,000 Schedule rows (3,288,894 bytes)
+measured 287.26 ms for a verified scan and 286.49 ms holding Schedule then state
+locks through a verified lookup and lock release. These synthetic local timings
+are observations, not latency guarantees. Windows retains file-sync/rename
+guarantees; physical power-loss behavior is untested. See [platform checks](PLATFORMS.md).
+
 ## 0.4.0 — 2026-11-13
 
 ### Added

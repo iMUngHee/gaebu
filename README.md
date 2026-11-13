@@ -113,8 +113,15 @@ file's registration after the move. Default `schedule show` and cards omit full
 dispatch contracts and finished work; use `schedule show <item>` for the full
 contract or `schedule show --all` for history. Cancelled items with live duties
 remain visible for cleanup. `gaebu compact` archives old terminal runtime
-history while preserving `duty show`/`duty_get`. Older binaries refuse both
-schema 4 state and Schedules containing retirement tombstones.
+history while preserving `duty show`/`duty_get`. Schedule schema 2 commits the
+archive prefix and prunes tombstones unless a live dependency or hot linked duty
+needs them. Retired counts include pruned history, which stays readable by ID.
+Add/update drops pruned complete dependencies and reports them as `satisfied`;
+cancelled dependencies are refused. The sidecar remains unbounded and historical
+reads scan its committed prefix. Boundary/recovery scans hold Schedule then state
+locks. 0.4.1 upgrades schema 1 on the first Schedule write by rewriting verified
+tombstone rows; 0.4.0 refuses schema 2's `archive` field. Upgrade all writers and
+restart resident MCP processes. Runtime schema remains 4.
 
 ### Claude Code
 

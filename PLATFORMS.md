@@ -49,6 +49,9 @@ SIGKILL on its stale code-signature cache.
 
 ## Pending checks
 
+- macOS and Windows: run the 0.4.1 Schedule schema-2 commitment, pruning,
+  migration and held-snapshot truncation tests; only Linux was run locally.
+
 - macOS and Windows: run the 0.4.0 archive, migration, repair, locking and
   native mod tests. Prior release checks below do not cover these changes.
 - Windows: directory fsync is unavailable through the portable standard-library
