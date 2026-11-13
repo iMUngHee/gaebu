@@ -37,6 +37,7 @@ pub const SESSION_LOCK_DEADLINE: Duration = Duration::from_millis(500);
 
 pub struct Store {
     home: PathBuf,
+    archive_limit: u64,
 }
 
 impl Store {
@@ -50,9 +51,27 @@ impl Store {
     }
 
     pub fn open(home: impl Into<PathBuf>) -> Result<Store> {
+        let raw = std::env::var_os("GAEBU_ARCHIVE_LIMIT_MIB");
+        Self::open_with_archive_limit(home, parse_archive_limit(raw.as_deref())?)
+    }
+
+    pub fn open_with_archive_limit(home: impl Into<PathBuf>, archive_limit: u64) -> Result<Store> {
+        if archive_limit < 8 {
+            return Err(Error::new(
+                Reason::InvalidArgument,
+                "archive_limit must be at least 8 bytes",
+            ));
+        }
         let home = home.into();
         fs::create_dir_all(&home).map_err(write_error)?;
-        Ok(Store { home })
+        Ok(Store {
+            home,
+            archive_limit,
+        })
+    }
+
+    pub fn archive_limit(&self) -> u64 {
+        self.archive_limit
     }
 
     /// The default home (`~/.gaebu`), whether or not it exists.
@@ -237,6 +256,23 @@ impl Store {
     pub fn capture_dir(&self) -> PathBuf {
         self.home.join("capture")
     }
+}
+
+fn parse_archive_limit(raw: Option<&std::ffi::OsStr>) -> Result<u64> {
+    let invalid = || {
+        Error::new(
+            Reason::InvalidArgument,
+            "GAEBU_ARCHIVE_LIMIT_MIB must be a positive integer in MiB within the supported byte range",
+        )
+    };
+    let Some(raw) = raw else {
+        return Ok(64 * 1024 * 1024);
+    };
+    raw.to_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(1024 * 1024))
+        .ok_or_else(invalid)
 }
 
 /// Session ids come from hosts; keep them path-safe.
@@ -735,4 +771,31 @@ fn clean_tmp(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod archive_limit_tests {
+    use super::*;
+
+    #[test]
+    fn archive_limit_parser() {
+        for (raw, want) in [
+            (None, Some(64 * 1024 * 1024)),
+            (Some("1"), Some(1024 * 1024)),
+            (Some("64"), Some(64 * 1024 * 1024)),
+            (Some("0"), None),
+            (Some("abc"), None),
+            (Some("18446744073709551615"), None),
+        ] {
+            let result = parse_archive_limit(raw.map(std::ffi::OsStr::new));
+            match want {
+                Some(bytes) => assert_eq!(result.unwrap(), bytes),
+                None => {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.reason, Reason::InvalidArgument);
+                    assert!(error.message.contains("GAEBU_ARCHIVE_LIMIT_MIB"));
+                }
+            }
+        }
+    }
 }
