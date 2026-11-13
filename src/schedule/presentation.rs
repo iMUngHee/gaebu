@@ -28,19 +28,7 @@ pub(super) fn show(store: &Store, st: &State, team: &str, args: &commands::Input
                 false,
             ));
         }
-        let retired = document
-            .schedule
-            .retired
-            .iter()
-            .find(|item| &item.id == id)
-            .ok_or_else(|| Error::new(Reason::NotFound, "schedule item not found"))?;
-        let item = archive::load(
-            Path::new(&reg.path),
-            &document.schedule,
-            std::slice::from_ref(retired),
-        )?
-        .pop()
-        .unwrap();
+        let item = archive::lookup(Path::new(&reg.path), &document.schedule, id)?;
         return Ok(item_view(
             store,
             st,
@@ -125,13 +113,9 @@ fn view_mode(store: &Store, st: &State, team: &str, all: bool) -> Result<Value> 
     }
     counts.insert("queued", counts["unassigned"] + counts["dependency_wait"]);
     counts.insert("total", items.len());
-    counts.insert("retired", document.schedule.retired.len());
+    counts.insert("retired", retired_total(&document.schedule) as usize);
     if all {
-        for item in archive::load(
-            Path::new(&reg.path),
-            &document.schedule,
-            &document.schedule.retired,
-        )? {
+        for item in archive::load(Path::new(&reg.path), &document.schedule)? {
             items.push(item_view(
                 store,
                 st,

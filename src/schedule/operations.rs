@@ -7,7 +7,8 @@ use crate::{authz, identity::Caller, store::Store};
 use serde_json::{Value, json};
 
 pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -> Result<Value> {
-    operate(store, caller, args, |st, actor, team, document| {
+    let auto = name != "schedule_archive";
+    operate(store, caller, args, auto, |st, actor, team, document| {
         if name == "schedule_archive" {
             authorize_manager(st, actor, team, &[])?;
             let path = Path::new(&st.schedules[team].path);
@@ -21,7 +22,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
             authorize_manager(st, actor, team, &item_scope)?;
             let owner_bu = owner_ref(st, team, args.owner_bu.as_deref())?;
             let pm_ref = args.pm_ref.clone();
-            let item = Item {
+            let mut item = Item {
                 id: format!("w-{}", document.schedule.next_item),
                 title,
                 pm_ref,
@@ -34,6 +35,8 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                 dispatches: vec![],
                 completion: None,
             };
+            let satisfied =
+                resolve_dependencies(st, team, &document.schedule, &item.id, &mut item.depends_on)?;
             document.schedule.next_item = document
                 .schedule
                 .next_item
@@ -41,7 +44,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                 .ok_or_else(|| invalid("item ids exhausted"))?;
             document.schedule.items.push(item.clone());
             validate(&document.schedule)?;
-            return Ok(json!({"item":item}));
+            return Ok(json!({"item":item,"satisfied":satisfied}));
         }
         let index = item_index(&document.schedule, args.text("item")?)?;
         let item = document.schedule.items[index].clone();
@@ -67,6 +70,12 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                 if args.owner_bu_set {
                     ensure_terminated(st, team, &document.schedule, &item)?;
                 }
+                let mut dependencies = args.depends_on.clone();
+                let satisfied = if let Some(deps) = &mut dependencies {
+                    resolve_dependencies(st, team, &document.schedule, &item.id, deps)?
+                } else {
+                    vec![]
+                };
                 let changed = &mut document.schedule.items[index];
                 if let Some(title) = &args.title {
                     changed.title = title.clone();
@@ -78,7 +87,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                     changed.scope = scope::normalize_list(&scope)?;
                     authorize_manager(st, actor, team, &changed.scope)?;
                 }
-                if let Some(deps) = args.depends_on.clone() {
+                if let Some(deps) = dependencies {
                     changed.depends_on = deps;
                 }
                 if args.owner_bu_set {
@@ -87,7 +96,7 @@ pub(super) fn mutate(store: &Store, caller: &Caller, name: &str, args: &Input) -
                 if args.pm_ref_set {
                     changed.pm_ref = args.pm_ref.clone();
                 }
-                let value = json!({"item":changed});
+                let value = json!({"item":changed,"satisfied":satisfied});
                 validate(&document.schedule)?;
                 Ok(value)
             }
@@ -270,4 +279,64 @@ pub(super) fn ensure_terminated(
         terminated(st, duty, dispatch)?;
     }
     Ok(())
+}
+
+fn resolve_dependencies(
+    st: &State,
+    team: &str,
+    schedule: &Schedule,
+    id: &str,
+    deps: &mut Vec<String>,
+) -> Result<Vec<String>> {
+    let mut allowed: BTreeSet<_> = schedule
+        .items
+        .iter()
+        .map(|item| item.id.as_str())
+        .chain(schedule.retired.iter().map(|item| item.id.as_str()))
+        .collect();
+    for dependency in deps.iter() {
+        if absent_retired(schedule, dependency) {
+            allowed.insert(dependency);
+        }
+    }
+    validate_dependencies(id, deps, &allowed)?;
+    let archived = if deps
+        .iter()
+        .any(|dependency| absent_retired(schedule, dependency))
+    {
+        archive::load(Path::new(&st.schedules[team].path), schedule)?
+    } else {
+        vec![]
+    };
+    let mut satisfied = vec![];
+    for dependency in deps.iter() {
+        if schedule
+            .items
+            .iter()
+            .any(|item| item.id == *dependency && item.cancellation.is_some())
+            || schedule
+                .retired
+                .iter()
+                .any(|item| item.id == *dependency && item.state == RetiredState::Cancelled)
+            || archived
+                .iter()
+                .any(|item| item.id == *dependency && item.cancellation.is_some())
+        {
+            return Err(conflict(format!(
+                "schedule dependency {dependency} is cancelled"
+            )));
+        }
+        if absent_retired(schedule, dependency) {
+            if archived
+                .iter()
+                .any(|item| item.id == *dependency && item.completion.is_some())
+            {
+                satisfied.push(dependency.clone());
+            } else {
+                return Err(invalid("missing, repeated, or self dependency"));
+            }
+        }
+    }
+    deps.retain(|dependency| !satisfied.contains(dependency));
+    Ok(satisfied)
 }

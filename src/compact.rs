@@ -16,6 +16,7 @@ const HOUR: Ms = 60 * 60 * 1000;
 pub struct Retired {
     pub schedule_id: String,
     pub items: BTreeSet<String>,
+    pub next_item: u64,
 }
 
 #[derive(Default)]
@@ -62,7 +63,12 @@ fn candidates(
                     retired.is_some_and(|r| {
                         reg.schedule_id == r.schedule_id
                             && link.schedule_id == r.schedule_id
-                            && r.items.contains(&link.item_id)
+                            && !r.items.contains(&link.item_id)
+                            && link
+                                .item_id
+                                .strip_prefix("w-")
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .is_some_and(|n| n > 0 && n < r.next_item)
                     })
                 });
             if !cancelled && !retired_here {
@@ -136,12 +142,8 @@ pub fn needs_schedule(st: &State, team: &str) -> bool {
     // Assuming every linked item retired gives an upper bound without I/O.
     let possible = Retired {
         schedule_id: registration.schedule_id.clone(),
-        items: st
-            .duties
-            .values()
-            .filter(|d| d.team == team)
-            .filter_map(|d| d.schedule_ref.as_ref().map(|r| r.item_id.clone()))
-            .collect(),
+        items: BTreeSet::new(),
+        next_item: u64::MAX,
     };
     let batches = candidates(st, crate::model::now_ms(), team, Some(&possible));
     counts(&batches).iter().sum::<usize>() >= 64

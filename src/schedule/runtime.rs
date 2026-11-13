@@ -125,7 +125,7 @@ pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> 
     if document.schedule.id != registration.schedule_id {
         return Err(conflict("schedule identity changed"));
     }
-    archive::load(&path, &document.schedule, &document.schedule.retired)?;
+    archive::load(&path, &document.schedule)?;
     store.transact(CLI_DEADLINE, |st| {
         let actor = identity::actor(st, caller)?;
         commander(st, &actor, &team)?;
@@ -276,9 +276,10 @@ pub fn transaction<T>(
             let retired = if crate::compact::needs_schedule(&after, &team) {
                 document().ok().map(|document| crate::compact::Retired {
                     schedule_id: document.schedule.id.clone(),
+                    next_item: document.schedule.next_item,
                     items: document
                         .schedule
-                        .retired
+                        .items
                         .iter()
                         .map(|item| item.id.clone())
                         .collect(),
@@ -314,9 +315,10 @@ pub fn compact(store: &Store, caller: &Caller) -> Result<Value> {
             .filter(|document| document.schedule.id == reg.schedule_id)
             .map(|document| crate::compact::Retired {
                 schedule_id: document.schedule.id,
+                next_item: document.schedule.next_item,
                 items: document
                     .schedule
-                    .retired
+                    .items
                     .into_iter()
                     .map(|item| item.id)
                     .collect(),
@@ -348,6 +350,18 @@ fn guard_duty(st: &State, team: &str, document: &Document, duty: &Duty) -> Resul
         return Err(match retired.state {
             RetiredState::Complete => conflict("schedule item is already complete"),
             RetiredState::Cancelled => Error::new(Reason::Cancelled, "schedule item cancelled"),
+        });
+    }
+    if absent_retired(&document.schedule, &reference.item_id) {
+        let item = archive::lookup(
+            Path::new(&st.schedules[team].path),
+            &document.schedule,
+            &reference.item_id,
+        )?;
+        return Err(if item.cancellation.is_some() {
+            Error::new(Reason::Cancelled, "schedule item cancelled")
+        } else {
+            conflict("schedule item is already complete")
         });
     }
     let item = &document.schedule.items[item_index(&document.schedule, &reference.item_id)?];
@@ -504,6 +518,7 @@ pub(super) fn operate<T>(
     store: &Store,
     caller: &Caller,
     args: &Input,
+    auto_archive: bool,
     f: impl FnOnce(&State, &Actor, &str, &mut Document) -> Result<T>,
 ) -> Result<T> {
     let snapshot = store.read_current()?;
@@ -530,7 +545,9 @@ pub(super) fn operate<T>(
     let before = document.schedule.clone();
     let result = f(&st, &actor, &team, &mut document)?;
     if before != document.schedule {
-        archive::sweep(&st, &team, &mut document, Path::new(&reg.path), false)?;
+        if auto_archive {
+            archive::sweep(&st, &team, &mut document, Path::new(&reg.path), false)?;
+        }
         document.save(Path::new(&reg.path), Instant::now() + CLI_DEADLINE)?;
     }
     Ok(result)

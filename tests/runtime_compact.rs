@@ -140,7 +140,8 @@ fn terminal(st: &mut State, root: &Actor, worker: &Actor) -> String {
 fn retired() -> compact::Retired {
     compact::Retired {
         schedule_id: "schedule-one".into(),
-        items: BTreeSet::from(["w-1".into()]),
+        items: BTreeSet::new(),
+        next_item: 2,
     }
 }
 
@@ -257,7 +258,7 @@ fn linked_duty_stays_hot_until_own_matching_tombstone() {
         })
         .unwrap();
     let mut r = retired();
-    r.items.clear();
+    r.items.insert("w-1".into());
     for supplied in [None, Some(&r)] {
         assert_eq!(
             compact::run(&f.store, &f.team, supplied).unwrap()["duties"],
@@ -273,6 +274,7 @@ fn linked_duty_stays_hot_until_own_matching_tombstone() {
     let wrong = compact::Retired {
         schedule_id: "wrong".into(),
         items: retired().items,
+        next_item: 2,
     };
     assert_eq!(
         compact::run(&f.store, &f.team, Some(&wrong)).unwrap()["duties"],
@@ -955,4 +957,40 @@ fn archive_large_cost() {
     println!(
         "10,000 entries: initial={initial:?}, boundary-check+append={append:?}, locked-lookup={lookup:?}"
     );
+}
+
+#[test]
+fn linked_retirement_uses_live_set_and_allocator() {
+    for (item, live, expected) in [
+        ("w-1", false, 1),
+        ("w-1", true, 0),
+        ("w-0", false, 0),
+        ("w-2", false, 0),
+        ("bad", false, 0),
+    ] {
+        let f = Fixture::new();
+        let id = f.duty();
+        f.store
+            .transact(CLI_DEADLINE, |st| {
+                link(st, &f.team, &id);
+                st.duties
+                    .get_mut(&id)
+                    .unwrap()
+                    .schedule_ref
+                    .as_mut()
+                    .unwrap()
+                    .item_id = item.into();
+                Ok(())
+            })
+            .unwrap();
+        let mut snapshot = retired();
+        if live {
+            snapshot.items.insert(item.into());
+        }
+        assert_eq!(
+            compact::run(&f.store, &f.team, Some(&snapshot)).unwrap()["duties"],
+            expected,
+            "{item}, live={live}"
+        );
+    }
 }
