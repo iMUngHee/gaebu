@@ -231,7 +231,10 @@ written. A failed unlink/sync defers enforcement; failed publication can leave
 unlisted files. These exceptions are visible through `retained_bytes`,
 `limit_bytes`, and optional `expiry_deferred`. `expired` reports removed segment
 and row counts. Explicit maintenance removes unlisted numbered files and applies
-the current limit without requiring another completed item.
+the current limit without requiring another completed item. Because it deletes
+unlisted files named like this Schedule's segments, `schedule register` and
+`schedule move` refuse a Schedule file named `*.archive.jsonl` or
+`*.archive.<n>.jsonl`.
 
 Every write pass first syncs the directory, normalizes an absent oldest prefix,
 validates the last committed boundary, and trims any unpublished tail, including

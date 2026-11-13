@@ -1324,12 +1324,21 @@ fn listed_segments_have_no_uncommitted_tail() {
         f.duty();
         compact::run(&f.store, &f.team, None).unwrap();
         assert_eq!(fs::read(&path).unwrap(), prefix);
-        for segment in f.stream("duties").segments {
+        let segments = f.stream("duties").segments;
+        for segment in &segments {
             assert_eq!(
                 fs::metadata(f.segment("duties", segment.n)).unwrap().len(),
                 segment.bytes
             );
         }
+        let on_disk: u64 = fs::read_dir(f.path("duties").parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("duties."))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        let largest = segments.iter().map(|s| s.bytes).max().unwrap_or(0);
+        assert!(on_disk <= f.store.archive_limit() + largest);
     }
     let last = f.stream("duties").segments.last().unwrap().clone();
     let path = f.segment("duties", last.n);

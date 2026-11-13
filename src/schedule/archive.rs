@@ -17,6 +17,27 @@ pub(super) fn path(schedule: &Path) -> PathBuf {
     name.into()
 }
 
+/// Explicit maintenance deletes unlisted files with sidecar names, so a
+/// Schedule document must never carry one.
+pub(super) fn refuse_sidecar_name(schedule: &Path) -> Result<()> {
+    let name = schedule
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let stem = name.strip_suffix(".jsonl").unwrap_or_default();
+    let numbered = stem.rsplit_once('.').is_some_and(|(head, number)| {
+        head.ends_with(".archive")
+            && !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit())
+    });
+    if stem.ends_with(".archive") || numbered {
+        return Err(invalid(
+            "a schedule file cannot use an archive segment name (*.archive.jsonl, *.archive.<n>.jsonl)",
+        ));
+    }
+    Ok(())
+}
+
 fn digest(item: &Item) -> Result<String> {
     let bytes = serde_json::to_string(item).map_err(io_error)?;
     Ok(crate::evidence::sha256_hex(&bytes)[..16].to_owned())
@@ -700,6 +721,25 @@ mod tests {
                 at: 1,
                 evidence: "reviewed".into(),
             }),
+        }
+    }
+
+    #[test]
+    fn schedule_files_cannot_use_sidecar_names() {
+        for (name, refused) in [
+            ("schedule.md", false),
+            ("notes.jsonl", false),
+            ("plan2.jsonl", false),
+            ("plan.archive5.jsonl", false),
+            ("plan.md.archive.jsonl", true),
+            ("plan.md.archive.2.jsonl", true),
+            ("plan.md.archive.02.jsonl", true),
+        ] {
+            assert_eq!(
+                refuse_sidecar_name(Path::new("dir").join(name).as_path()).is_err(),
+                refused,
+                "{name}"
+            );
         }
     }
 

@@ -694,6 +694,29 @@ fn many_tombstones_validate() {
 }
 
 #[test]
+fn schedule_files_cannot_be_registered_or_moved_to_sidecar_names() {
+    let f = Fixture::new();
+    for name in ["other.md.archive.jsonl", "other.md.archive.3.jsonl"] {
+        let destination = f.path.with_file_name(name);
+        assert_eq!(
+            schedule::register(&f.store, &f.root, &destination, true)
+                .unwrap_err()
+                .reason,
+            Reason::InvalidArgument
+        );
+        assert!(!destination.exists());
+        fs::copy(&f.path, &destination).unwrap();
+        assert_eq!(
+            f.call("schedule_move", json!({"path":destination}))
+                .unwrap_err()
+                .reason,
+            Reason::InvalidArgument
+        );
+        assert_eq!(fs::read(&destination).unwrap(), fs::read(&f.path).unwrap());
+    }
+}
+
+#[test]
 fn move_registration_requires_missing_old_path_and_copied_archive() {
     let f = Fixture::new();
     let item = f.add("retired", &[]);
@@ -2654,7 +2677,12 @@ fn missing_prefix_is_expired_but_holes_are_corrupt() {
             let normalized = f.document().archive.unwrap();
             assert_eq!(normalized.next, head.next);
             let id = f.retire_batch(1).pop().unwrap();
-            assert!(f.document().archive.unwrap().segments.last().unwrap().n >= head.next - 1);
+            let last = f.document().archive.unwrap().segments.last().unwrap().n;
+            if missing == "all" {
+                assert_eq!(last, head.next);
+            } else {
+                assert!(last >= head.next - 1);
+            }
             assert_eq!(
                 f.call("schedule_show", json!({"item":id})).unwrap()["stage"],
                 "complete"

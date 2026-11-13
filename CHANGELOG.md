@@ -33,6 +33,9 @@ the state, and anything to do after upgrading.
   listed segment at the destination. `counts.retired` counts retained rows;
   `counts.expired` counts expired rows. Runtime expired duty lookup returns
   `not_found`: `duty not found in hot state or retained team archive`.
+- A Schedule file can no longer be registered or moved under an archive segment
+  name (`*.archive.jsonl`, `*.archive.<n>.jsonl`); explicit maintenance deletes
+  unlisted files with those names next to a Schedule.
 - Maintenance results report `expired`, `retained_bytes`, `limit_bytes`, and
   optional `expiry_deferred`. Runtime `over_limit` identifies individual team
   streams still above their limit; retained byte totals can span several teams.
