@@ -357,6 +357,10 @@ without deleting anything. Automatic compaction and plain `compact` never heal.
 plus `unlisted_files` and their actual `unlisted_bytes`. Successfully normalized
 bookkeeping counts each removed entry once: `healed` plus `expired` equals the
 entries dropped from the stream. Already-missing segments count as `expired`.
+`expired` totals every team the pass maintained while `healed` covers only the
+caller's team, so the equality holds per team. A pass also archives other teams'
+eligible rows; when another team's archive is damaged that stream is skipped, its
+rows stay hot, and the result names it under `skipped` instead of failing.
 A partial heal reports actual removals with `heal_deferred.<stream>` and the
 observed `hole_remaining.<stream>`, skips that stream's normal pass, preserves its
 bookkeeping and eligible hot rows, and archives other streams normally. A failed

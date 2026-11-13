@@ -225,6 +225,7 @@ fn compact(
         let mut over_limit = Vec::new();
         let mut archived = [0; 3];
         let mut archived_records = BTreeSet::new();
+        let mut skipped = Vec::new();
         for (batch_team, batch) in &batches {
             let dir = team_dir(store, batch_team)?;
             fs::create_dir_all(&dir).map_err(write_error)?;
@@ -283,12 +284,29 @@ fn compact(
                     }
                 }
                 let mut result = if completed[index] {
-                    let result = maintain(
+                    let before = stream.clone();
+                    match maintain(
                         &path, stream, &bytes, bounds, store.archive_limit(),
                         explicit && batch_team == team,
-                    )?;
-                    archived[index] += batch_counts[index];
-                    result
+                    ) {
+                        Ok(result) => {
+                            archived[index] += batch_counts[index];
+                            result
+                        }
+                        // Another team's damaged archive must not block this
+                        // team's pass; its rows stay hot for its own commander.
+                        Err(error) if batch_team != team => {
+                            *stream = before;
+                            completed[index] = false;
+                            skipped.push(json!({"team": batch_team, "stream": name,
+                                "reason": error.message}));
+                            Maintenance {
+                                retained_bytes: stream.segments.iter().map(|s| s.bytes).sum(),
+                                ..Default::default()
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else {
                     Maintenance {
                         retained_bytes: stream.segments.iter().map(|s| s.bytes).sum(),
@@ -351,6 +369,9 @@ fn compact(
             "expired": expired, "retained_bytes": retained, "limit_bytes": store.archive_limit(), "over_limit": over_limit});
         if !deferred.is_empty() {
             result["expiry_deferred"] = Value::Object(deferred);
+        }
+        if !skipped.is_empty() {
+            result["skipped"] = json!(skipped);
         }
         if heal_caller.is_some() {
             let mut healed = serde_json::Map::new();
@@ -418,6 +439,11 @@ fn validate_stream(stream: &ArchiveStream) -> Result<()> {
             (None, None) => false,
             _ => true,
         })
+        || stream
+            .segments
+            .iter()
+            .try_fold(0u64, |sum, s| sum.checked_add(s.bytes))
+            .is_none()
     {
         return Err(corrupt("invalid archive segment bookkeeping"));
     }

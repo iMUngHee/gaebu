@@ -251,7 +251,9 @@ pub(super) fn sweep(
         .clone()
         .ok_or_else(|| invalid("missing archive head"))?;
     let healed = if let Some(report) = heal {
-        if !migrated {
+        // Without a hole heal has nothing to do, so the full verification that
+        // must precede a deletion is not paid for either.
+        if !migrated && crate::archive::has_hole(&path(schedule_path), &head.segments)? {
             precheck_heal(schedule_path, &document.schedule)?;
             *report = crate::archive::heal_holes(&path(schedule_path), &head.segments)?;
         }

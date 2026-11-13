@@ -1697,6 +1697,48 @@ fn maintenance_only_touches_caller_and_streams_with_new_rows() {
 }
 
 #[test]
+fn damaged_foreign_archive_is_skipped_not_fatal() {
+    let f = Fixture::with_limit(2048);
+    let (other_root, other_worker, other_team) = f
+        .store
+        .transact(CLI_DEADLINE, |st| {
+            let actors = seed(st, "other");
+            terminal(st, &actors.0, &actors.1);
+            st.records.clear();
+            Ok(actors)
+        })
+        .unwrap();
+    compact::run(&f.store, &f.team, None).unwrap();
+    let foreign = f
+        .store
+        .home()
+        .join("archive")
+        .join(&other_team)
+        .join("duties.jsonl");
+    fs::write(&foreign, b"damaged").unwrap();
+    let waiting = f
+        .store
+        .transact(CLI_DEADLINE, |st| {
+            let id = terminal(st, &other_root, &other_worker);
+            st.records.clear();
+            Ok(id)
+        })
+        .unwrap();
+    let own = f.duty();
+    let before = f.store.read_current().unwrap().archives[&other_team].clone();
+    let result = compact::run(&f.store, &f.team, None).unwrap();
+    assert_eq!(result["duties"], 1);
+    assert_eq!(result["skipped"][0]["team"], other_team.as_str());
+    assert_eq!(result["skipped"][0]["stream"], "duties");
+    let after = f.store.read_current().unwrap();
+    assert!(!after.duties.contains_key(&own));
+    assert!(after.duties.contains_key(&waiting));
+    assert_eq!(after.archives[&other_team], before);
+    assert_eq!(fs::read(&foreign).unwrap(), b"damaged");
+    assert_eq!(f.get(&own).unwrap().id, own);
+}
+
+#[test]
 fn invalid_segment_bookkeeping_refuses_lookup_and_maintenance() {
     for damage in ["next-zero", "next-reused", "inverted", "lo-only", "hi-only"] {
         let f = Fixture::with_limit(2048);
@@ -2216,6 +2258,13 @@ fn heal_flag_reaches_both_commands() {
         } else {
             let invalid = f.mcp(serde_json::json!({"heal":"true"}));
             assert_eq!(invalid["result"]["isError"], true);
+            assert!(
+                invalid["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid_argument"),
+                "{invalid}"
+            );
             let plain = f.mcp(serde_json::json!({}));
             assert_eq!(plain["result"]["isError"], true);
             let healed = f.mcp(serde_json::json!({"heal":true}));

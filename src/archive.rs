@@ -226,6 +226,10 @@ fn inspect_heal_with<S: Segment>(
     Ok((after_missing, hole))
 }
 
+pub(crate) fn has_hole<S: Segment>(base: &Path, segments: &[S]) -> Result<bool> {
+    Ok(inspect_heal_with(base, segments, open_optional)?.1)
+}
+
 /// Read-only checks; the returned index excludes every segment heal may expire.
 pub(crate) fn precheck_heal<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
     let (retained, _) = inspect_heal_with(base, segments, open_optional)?;
