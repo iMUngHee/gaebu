@@ -1,13 +1,16 @@
 //! Retire terminal runtime history behind committed JSONL boundaries.
 
-use crate::model::{Duty, DutyStatus, Escalation, EscalationStatus, Ms, Record, State, TeamStatus};
+use crate::archive;
+use crate::model::{
+    ArchiveSegment, ArchiveStream, Duty, DutyStatus, Escalation, EscalationStatus, Ms, Record,
+    State, TeamStatus,
+};
 use crate::store::{self, Store};
 use crate::{Error, Reason, Result, authz};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const DAY: Ms = 24 * 60 * 60 * 1000;
@@ -122,7 +125,7 @@ pub fn auto(store: &Store, team: &str, retired: Option<&Retired>) {
     }
 }
 
-/// Explicit retirement, including batches smaller than the automatic threshold.
+/// Retire eligible rows and maintain the caller team’s retained archives.
 pub fn run(store: &Store, team: &str, retired: Option<&Retired>) -> Result<Value> {
     compact(store, team, retired, 1)
 }
@@ -159,34 +162,88 @@ fn compact(
     threshold: usize,
 ) -> Result<Value> {
     let empty = || json!({"duties": 0, "escalations": 0, "records": 0});
-    let before = store.read_view()?;
-    if counts(&candidates(&before, crate::model::now_ms(), team, retired))
+    let explicit = threshold == 1;
+    if !explicit
+        && counts(&candidates(
+            &store.read_view()?,
+            crate::model::now_ms(),
+            team,
+            retired,
+        ))
         .iter()
         .sum::<usize>()
-        < threshold
+            < threshold
     {
         return Ok(empty());
     }
     store.transact(store::CLI_DEADLINE, |st| {
-        let batches = candidates(st, crate::model::now_ms(), team, retired);
+        let mut batches = candidates(st, crate::model::now_ms(), team, retired);
         let n = counts(&batches);
-        if n.iter().sum::<usize>() < threshold {
+        if !explicit && n.iter().sum::<usize>() < threshold {
             return Ok(empty());
+        }
+        if explicit {
+            batches.entry(team.to_owned()).or_default();
         }
         let archive = store.home().join("archive");
         fs::create_dir_all(&archive).map_err(write_error)?;
         let mut lengths = st.archives.clone();
-        for (team, batch) in &batches {
-            let dir = team_dir(store, team)?;
+        let mut totals: [Maintenance; 3] = std::array::from_fn(|_| Maintenance::default());
+        let mut over_limit = Vec::new();
+        for (batch_team, batch) in &batches {
+            let dir = team_dir(store, batch_team)?;
             fs::create_dir_all(&dir).map_err(write_error)?;
-            let lengths = lengths.entry(team.clone()).or_default();
-            lengths.duties = append(&dir.join("duties.jsonl"), lengths.duties, &batch.duties)?;
-            lengths.escalations = append(
-                &dir.join("escalations.jsonl"),
-                lengths.escalations,
-                &batch.escalations,
-            )?;
-            lengths.records = append(&dir.join("records.jsonl"), lengths.records, &batch.records)?;
+            let lengths = lengths.entry(batch_team.clone()).or_default();
+            let bounds = batch
+                .duties
+                .iter()
+                .try_fold(None, |bounds, duty| {
+                    let number = duty_number(&duty.id)?;
+                    Some(Some(
+                        bounds.map_or((number, number), |(lo, hi): (u64, u64)| {
+                            (lo.min(number), hi.max(number))
+                        }),
+                    ))
+                })
+                .flatten();
+            let streams = [
+                ("duties", &mut lengths.duties, rows(&batch.duties)?, bounds),
+                (
+                    "escalations",
+                    &mut lengths.escalations,
+                    rows(&batch.escalations)?,
+                    None,
+                ),
+                ("records", &mut lengths.records, rows(&batch.records)?, None),
+            ];
+            for (index, (name, stream, bytes, bounds)) in streams.into_iter().enumerate() {
+                if bytes.is_empty() && !(explicit && batch_team == team) {
+                    continue;
+                }
+                let result = maintain(
+                    &dir.join(format!("{name}.jsonl")),
+                    stream,
+                    &bytes,
+                    bounds,
+                    store.archive_limit(),
+                    explicit && batch_team == team,
+                )?;
+                if result.retained_bytes > store.archive_limit() {
+                    over_limit.push(json!({"team": batch_team, "stream": name,
+                        "bytes": result.retained_bytes, "limit_bytes": store.archive_limit()}));
+                }
+                let total = &mut totals[index];
+                total.expired_segments += result.expired_segments;
+                total.expired_bytes += result.expired_bytes;
+                total.retained_bytes += result.retained_bytes;
+                if let Some(reason) = result.deferred {
+                    let reason = format!("team {batch_team}: {reason}");
+                    total.deferred = Some(match total.deferred.take() {
+                        Some(previous) => format!("{previous}; {reason}"),
+                        None => reason,
+                    });
+                }
+            }
             // Retry paths may reuse links created by a failed, unsynced pass.
             store::sync_dir(&dir)?;
         }
@@ -205,7 +262,20 @@ fn compact(
         st.records
             .retain(|r| !archived_records.contains(r.id.as_str()));
         st.archives = lengths;
-        Ok(json!({"duties": n[0], "escalations": n[1], "records": n[2]}))
+        let mut expired = serde_json::Map::new();
+        let mut retained = serde_json::Map::new();
+        let mut deferred = serde_json::Map::new();
+        for (name, total) in ["duties", "escalations", "records"].into_iter().zip(totals) {
+            expired.insert(name.into(), json!({"segments": total.expired_segments, "bytes": total.expired_bytes}));
+            retained.insert(name.into(), json!(total.retained_bytes));
+            if let Some(reason) = total.deferred { deferred.insert(name.into(), json!(reason)); }
+        }
+        let mut result = json!({"duties": n[0], "escalations": n[1], "records": n[2],
+            "expired": expired, "retained_bytes": retained, "limit_bytes": store.archive_limit(), "over_limit": over_limit});
+        if !deferred.is_empty() {
+            result["expiry_deferred"] = Value::Object(deferred);
+        }
+        Ok(result)
     })
 }
 
@@ -216,52 +286,108 @@ fn team_dir(store: &Store, team: &str) -> Result<PathBuf> {
     Ok(store.home().join("archive").join(team))
 }
 
-/// Check the boundary before any truncation; parsing belongs to streaming lookup.
-fn boundary(file: &mut File, committed: u64) -> Result<()> {
-    if file.metadata().map_err(write_error)?.len() < committed {
-        return Err(corrupt("archive is shorter than its committed boundary"));
+impl archive::Segment for ArchiveSegment {
+    fn number(&self) -> u64 {
+        self.n
     }
-    if committed > 0 {
-        file.seek(SeekFrom::Start(committed - 1))
-            .map_err(write_error)?;
-        let mut last = [0];
-        file.read_exact(&mut last).map_err(write_error)?;
-        if last != *b"\n" {
-            return Err(corrupt(
-                "archive committed boundary does not end in newline",
-            ));
-        }
+    fn bytes(&self) -> u64 {
+        self.bytes
     }
-    file.seek(SeekFrom::Start(0)).map_err(write_error)?;
+}
+
+fn validate_stream(stream: &ArchiveStream) -> Result<()> {
+    if stream.next == 0
+        || stream.segments.last().is_some_and(|s| s.n >= stream.next)
+        || stream.segments.iter().any(|s| match (s.lo, s.hi) {
+            (Some(lo), Some(hi)) => lo > hi,
+            (None, None) => false,
+            _ => true,
+        })
+    {
+        return Err(corrupt("invalid archive segment bookkeeping"));
+    }
     Ok(())
 }
 
-fn append<T: Serialize>(path: &Path, committed: u64, entries: &[T]) -> Result<u64> {
-    if entries.is_empty() {
-        return Ok(committed);
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(committed == 0)
-        .truncate(false)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                corrupt("committed archive is missing")
-            } else {
-                write_error(e)
-            }
-        })?;
-    boundary(&mut file, committed)?;
-    file.set_len(committed).map_err(write_error)?;
-    file.seek(SeekFrom::Start(committed)).map_err(write_error)?;
+fn duty_number(id: &str) -> Option<u64> {
+    id.rsplit_once('-')?.1.parse().ok()
+}
+
+fn rows<T: Serialize>(entries: &[T]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
     for entry in entries {
-        serde_json::to_writer(&mut file, entry).map_err(write_error)?;
-        file.write_all(b"\n").map_err(write_error)?;
+        serde_json::to_writer(&mut bytes, entry).map_err(write_error)?;
+        bytes.push(b'\n');
     }
-    file.sync_all().map_err(write_error)?;
-    file.stream_position().map_err(write_error)
+    Ok(bytes)
+}
+
+#[derive(Default)]
+struct Maintenance {
+    expired_segments: u64,
+    expired_bytes: u64,
+    retained_bytes: u64,
+    deferred: Option<String>,
+}
+
+fn maintain(
+    path: &Path,
+    stream: &mut ArchiveStream,
+    bytes: &[u8],
+    bounds: Option<(u64, u64)>,
+    limit: u64,
+    cleanup: bool,
+) -> Result<Maintenance> {
+    validate_stream(stream)?;
+    let prefix = archive::prepare_segments(path, &stream.segments)?;
+    let mut result = Maintenance::default();
+    for segment in stream.segments.drain(..prefix) {
+        result.expired_segments += 1;
+        result.expired_bytes += segment.bytes;
+    }
+    if !bytes.is_empty() {
+        let appended =
+            archive::append_segment(path, &stream.segments, &mut stream.next, limit / 8, bytes)?;
+        if appended.created {
+            stream.segments.push(ArchiveSegment {
+                n: appended.number,
+                bytes: appended.bytes,
+                lo: bounds.map(|b| b.0),
+                hi: bounds.map(|b| b.1),
+            });
+        } else {
+            let last = stream
+                .segments
+                .last_mut()
+                .expect("append_segment selected an existing segment");
+            last.bytes = appended.bytes;
+            // Adopted segments stay unbounded: their older rows were never indexed.
+            match (last.lo, last.hi, bounds) {
+                (Some(lo), Some(hi), Some((new_lo, new_hi))) => {
+                    last.lo = Some(lo.min(new_lo));
+                    last.hi = Some(hi.max(new_hi));
+                }
+                _ => {
+                    last.lo = None;
+                    last.hi = None;
+                }
+            }
+        }
+    }
+    let enforcement = archive::enforce_limit(path, &mut stream.segments, limit)?;
+    for segment in enforcement.expired {
+        result.expired_segments += 1;
+        result.expired_bytes += segment.bytes;
+    }
+    result.deferred = enforcement.deferred;
+    if cleanup {
+        let cleanup_error = archive::remove_unlisted(path, &stream.segments)?;
+        if result.deferred.is_none() {
+            result.deferred = cleanup_error;
+        }
+    }
+    result.retained_bytes = stream.segments.iter().map(|s| s.bytes).sum();
+    Ok(result)
 }
 
 /// Hot contracts use the caller's snapshot; archive reads lock against truncation.
@@ -276,42 +402,39 @@ pub fn full_duty(store: &Store, st: &State, session: &str, duty: &str) -> Result
     if st.duties.contains_key(duty) {
         return crate::card::full_duty(&st, session, duty).cloned();
     }
-    let committed = st.archives.get(&member.team).map_or(0, |a| a.duties);
+    let stream = st.archives.get(&member.team).map(|a| &a.duties);
     let mut found = None;
-    if committed > 0 {
-        let mut file =
-            File::open(team_dir(store, &member.team)?.join("duties.jsonl")).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    corrupt("committed archive is missing")
-                } else {
-                    write_error(e)
+    if let Some(stream) = stream {
+        validate_stream(stream)?;
+        let path = team_dir(store, &member.team)?.join("duties.jsonl");
+        let prefix = archive::expired_prefix(&path, &stream.segments)?;
+        for index in (prefix..stream.segments.len()).rev() {
+            let segment = &stream.segments[index];
+            if let (Some(number), Some(lo), Some(hi)) = (duty_number(duty), segment.lo, segment.hi)
+                && (number < lo || number > hi)
+            {
+                continue;
+            }
+            archive::scan_segment(&path, &stream.segments, index, |line| {
+                let entry: Duty =
+                    serde_json::from_slice(line).map_err(|e| corrupt(e.to_string()))?;
+                if entry.team != member.team {
+                    return Err(corrupt("archive entry belongs to another team"));
                 }
+                if entry.id == duty {
+                    found = Some(entry);
+                }
+                Ok(())
             })?;
-        boundary(&mut file, committed)?;
-        let mut reader = BufReader::new(file.take(committed));
-        let mut line = String::new();
-        while reader.read_line(&mut line).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidData {
-                corrupt(e.to_string())
-            } else {
-                write_error(e)
+            if found.is_some() {
+                break;
             }
-        })? > 0
-        {
-            let entry: Duty = serde_json::from_str(&line).map_err(|e| corrupt(e.to_string()))?;
-            if entry.team != member.team {
-                return Err(corrupt("archive entry belongs to another team"));
-            }
-            if entry.id == duty {
-                found = Some(entry);
-            }
-            line.clear();
         }
     }
     found.ok_or_else(|| {
         Error::new(
             Reason::NotFound,
-            "duty not found in hot state or team archive",
+            "duty not found in hot state or retained team archive",
         )
     })
 }

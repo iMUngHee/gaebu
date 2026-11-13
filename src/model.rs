@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub type Ms = u64;
 
@@ -24,7 +24,7 @@ pub struct State {
     /// Registered canonical project schedules, keyed by runtime team id.
     #[serde(default)]
     pub schedules: BTreeMap<String, ScheduleRegistration>,
-    /// Committed JSONL byte lengths, keyed by runtime team id.
+    /// Retained JSONL segments and monotonic allocators, keyed by runtime team id.
     #[serde(default)]
     pub archives: BTreeMap<String, ArchiveLengths>,
     pub teams: BTreeMap<String, Team>,
@@ -66,9 +66,34 @@ impl Default for State {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveLengths {
-    pub duties: u64,
-    pub escalations: u64,
-    pub records: u64,
+    pub duties: ArchiveStream,
+    pub escalations: ArchiveStream,
+    pub records: ArchiveStream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveStream {
+    pub next: u64,
+    pub segments: Vec<ArchiveSegment>,
+}
+
+impl Default for ArchiveStream {
+    fn default() -> Self {
+        Self {
+            next: 1,
+            segments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveSegment {
+    pub n: u64,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lo: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi: Option<u64>,
 }
 
 impl State {
