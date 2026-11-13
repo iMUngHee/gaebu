@@ -339,7 +339,8 @@ left the list. Removed detail is expired, never evidence of completion; retained
 complete tombstones still satisfy their dependants.
 
 A failed sync or unlink stops healing and returns success with `heal_deferred`
-and observed `hole_remaining`. The pass retires nothing and leaves the document
+and `hole_remaining` (also true when reinspection fails with an I/O error).
+The pass retires nothing and leaves the document
 unchanged; `healed` still reports actual deletions. `hole_remaining` can be false
 when only the final directory sync failed. Retry `--heal`; a plain run works once
 the hole is gone. A later save error includes the number of files already removed
