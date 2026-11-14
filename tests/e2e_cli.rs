@@ -259,7 +259,7 @@ fn full_duty_read_survives_completion_and_cannot_cross_team_or_write_state() {
 fn delegated_schedule_nested_team_hold_and_review_work_through_cli() {
     use gaebu::model::now_ms;
     use gaebu::ops::{self, SeedSpec};
-    let (_guard, dir, store) = setup();
+    let (_guard, _dir, store) = setup();
     let pager = FakePager::new(&[
         ("boss-session", "boss"),
         ("master-session", "master"),
@@ -317,7 +317,8 @@ fn delegated_schedule_nested_team_hold_and_review_work_through_cli() {
         .find(|m| m.binding.alias == "master")
         .unwrap()
         .clone();
-    let project = dir.0.join("schedule.md");
+    let project_dir = home();
+    let project = project_dir.0.join("schedule.md");
     assert_eq!(
         gaebu(&pager, &["schedule", "init", project.to_str().unwrap()]),
         0

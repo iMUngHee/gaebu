@@ -389,6 +389,10 @@ fn holds_require_evidence() {
             .filter(|r| r.kind == RecordKind::Handoff)
             .all(|r| r.text.contains(words) && r.text.contains("human approval"))
     );
+    for record in st.records.iter().filter(|r| r.kind == RecordKind::Handoff) {
+        let details: Value = serde_json::from_str(&record.text).unwrap();
+        assert_eq!(details["holds"][0]["cleared"], true);
+    }
     for scenario in [
         "duty",
         "bu",
@@ -626,7 +630,14 @@ fn adopter_archives_inherited_terminal_items() {
     )
     .unwrap();
     f.offer(1);
-    f.adopt(1).unwrap();
+    assert_eq!(f.adopt(1).unwrap()["retired_dispatches"], 1);
+    assert_eq!(
+        schedule::read_document(&f.path).unwrap().schedule.items[0]
+            .owner_bu
+            .as_ref()
+            .map(|owner| owner.id.as_str()),
+        Some(f.teams[0].bu.as_str())
+    );
     f.call(1, "schedule_archive", json!({})).unwrap();
     assert!(
         schedule::read_document(&f.path)
@@ -1389,4 +1400,89 @@ fn adopt_path_refuses_archive_names_before_locking() {
     );
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(!path.with_file_name("orphan.archive.3.jsonl.lock").exists());
+}
+
+#[test]
+fn path_adoption_can_coexist_with_other_registered_schedules() {
+    let f = Fixture::new();
+    let mut doc = schedule::read_document(&f.path).unwrap().schedule;
+    doc.id = "independent-orphan".into();
+    doc.archive.as_mut().unwrap().base = evidence::sha256_hex(&doc.id);
+    let path = f.path.with_file_name("independent.md");
+    fs::write(
+        &path,
+        format!(
+            "<!-- gaebu-schedule -->\n```json\n{}\n```\n",
+            serde_json::to_string(&doc).unwrap()
+        ),
+    )
+    .unwrap();
+    let words = "adopt the independent orphan while keeping the original team";
+    f.prompt(1, words);
+    assert_eq!(
+        f.call(1, "schedule_adopt", json!({"path":path,"evidence":words}))
+            .unwrap()["adopted"],
+        true
+    );
+    let state = f.store.read_current().unwrap();
+    assert_eq!(state.schedules.len(), 2);
+    assert_ne!(
+        state.schedules[&f.teams[0].id].schedule_id,
+        state.schedules[&f.teams[1].id].schedule_id
+    );
+}
+
+#[test]
+fn adoption_rechecks_same_words_from_a_new_prompt_under_the_state_lock() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    f.add("transfer", &[]);
+    f.offer(1);
+    let words = "adopt this Schedule under this instruction";
+    f.prompt(1, words);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.store.home().join("state.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let store = Store::open(f.store.home()).unwrap();
+    let caller = f.teams[1].root.clone();
+    let source = f.teams[0].id.clone();
+    let worker = std::thread::spawn(move || {
+        schedule::call(
+            &store,
+            &QuietPager,
+            &caller,
+            "schedule_adopt",
+            &json!({"team":source,"evidence":words}),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.path.with_file_name("schedule.md.lock"))
+            .unwrap();
+        match probe.try_lock() {
+            Err(fs::TryLockError::WouldBlock) => break,
+            Ok(()) => drop(probe),
+            Err(error) => panic!("unexpected lock error: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "adopter did not take the Schedule lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Let the first evidence check finish before changing its sequence behind state.lock.
+    std::thread::sleep(Duration::from_millis(50));
+    f.prompt(1, words);
+    let before = fs::read(&f.path).unwrap();
+    drop(lock);
+    let error = worker.join().unwrap().unwrap_err();
+    assert_eq!(error.reason, Reason::NoUserEvidence);
+    assert!(error.message.contains("current prompt changed"));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
 }

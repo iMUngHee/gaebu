@@ -1197,8 +1197,19 @@ mod tests {
 
     fn registered_heal_fixture(
         count: u64,
-    ) -> (crate::store::Store, PathBuf, crate::identity::Caller) {
-        let (store, schedule_path, _) = segmented_fixture(count, 8192);
+    ) -> (
+        crate::store::Store,
+        PathBuf,
+        crate::identity::Caller,
+        PathBuf,
+    ) {
+        let (original_store, schedule_path, _) = segmented_fixture(count, 8192);
+        let fixture_root = original_store.home().to_owned();
+        let store = crate::store::Store::open_with_archive_limit(
+            original_store.home().join("runtime"),
+            8192,
+        )
+        .unwrap();
         store
             .transact(crate::store::CLI_DEADLINE, |st| {
                 crate::ops::dev_seed(
@@ -1221,16 +1232,45 @@ mod tests {
             tool: Some(Tool::Codex),
             source: crate::identity::Source::PagerNative,
         };
-        runtime::register(&store, &caller, &schedule_path, false).unwrap();
+        let quote = "adopt the existing archive test Schedule";
+        let log = store.session(&caller.session_id);
+        log.append(
+            now_ms(),
+            crate::store::EventKind::UserPrompt,
+            Some(crate::evidence::sha256_hex(quote)),
+            Some(quote.into()),
+            None,
+        )
+        .unwrap();
+        handoff::adopt(
+            &store,
+            &caller,
+            &commands::Input::parse(&json!({"path":schedule_path,"evidence":quote})).unwrap(),
+        )
+        .unwrap();
         // Registration canonicalizes the path; injected failures match the
         // registered spelling (macOS temp aliases, Windows verbatim prefixes).
         let schedule_path = fs::canonicalize(schedule_path).unwrap();
-        (store, schedule_path, caller)
+        (store, schedule_path, caller, fixture_root)
+    }
+
+    #[test]
+    fn registered_heal_fixture_cleanup_stays_within_owned_root() {
+        let (store, _, _, fixture_root) = registered_heal_fixture(0);
+        assert_ne!(fixture_root, std::env::temp_dir());
+        assert_eq!(store.home(), fixture_root.join("runtime"));
+        let other = fixture_root.with_extension("cleanup-peer");
+        fs::create_dir(&other).unwrap();
+        let sentinel = other.join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        fs::remove_dir_all(fixture_root).unwrap();
+        assert_eq!(fs::read(sentinel).unwrap(), b"keep");
+        fs::remove_dir_all(other).unwrap();
     }
 
     #[test]
     fn partial_heal_reports_and_resumes() {
-        let (store, schedule_path, caller) = registered_heal_fixture(4);
+        let (store, schedule_path, caller, fixture_root) = registered_heal_fixture(4);
         let mut document = read_document(&schedule_path).unwrap();
         let head = document.schedule.archive.as_ref().unwrap().clone();
         assert_eq!(head.segments.len(), 4);
@@ -1265,12 +1305,12 @@ mod tests {
             load(&schedule_path, &final_.schedule).unwrap().items.len(),
             2
         );
-        fs::remove_dir_all(store.home()).unwrap();
+        fs::remove_dir_all(fixture_root).unwrap();
     }
 
     #[test]
     fn heal_reports_listed_and_unlisted_separately() {
-        let (store, schedule_path, caller) = registered_heal_fixture(4);
+        let (store, schedule_path, caller, fixture_root) = registered_heal_fixture(4);
         let mut document = read_document(&schedule_path).unwrap();
         let head = document.schedule.archive.as_mut().unwrap();
         let expired: Vec<_> = head.segments.drain(..2).collect();
@@ -1297,13 +1337,13 @@ mod tests {
         );
         assert!(result["heal_deferred"].is_string());
         assert_eq!(fs::read(&schedule_path).unwrap(), original);
-        fs::remove_dir_all(store.home()).unwrap();
+        fs::remove_dir_all(fixture_root).unwrap();
     }
 
     #[test]
     fn heal_then_failed_publish_is_consistent() {
         for unlisted in [false, true] {
-            let (store, schedule_path, caller) = registered_heal_fixture(4);
+            let (store, schedule_path, caller, fixture_root) = registered_heal_fixture(4);
             let mut document = read_document(&schedule_path).unwrap();
             if unlisted {
                 let head = document.schedule.archive.as_mut().unwrap();
@@ -1342,7 +1382,7 @@ mod tests {
             let retry = operations::mutate(&store, &caller, "schedule_archive", &args).unwrap();
             assert_eq!(retry["healed"]["segments"], 0);
             assert_eq!(retry["expired"]["segments"], if unlisted { 2 } else { 3 });
-            fs::remove_dir_all(store.home()).unwrap();
+            fs::remove_dir_all(fixture_root).unwrap();
         }
     }
 
