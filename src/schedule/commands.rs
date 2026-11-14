@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 #[serde(deny_unknown_fields)]
 pub(super) struct Input {
     pub item: Option<String>,
+    pub team: Option<String>,
+    pub to: Option<String>,
+    #[serde(default)]
+    pub withdraw: bool,
     pub title: Option<String>,
     pub key: Option<String>,
     pub token: Option<String>,
@@ -94,6 +98,28 @@ pub fn human_hold(store: &Store, caller: &Caller, args: &Value, release: bool) -
 
 #[derive(Debug, Subcommand)]
 pub enum ScheduleCmd {
+    /// Offer this team's Schedule to another team or withdraw its offer.
+    Offer {
+        #[arg(
+            long,
+            required_unless_present = "withdraw",
+            conflicts_with = "withdraw"
+        )]
+        to: Option<String>,
+        #[arg(long)]
+        withdraw: bool,
+    },
+    /// Adopt a team's Schedule, or an unregistered file with human evidence.
+    Adopt {
+        #[arg(required_unless_present = "path", conflicts_with = "path")]
+        team: Option<String>,
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        #[arg(long)]
+        evidence: Option<String>,
+        #[arg(long)]
+        explicit: bool,
+    },
     Init {
         path: std::path::PathBuf,
     },
@@ -220,6 +246,8 @@ pub fn tools() -> Vec<Value> {
     let pm = json!({"type":["object","null"],"properties":{"task":string,"item":string,"plan":{"type":["string","null"]}},"required":["task","item"],"additionalProperties":false});
     let spec = json!({"type":"object","properties":{"intent":string,"outcome":string,"scope":strings,"decision_rights":string,"escalate_on":strings,"done_criteria":string,"plan_ref":{"type":["string","null"]},"exec_root":{"type":["string","null"]},"source_quote":string},"required":["intent","outcome","scope","decision_rights","escalate_on","done_criteria"],"additionalProperties":false});
     [
+        ("schedule_offer","Offer the commander's registered Schedule to another active team, or withdraw the offer",json!({"to":string,"withdraw":{"type":"boolean"}}),vec![]),
+        ("schedule_adopt","Adopt a team's whole Schedule. Active sources must offer it; source runtime holds require current-turn evidence. An unregistered path always requires human evidence. Existing item holds remain.",json!({"team":string,"path":string,"evidence":string,"explicit":{"type":"boolean"}}),vec![]),
         ("schedule_show","Read compact open work, all history, or one full Schedule item",json!({"item":string,"all":{"type":"boolean"}}),vec![]),
         ("schedule_archive","Archive eligible terminal Schedule items and enforce the byte limit, permanently deleting old segments. expired reports removed segments/rows; retained_bytes and limit_bytes show bounds; expiry_deferred reports deletion failures. heal=true explicitly deletes older history to repair holes; healed separates listed and unlisted removals, heal_deferred/hole_remaining report partial recovery.",json!({"expected_revision":revision,"heal":{"type":"boolean"}}),vec![]),
         ("schedule_move","Move the commander team's missing Schedule registration to an existing file",json!({"path":string}),vec!["path"]),
@@ -269,6 +297,8 @@ pub fn call(
     }
     let input = Input::parse(args)?;
     let result = match name {
+        "schedule_offer" => handoff::offer(store, caller, &input),
+        "schedule_adopt" => handoff::adopt(store, caller, &input),
         "schedule_move" => runtime::move_registration(
             store,
             caller,
@@ -316,6 +346,31 @@ pub fn run_cli(cmd: ScheduleCmd, json_output: bool, pager: &dyn Pager) -> Result
         crate::identity::refresh_bindings(&store, pager)?;
     }
     let result = match cmd {
+        ScheduleCmd::Offer { to, withdraw } => {
+            let mut args = json!({"withdraw":withdraw});
+            if let Some(to) = to {
+                args["to"] = json!(to);
+            }
+            call(&store, pager, &caller, "schedule_offer", &args)
+        }
+        ScheduleCmd::Adopt {
+            team,
+            path,
+            evidence,
+            explicit,
+        } => {
+            let mut args = json!({"explicit":explicit});
+            if let Some(team) = team {
+                args["team"] = json!(team);
+            }
+            if let Some(path) = path {
+                args["path"] = json!(path);
+            }
+            if let Some(evidence) = evidence {
+                args["evidence"] = json!(evidence);
+            }
+            call(&store, pager, &caller, "schedule_adopt", &args)
+        }
         ScheduleCmd::Init { path } => runtime::register(&store, &caller, &path, true),
         ScheduleCmd::Attach { path } => runtime::register(&store, &caller, &path, false),
         ScheduleCmd::Manager { member, scope } => {

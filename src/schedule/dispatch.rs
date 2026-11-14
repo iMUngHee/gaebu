@@ -170,30 +170,7 @@ pub(super) fn human_hold(
     release: bool,
 ) -> Result<Value> {
     let quote = args.text("evidence")?;
-    let verify = || -> Result<Evidence> {
-        let log = store.session(&caller.session_id);
-        let mut ev = crate::evidence::current_turn_evidence(
-            &caller.session_id,
-            &log.events()?,
-            &log.composers()?,
-            quote,
-            now_ms(),
-        )?;
-        if log.unrecorded_after(ev.at)?
-            || store
-                .session(crate::store::GLOBAL_MARKERS)
-                .unrecorded_after(ev.at)?
-        {
-            return Err(Error::new(
-                Reason::NoUserEvidence,
-                "a later prompt was unrecorded",
-            ));
-        }
-        if args.explicit {
-            ev.strength = Strength::Explicit;
-        }
-        Ok(ev)
-    };
+    let verify = || human_evidence(store, caller, quote, args.explicit);
     let first = verify()?;
     operate(store, caller, args, true, |_st, _actor, _team, document| {
         let ev = verify()?;

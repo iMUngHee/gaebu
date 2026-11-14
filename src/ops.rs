@@ -2030,6 +2030,31 @@ fn changed(
         return;
     };
     let team = actor.team.clone();
+    record_change(
+        st,
+        now,
+        author,
+        affected,
+        text,
+        notify,
+        (RecordKind::Change, &team),
+    );
+}
+
+pub(crate) fn record_change(
+    st: &mut State,
+    now: Ms,
+    author: &str,
+    affected: &[String],
+    text: &str,
+    notify: Notify<'_>,
+    record: (RecordKind, &str),
+) {
+    let Some(actor) = st.members.get(author) else {
+        return;
+    };
+    let (kind, team) = record;
+    let team = team.to_owned();
     let actor_session = actor.binding.session_id.clone();
     let actor_name = crate::card::display(st, actor);
     let team_name = st
@@ -2042,7 +2067,7 @@ fn changed(
     st.records.push(Record {
         id,
         team,
-        kind: RecordKind::Change,
+        kind,
         author: author.into(),
         refs: affected.to_vec(),
         text: text.into(),

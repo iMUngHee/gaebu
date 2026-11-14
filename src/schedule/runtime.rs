@@ -15,22 +15,14 @@ pub fn register(store: &Store, caller: &Caller, path: &Path, create: bool) -> Re
     let actor = identity::actor(&snapshot, caller)?;
     let team = snapshot.members[&actor.member].team.clone();
     commander(&snapshot, &actor, &team)?;
-    let path = if path.exists() {
-        fs::canonicalize(path).map_err(io_error)?
-    } else {
-        let absolute = std::path::absolute(path).map_err(io_error)?;
-        let parent = fs::canonicalize(
-            absolute
-                .parent()
-                .ok_or_else(|| invalid("schedule has no parent"))?,
-        )
-        .map_err(io_error)?;
-        parent.join(
-            absolute
-                .file_name()
-                .ok_or_else(|| invalid("schedule has no file name"))?,
-        )
-    };
+    let path = store::canonical_path(path)?;
+    if snapshot
+        .schedules
+        .get(&team)
+        .is_none_or(|registration| Path::new(&registration.path) != path)
+    {
+        refuse_runtime_home(store, &path)?;
+    }
     archive::refuse_sidecar_name(&path)?;
     let _file = lock_path(&path)?;
     let mut document = if path.exists() {
@@ -61,10 +53,26 @@ pub fn register(store: &Store, caller: &Caller, path: &Path, create: bool) -> Re
         if st.schedules.iter().any(|(id,reg)|id!=&team && (reg.schedule_id==document.schedule.id || reg.path==path.to_string_lossy())) {
             return Err(conflict("schedule is already registered to another team"));
         }
+        if !st.schedules.contains_key(&team) {
+            refuse_runtime_home(store,&path)?;
+            if !document.schedule.items.is_empty() || !document.schedule.retired.is_empty()
+                || document.schedule.archive.as_ref().is_some_and(|head|head.expired_rows>0 || head.retained_rows()>0) {
+                return Err(conflict("nonempty Schedule requires schedule adopt --path <file> --evidence <words>"));
+            }
+        }
         st.schedules.entry(team.clone()).or_insert(ScheduleRegistration {schedule_id:document.schedule.id.clone(),path:path.to_string_lossy().into_owned(),manager:None,offer:None,predecessors:Default::default()});
         Ok(json!({"registered":true,"schedule_id":document.schedule.id,"path":path,"revision":document.schedule.revision}))
     })
 }
+pub(super) fn refuse_runtime_home(store: &Store, path: &Path) -> Result<()> {
+    if path.starts_with(store::canonical_path(store.home())?) {
+        return Err(invalid(
+            "Schedule registrations inside the runtime home are not allowed",
+        ));
+    }
+    Ok(())
+}
+
 pub fn set_manager(
     store: &Store,
     caller: &Caller,
@@ -121,7 +129,8 @@ pub(super) fn move_registration(store: &Store, caller: &Caller, path: &Path) -> 
         .get(&team)
         .cloned()
         .ok_or_else(|| Error::new(Reason::NotFound, "team has no schedule"))?;
-    let path = fs::canonicalize(path).map_err(io_error)?;
+    let path = store::canonical_path(path)?;
+    refuse_runtime_home(store, &path)?;
     archive::refuse_sidecar_name(&path)?;
     let (_file, document) = lock_document(&path)?;
     if document.schedule.id != registration.schedule_id {
@@ -490,7 +499,7 @@ pub(super) fn master<'a>(st: &'a State, team: &str, item: &Item) -> Result<&'a M
     Ok(member)
 }
 
-fn commander(st: &State, actor: &Actor, team: &str) -> Result<()> {
+pub(super) fn commander(st: &State, actor: &Actor, team: &str) -> Result<()> {
     authz::check_actor(st, actor)?;
     if st
         .teams
@@ -585,7 +594,7 @@ pub(super) fn operate<T>(
     Ok(result)
 }
 
-fn lock_path(path: &Path) -> Result<File> {
+pub(super) fn lock_path(path: &Path) -> Result<File> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("schedule path has no parent"))?;

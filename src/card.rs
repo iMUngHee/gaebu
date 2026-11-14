@@ -196,7 +196,7 @@ pub fn full_duty<'a>(st: &'a State, session: &str, duty: &str) -> crate::Result<
         .duties
         .get(duty)
         .ok_or_else(|| crate::Error::new(crate::Reason::NotFound, "duty not found"))?;
-    if member.team != duty.team {
+    if member.team != duty.team && !crate::schedule::predecessor_duty(st, &member.team, duty) {
         return Err(crate::Error::new(
             crate::Reason::NoGrant,
             "duty belongs to another team",

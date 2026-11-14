@@ -14,10 +14,12 @@ use std::{
 mod archive;
 mod commands;
 mod dispatch;
+mod handoff;
 mod operations;
 mod presentation;
 mod runtime;
 pub use commands::{ScheduleCmd, call, human_hold, reserve, run_cli, tools};
+pub(crate) use handoff::predecessor_duty;
 pub use presentation::view;
 pub use runtime::{compact, register, set_manager, transaction};
 
@@ -485,6 +487,36 @@ impl Document {
         }
         crate::store::replace_until(path, text.as_bytes(), deadline)
     }
+}
+
+fn human_evidence(
+    store: &crate::store::Store,
+    caller: &crate::identity::Caller,
+    quote: &str,
+    explicit: bool,
+) -> Result<Evidence> {
+    let log = store.session(&caller.session_id);
+    let mut evidence = crate::evidence::current_turn_evidence(
+        &caller.session_id,
+        &log.events()?,
+        &log.composers()?,
+        quote,
+        now_ms(),
+    )?;
+    if log.unrecorded_after(evidence.at)?
+        || store
+            .session(crate::store::GLOBAL_MARKERS)
+            .unrecorded_after(evidence.at)?
+    {
+        return Err(Error::new(
+            Reason::NoUserEvidence,
+            "a later prompt was unrecorded",
+        ));
+    }
+    if explicit {
+        evidence.strength = Strength::Explicit;
+    }
+    Ok(evidence)
 }
 
 fn nonempty(text: &str, field: &str) -> Result<()> {

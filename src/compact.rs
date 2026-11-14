@@ -557,11 +557,39 @@ pub fn full_duty(store: &Store, st: &State, session: &str, duty: &str) -> Result
     if st.duties.contains_key(duty) {
         return crate::card::full_duty(&st, session, duty).cloned();
     }
-    let stream = st.archives.get(&member.team).map(|a| &a.duties);
+    if let Some(found) = archived_duty(store, &st, &member.team, duty)? {
+        return Ok(found);
+    }
+    if let Some(registration) = st.schedules.get(&member.team) {
+        let mut unavailable = false;
+        for predecessor in &registration.predecessors {
+            match archived_duty(store, &st, predecessor, duty) {
+                Ok(Some(found)) if crate::schedule::predecessor_duty(&st, &member.team, &found) => {
+                    return Ok(found);
+                }
+                Ok(_) => (),
+                Err(_) => unavailable = true,
+            }
+        }
+        if unavailable {
+            return Err(Error::new(
+                Reason::NotFound,
+                "predecessor archive unavailable",
+            ));
+        }
+    }
+    Err(Error::new(
+        Reason::NotFound,
+        "duty not found in hot state or retained team archive",
+    ))
+}
+
+fn archived_duty(store: &Store, st: &State, team: &str, duty: &str) -> Result<Option<Duty>> {
+    let stream = st.archives.get(team).map(|a| &a.duties);
     let mut found = None;
     if let Some(stream) = stream {
         validate_stream(stream)?;
-        let path = team_dir(store, &member.team)?.join("duties.jsonl");
+        let path = team_dir(store, team)?.join("duties.jsonl");
         let prefix = archive::expired_prefix(&path, &stream.segments)?;
         for index in (prefix..stream.segments.len()).rev() {
             let segment = &stream.segments[index];
@@ -573,7 +601,7 @@ pub fn full_duty(store: &Store, st: &State, session: &str, duty: &str) -> Result
             archive::scan_segment(&path, &stream.segments, index, |line| {
                 let entry: Duty =
                     serde_json::from_slice(line).map_err(|e| corrupt(e.to_string()))?;
-                if entry.team != member.team {
+                if entry.team != team {
                     return Err(corrupt("archive entry belongs to another team"));
                 }
                 if entry.id == duty {
@@ -586,12 +614,7 @@ pub fn full_duty(store: &Store, st: &State, session: &str, duty: &str) -> Result
             }
         }
     }
-    found.ok_or_else(|| {
-        Error::new(
-            Reason::NotFound,
-            "duty not found in hot state or retained team archive",
-        )
-    })
+    Ok(found)
 }
 
 fn write_error(error: impl std::fmt::Display) -> Error {
