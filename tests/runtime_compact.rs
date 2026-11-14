@@ -243,6 +243,8 @@ fn link(st: &mut State, team: &str, id: &str) {
             schedule_id: "schedule-one".into(),
             path: "unreadable".into(),
             manager: None,
+            offer: None,
+            predecessors: Default::default(),
         },
     );
     st.duties.get_mut(id).unwrap().schedule_ref = Some(ScheduleRef {

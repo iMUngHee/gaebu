@@ -392,7 +392,7 @@ fn legacy_sighting_defaults_pending_throttle_fields() {
 // ----- schema v2 migration (plan gaebu-v0-2, Decisions 12–12d) -----
 
 const V1: &str = include_str!("fixtures/state-v1.json");
-const FUTURE: &str = r#"{"schema_version":6,"teams":"a newer shape this model cannot parse"}"#;
+const FUTURE: &str = r#"{"schema_version":7,"teams":"a newer shape this model cannot parse"}"#;
 
 fn json(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
@@ -433,16 +433,99 @@ fn schema_3_migrates_with_exact_backup_and_archive_defaults() {
     let original = serde_json::to_vec(&legacy).unwrap();
     fs::write(home.0.join("state.json"), &original).unwrap();
     let store = home.store();
-    assert_eq!(store.read_view().unwrap().schema_version, 5);
+    assert_eq!(store.read_view().unwrap().schema_version, 6);
     store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
     let state = store.read_current().unwrap();
-    assert_eq!(state.schema_version, 5);
+    assert_eq!(state.schema_version, 6);
     assert_eq!(state.runtime_id, "original-runtime");
     assert_eq!(state.next_id, 50);
     assert_eq!(state.rev, 10);
     assert!(state.archives.is_empty());
     assert_eq!(fs::read(home.0.join("state.v3.json")).unwrap(), original);
-    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 5);
+    assert_eq!(json(&home.0.join("state.prev.json"))["schema_version"], 6);
+}
+
+#[test]
+fn schema5_state_adopts_schema6() {
+    let cases = ["absolute", "relative"]
+        .into_iter()
+        .chain(cfg!(unix).then_some("symlink"));
+    for case in cases {
+        let root = if case == "relative" {
+            let path = PathBuf::from("target").join(format!(
+                "gaebu-schema6-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Home(path)
+        } else {
+            Home::new()
+        };
+        let actual_home = root.0.join("runtime");
+        fs::create_dir_all(actual_home.join("archive/team")).unwrap();
+        let access = if case == "symlink" {
+            let alias = root.0.join("runtime-alias");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&actual_home, &alias).unwrap();
+            alias
+        } else {
+            actual_home.clone()
+        };
+        let canonical_home = fs::canonicalize(&actual_home).unwrap();
+        let document = canonical_home.join("archive/team/duties.jsonl");
+        fs::write(&document, b"temporarily unparseable Schedule document").unwrap();
+        let external = fs::canonicalize(&root.0).unwrap().join("runtime-sibling");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("schedule.md"), b"outside").unwrap();
+        let mut legacy = serde_json::to_value(State::default()).unwrap();
+        legacy["schema_version"] = 5.into();
+        for field in ["root_evidence_floor", "purge_pending", "home_schedules"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        legacy["schedules"] = serde_json::json!({
+            "inside": {"schedule_id":"old-inside", "path":document, "manager":null},
+            "missing": {"schedule_id":"old-missing", "path":access.join("missing/sub/schedule.md"), "manager":null},
+            "outside": {"schedule_id":"old-outside", "path":external.join("schedule.md"), "manager":null}
+        });
+        let original = serde_json::to_vec(&legacy).unwrap();
+        fs::write(access.join("state.json"), &original).unwrap();
+        let store = Store::open(&access).unwrap();
+        let expected: std::collections::BTreeSet<_> = [
+            document.to_string_lossy().into_owned(),
+            canonical_home
+                .join("missing/sub/schedule.md")
+                .to_string_lossy()
+                .into_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let view = store.read_view().unwrap();
+        assert_eq!(view.schema_version, 6);
+        assert_eq!(view.root_evidence_floor, 0);
+        assert!(view.purge_pending.is_empty());
+        assert_eq!(view.home_schedules, expected, "{case}");
+        for registration in view.schedules.values() {
+            assert_eq!(registration.offer, None);
+            assert!(registration.predecessors.is_empty());
+        }
+        assert_eq!(fs::read(access.join("state.json")).unwrap(), original);
+        store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
+        assert_eq!(fs::read(access.join("state.v5.json")).unwrap(), original);
+        assert_eq!(store.read_current().unwrap().home_schedules, expected);
+        assert_eq!(json(&access.join("state.prev.json"))["schema_version"], 6);
+        assert_eq!(
+            fs::read(&document).unwrap(),
+            b"temporarily unparseable Schedule document"
+        );
+        store
+            .transact(Duration::from_secs(5), |st| {
+                st.schedules.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.read_current().unwrap().home_schedules, expected);
+    }
 }
 
 #[test]
@@ -824,7 +907,7 @@ fn state_v4_archives_become_segment_one() {
     store.transact(Duration::from_secs(5), |_| Ok(())).unwrap();
     assert_eq!(fs::read(home.0.join("state.v4.json")).unwrap(), original);
     assert_eq!(fs::read(&path).unwrap(), archive);
-    assert_eq!(store.read_current().unwrap().schema_version, 5);
+    assert_eq!(store.read_current().unwrap().schema_version, 6);
     let mut fresh = original_duty.clone();
     fresh.id = "d-9999".into();
     store

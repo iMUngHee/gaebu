@@ -9,6 +9,7 @@
 //! state.v1.json         the schema-1 original, kept by the v2 migration
 //! state.v3.json         the schema-3 original, kept by migration
 //! state.v4.json         the schema-4 original, kept by the v5 migration
+//! state.v5.json         the schema-5 original, kept by the v6 migration
 //! archive/<team>/{duties,escalations,records}.jsonl  committed history
 //! state.lock            OS lock (never deleted)
 //! sessions/<id>/events.jsonl    SessionEvent lines (hook writes)
@@ -508,7 +509,7 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
     };
     let probe: Probe = serde_json::from_slice(&bytes).map_err(corrupt_error)?;
     match probe.schema_version {
-        version @ (1..=4) => {
+        version @ (1..=5) => {
             // Legacy additions default; schema 1 also needs notice/evidence normalization.
             let mut value: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(corrupt_error)?;
@@ -565,6 +566,15 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
             if version == 1 {
                 migrate_v1(&mut state);
             }
+            let home = canonical_path(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            for registration in state.schedules.values() {
+                let schedule = canonical_path(Path::new(&registration.path))?;
+                if schedule.starts_with(&home) {
+                    state
+                        .home_schedules
+                        .insert(schedule.to_string_lossy().into_owned());
+                }
+            }
             state.schema_version = crate::model::SCHEMA_VERSION;
             Ok(Some(Loaded {
                 state,
@@ -579,6 +589,38 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
             Reason::StoreUnsupported,
             format!("schema_version {v} is newer than this gaebu"),
         )),
+    }
+}
+
+/// Keep home containment stable when a registered path or its parents are missing.
+pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf> {
+    let mut prefix = std::path::absolute(path).map_err(write_error)?;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::canonicalize(&prefix) {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    if component == std::ffi::OsStr::new("..") {
+                        resolved.pop();
+                    } else {
+                        resolved.push(component);
+                    }
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = match prefix.components().next_back() {
+                    Some(std::path::Component::Normal(name)) => name.to_owned(),
+                    Some(std::path::Component::ParentDir) => "..".into(),
+                    _ => return Err(write_error(error)),
+                };
+                suffix.push(component);
+                if !prefix.pop() {
+                    return Err(write_error(error));
+                }
+            }
+            Err(error) => return Err(write_error(error)),
+        }
     }
 }
 
@@ -823,6 +865,37 @@ fn clean_tmp(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod canonical_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_missing_components_and_parent_components() {
+        let home = std::env::temp_dir().join(format!(
+            "gaebu-canonical-{}-{}",
+            std::process::id(),
+            TMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&home).unwrap();
+        let canonical = fs::canonicalize(&home).unwrap();
+        let missing = canonical_path(&home.join("missing/deep/schedule.md"));
+        let parent = canonical_path(&home.join("missing/../schedule.md"));
+        fs::remove_dir_all(home).unwrap();
+        assert_eq!(missing.unwrap(), canonical.join("missing/deep/schedule.md"));
+        assert_eq!(parent.unwrap(), canonical.join("schedule.md"));
+    }
+
+    #[test]
+    fn invalid_names_are_errors_instead_of_missing_paths() {
+        assert_eq!(
+            canonical_path(Path::new("invalid\0path"))
+                .unwrap_err()
+                .reason,
+            Reason::StoreWriteFailed
+        );
+    }
 }
 
 #[cfg(test)]

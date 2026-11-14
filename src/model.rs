@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub type Ms = u64;
 
@@ -27,6 +27,15 @@ pub struct State {
     /// Retained JSONL segments and monotonic allocators, keyed by runtime team id.
     #[serde(default)]
     pub archives: BTreeMap<String, TeamArchives>,
+    /// Published runtime archive ownership awaiting physical deletion.
+    #[serde(default)]
+    pub purge_pending: BTreeMap<String, TeamArchives>,
+    /// Legacy Schedule paths inside the runtime home, retained across purges.
+    #[serde(default)]
+    pub home_schedules: BTreeSet<String>,
+    /// Root directives must cite evidence newer than this cancellation boundary.
+    #[serde(default)]
+    pub root_evidence_floor: Ms,
     pub teams: BTreeMap<String, Team>,
     pub bus: BTreeMap<String, Bu>,
     pub members: BTreeMap<String, Member>,
@@ -50,6 +59,9 @@ impl Default for State {
             runtime_id: String::new(),
             schedules: BTreeMap::new(),
             archives: BTreeMap::new(),
+            purge_pending: BTreeMap::new(),
+            home_schedules: BTreeSet::new(),
+            root_evidence_floor: 0,
             teams: BTreeMap::new(),
             bus: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -134,6 +146,10 @@ pub struct ScheduleRegistration {
     pub schedule_id: String,
     pub path: String,
     pub manager: Option<String>,
+    #[serde(default)]
+    pub offer: Option<String>,
+    #[serde(default)]
+    pub predecessors: BTreeSet<String>,
 }
 
 /// An immutable dispatch in the project's canonical Schedule.

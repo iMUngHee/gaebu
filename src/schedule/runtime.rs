@@ -61,7 +61,7 @@ pub fn register(store: &Store, caller: &Caller, path: &Path, create: bool) -> Re
         if st.schedules.iter().any(|(id,reg)|id!=&team && (reg.schedule_id==document.schedule.id || reg.path==path.to_string_lossy())) {
             return Err(conflict("schedule is already registered to another team"));
         }
-        st.schedules.entry(team.clone()).or_insert(ScheduleRegistration {schedule_id:document.schedule.id.clone(),path:path.to_string_lossy().into_owned(),manager:None});
+        st.schedules.entry(team.clone()).or_insert(ScheduleRegistration {schedule_id:document.schedule.id.clone(),path:path.to_string_lossy().into_owned(),manager:None,offer:None,predecessors:Default::default()});
         Ok(json!({"registered":true,"schedule_id":document.schedule.id,"path":path,"revision":document.schedule.revision}))
     })
 }
