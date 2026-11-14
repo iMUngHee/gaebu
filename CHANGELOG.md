@@ -9,6 +9,51 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.6.0 — 2026-11-14
+
+### Added
+
+- Commanders can transfer an entire canonical Schedule with `schedule offer
+  --to <team>` / `--withdraw` and `schedule adopt <team>` (CLI and MCP). A
+  cancelled source needs no offer. Adoption retires inline attempts, closes
+  linked open duties as handed off, clears non-terminal owners and preserves
+  IDs, dependencies, item holds and history. Reassign owners before redispatch.
+- Any source runtime hold requires the adopter's current-turn `--evidence`.
+  Only the own holds of linked open duties closed by handoff are cleared; source
+  bu holds and other duty holds stay. Both teams record every hold and its effect.
+  Members can read predecessor duty contracts linked to the inherited Schedule.
+- Cancelled teams expire after 30 days unless protected by a keeper's Schedule
+  predecessors. Compaction purges their runtime rows, then removes only listed
+  archive files through retryable `purge_pending` bookkeeping. `purged` and
+  `purge_deferred` expose the outcome. Sessions without an active seat can run
+  this rule-based purge pass; root directives also trigger the automatic check.
+  Project files, session logs, migration backups and unlisted leftovers remain.
+
+### Changed
+
+- `schedule adopt --path <file> --evidence <words>` continues an unregistered
+  document. Populated existing files are refused by `init` and `attach`, with
+  guidance to adopt; empty files and own-registration retries remain usable.
+  Former runtime holds cannot be recovered after purge, so path adoption always
+  requires the human's current words.
+- New Schedule registrations, moves and path adoptions inside the canonical
+  runtime home are refused before creating files. Legacy registrations continue
+  working and their paths are protected from runtime archive mutations.
+- Terminal linked duties may compact once their team no longer registers their
+  Schedule, with the existing age, hold and escalation restrictions.
+
+### Compatibility
+
+- Runtime schema 6 adds offer/predecessor registration fields, retryable purge
+  bookkeeping, protected legacy paths and a root-evidence floor that prevents
+  replay after purge. Schemas 1–5 migrate with exact versioned backups; older
+  binaries refuse schema 6. Schedule documents retain schema 3. Upgrade writers
+  and reconnect resident MCP servers. Very old root instructions may require
+  restatement; `state.prev.json` and migration backups may retain purged rows.
+- On Windows, directory flush remains pending: power loss may restore purged
+  files after pending bookkeeping was cleared, leaving unread leftovers. See
+  `PLATFORMS.md` for native validation still owned by integration.
+
 ## 0.5.1 — 2026-11-14
 
 ### Added

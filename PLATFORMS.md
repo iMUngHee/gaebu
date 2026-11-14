@@ -69,6 +69,11 @@ not physical power-loss tests.
   with backup semantics and flushing it; verify on a native Windows filesystem
   with the archive tests. Until then power loss can leave an archive hole; recover
   explicitly with `gaebu compact --heal` or `gaebu schedule archive --heal`.
+  A power loss can also bring back purged-team files after `purge_pending` was
+  cleared; those files become unlisted leftovers that nothing reads.
+- macOS and Windows: run the 0.6.0 handoff, purge, legacy-path protection,
+  publication/removal failure and repair tests natively. Only Linux is exercised
+  locally; parent integration owns the three-platform CI gate.
 - macOS and Windows: run the 0.5.1 heal/pre-check/partial-failure tests natively.
   Only Linux was executed locally; integration owns the three-platform CI gate.
 

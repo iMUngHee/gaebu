@@ -3,8 +3,8 @@
 This is the contract for what Gaebu stores and prints. The Rust types in
 `src/model.rs`, `src/schedule.rs` and `src/card.rs` are its source of truth; this page explains
 them. The JSON in `~/.gaebu/state.json` is exactly their serde form, with
-`schema_version: 5`. Schema 1–4 files migrate on first write (see
-[Schema 5 migration](#schema-5-migration)).
+`schema_version: 6`. Schema 1–5 files migrate on first write (see
+[Schema 6 migration](#schema-6-migration)).
 
 ## Vocabulary
 
@@ -29,7 +29,7 @@ only from grants.
 ## Entities
 
 - **Runtime origin**: a stable `runtime_id`, initialized on the first committed write, qualifies local organization references and prevents another machine's numeric IDs from matching accidentally. Empty fresh reads remain empty.
-- **Schedule registration**: `State.schedules[team]` records a canonical absolute project artifact path, its immutable Schedule ID and optional manager member. No manager means the commander retains scheduling. Registration is local authority; the file cannot create grants. See [Schedule operations](schedules.md).
+- **Schedule registration**: `State.schedules[team]` records a canonical absolute project artifact path, its immutable Schedule ID, optional manager member, optional `offer` target team ID and a `predecessors` set of inherited team IDs. No manager means the commander retains scheduling. Registration is local authority; the file cannot create grants. Adoption transfers the registration and accumulates predecessors, excluding its new owner. See [Schedule operations](schedules.md).
 - **Team**: one commander and everyone under them. `project` is a label that
   scopes are relative to. `root_bu` is the commander's own bu (승상부 by
   default). `status` is `active` or `cancelled`.
@@ -244,6 +244,7 @@ still has that token.
 ~/.gaebu/state.v2.json         the schema-2 original, kept once by the migration
 ~/.gaebu/state.v3.json         the schema-3 original, kept once by the migration
 ~/.gaebu/state.v4.json         the schema-4 original, kept once by the migration
+~/.gaebu/state.v5.json         the schema-5 original, kept once by the migration
 ~/.gaebu/archive/<team>/duties.jsonl      retired full duty contracts
 ~/.gaebu/archive/<team>/escalations.jsonl retired closed questions
 ~/.gaebu/archive/<team>/records.jsonl     retired team records
@@ -271,8 +272,8 @@ when appended to. Runtime compaction
 keeps terminal duties for at least 24 hours after `updated_at`, closed
 escalations for 24 hours after closure, and records for one hour. Duties
 covered by any human hold or referenced by an open escalation remain hot.
-Teams, bus, members, grants, root idempotency keys and Schedule registrations
-remain hot; the allocator and runtime identity are preserved.
+Teams and their live organization remain hot until the cancelled-team purge
+rule below applies; the allocator and runtime identity are preserved.
 
 A linked duty of an Active team retires only when the caller holds that
 team's Schedule observation with matching registration/document/reference ID
@@ -281,9 +282,9 @@ pruned retired items. This gate does not read the Schedule archive. Other Active
 teams' linked duties remain hot. If recovery restores a hot duty after its
 tombstone was pruned, the duty guard verifies the committed Schedule archive
 and returns the same complete/cancelled refusal as the tombstone.
-Terminal linked duties of Cancelled teams can retire without their Schedule,
-because those teams cannot materialize another dispatch. Retention, holds and
-open escalations still apply to that exception.
+Terminal linked duties can also retire when their team is cancelled or no longer
+has a registration for that Schedule, including after handoff. Retention, holds
+and open escalations still apply to that exception.
 
 Automatic compaction runs after a member operation has committed, in a
 separate transaction, when at least 64 eligible entities exist across the
@@ -292,10 +293,15 @@ operation. Explicit compaction also maintains all three streams of the caller's
 team without new rows, normalizes expired prefixes, trims unpublished tails,
 enforces the limit, and removes unlisted segment files. It reports I/O errors;
 a failed expiry unlink or sync is reported as deferred enforcement.
-Root operations and hooks do not trigger compaction. Neither path takes a
-Schedule lock inside `state.lock`.
+Root directives also run the automatic check after their commit. A purgeable team
+or pending purge-file removal triggers that check regardless of the 64-row
+threshold. Hooks do not trigger compaction. No path takes a Schedule lock inside
+`state.lock`.
 
-Explicit compaction checks the actor on entry only: like automatic compaction, it maintains history without changing live work or authority, while eligibility is rechecked under `state.lock`.
+Explicit compaction checks the actor on entry for archive maintenance, while
+eligibility is rechecked under `state.lock`. A session without an active seat,
+including a seat in a cancelled team, runs only rule-based purge and pending
+file removal; it does not maintain team archives.
 
 Each team's stream has its own size limit, 64 MiB by default, configured with
 `GAEBU_ARCHIVE_LIMIT_MIB` (integer >= 1). Before appending, the last segment must
@@ -331,6 +337,10 @@ newest first. Bounds excluding an ID skip parsing that segment. Every visited
 segment is parsed completely and checked against the caller's team. The last
 matching row within the newest matching segment wins. Short, malformed or
 unterminated committed data is `store_corrupt`; unpublished suffix bytes are ignored.
+The adopting team's members may also read predecessor contracts linked to their
+registered Schedule ID, from hot state or predecessor archives. Predecessor
+archive fallback rechecks authorization under the state lock; a read or validation
+failure returns `not_found` with `predecessor archive unavailable`.
 Expired or unknown duties return `not_found` with
 "duty not found in hot state or retained team archive". A foreign hot duty retains
 the existing `no_grant` refusal; foreign archived duties return `not_found`.
@@ -390,22 +400,70 @@ change and retires no waiting items. A retained complete tombstone still satisfi
 its dependants after its detail is healed away. Automatic sweeps never heal. See
 [hole recovery](schedules.md#healing-an-archive-hole) for authorization and reports.
 
-## Schema 5 migration
+## Cancelled-team purge
 
-The first write or repair of schema 1/2/3/4 backs up the exact original bytes to
-`state.v1.json`, `state.v2.json`, `state.v3.json` or `state.v4.json` without replacing
-a previous backup. Migration publishes schema 5 to `state.prev.json` and then
-`state.json` before running the requested operation. A crash repeats the migration safely; older binaries cannot
-fall back to an older generation and ignore Schedule guards.
+A cancelled team expires 30 days after `cancelled_at`. Teams that have not expired
+are keepers; every predecessor listed by a keeper's Schedule registration is
+protected. Compaction purges expired, unprotected teams in one state transaction,
+including their bus, members, grants, duties, leases, escalations, records, root
+action keys, registration and notices addressed to removed members. Predecessors
+are cumulative, so protection is transitive; expired cycles alone do not protect
+each other. Missing team IDs are pruned from remaining predecessor sets.
+
+Purge excludes these teams from archive batches and moves their committed
+`TeamArchives` bookkeeping to `State.purge_pending[team]`. After publication,
+removal unlinks only listed runtime segments, syncs the team directory, removes
+it non-recursively if empty, and syncs `archive/` before dropping the pending entry.
+Unlink or sync failures retain that entry and appear in
+`purge_deferred: [{team, reason}]`; the next compaction retries it. Successful
+state purges appear in `purged: [{team, name}]`. Publication failure before purge
+commits deletes no files.
+
+`State.home_schedules` freezes canonical registered paths under the runtime home
+at migration. All runtime archive mutations protect these legacy Schedule paths:
+deletion skips them, and append, truncate or creation conflicts before changing
+them. New `init`, `attach`, `move` and path adoption refuse destinations inside
+the canonical runtime home before creating files. Purge never removes unlisted
+files, including Schedule documents, sidecars, other programs' files and failed
+publication leftovers. Normal explicit maintenance and heal still remove their
+usual unlisted runtime segments while respecting `home_schedules`.
+
+Purge raises `root_evidence_floor` to the greatest cancellation time it removes.
+Every root directive requires evidence strictly newer than that floor; old
+appointments cannot replay after their idempotency keys disappear. A refused
+old instruction must be restated by the human.
+
+Session logs are retained to preserve evidence sequences, locks and fail-closed
+markers. Project Schedule files remain and can be continued with evidence-backed
+path adoption. `state.prev.json` may retain purged rows until a later commit, and
+versioned migration backups are never rewritten. Repair may restore an expired
+team whose files have gone; the next pass purges it again. If adoption protects
+it in that window, unavailable predecessor history returns `not_found`.
+
+## Schema 6 migration
+
+The first write or repair of schema 1/2/3/4/5 backs up the exact original bytes to
+`state.v1.json`, `state.v2.json`, `state.v3.json`, `state.v4.json` or `state.v5.json`
+without replacing a previous backup. Migration publishes schema 6 to
+`state.prev.json` and then `state.json` before running the requested operation.
+A crash repeats the migration safely; older binaries cannot fall back to an
+older generation and ignore Schedule guards.
 
 Schema 1 still receives evidence strength, notice deduplication and escalation
 normalization. Legacy schemas gain default Schedule/archive fields and a stable
 runtime origin if absent. Older closed escalations default `closed_at` to null.
 The requesting operation runs only after migration commits. Older binaries
-refuse schema 5 rather than dropping segment boundaries on their next write.
+refuse schema 6 rather than dropping handoff and purge protections on their next
+write.
 Schema 4's nonzero stream length becomes segment 1 with that committed byte count
 and `next: 2`, without lookup bounds; zero becomes an empty list with `next: 1`.
 Archive files are adopted in place without rewriting, renaming or copying.
+
+Registrations default `offer` to null and `predecessors` to an empty set.
+`root_evidence_floor` defaults to 0 and `purge_pending` to an empty map.
+`home_schedules` contains every legacy registration under the canonical runtime
+home, including relative and symlinked home spellings; that set is never pruned.
+Schedule documents retain schema 3.
 
 The schema probe precedes full decoding. Future schemas return
 `store_unsupported` and never fall back or get overwritten by repair. Install the

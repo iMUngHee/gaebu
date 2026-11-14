@@ -32,10 +32,72 @@ that appointment to issue duties to sibling units' workers or lift a human hold.
 The current head of a work item's responsible unit is its task master: it
 dispatches work to its own descendants and reviews their results.
 
-Use `schedule attach <path>` to register an existing recognized Schedule. The
-runtime registers one canonical absolute path for the team. All its local
+Use `schedule attach <path>` to register an empty recognized Schedule. A populated
+document requires `schedule adopt --path <file> --evidence <current user words>`;
+`init` follows the same rule for an existing file. Re-registering the team's own
+document remains idempotent. New registrations and moves must be outside the
+canonical runtime home, including through relative paths and symlinks; legacy
+registrations inside that home remain usable.
+
+The runtime registers one canonical absolute path for the team. All its local
 worktrees and clones use that path, rather than discovering another source from
 the current directory. A missing registration is distinct from an empty Schedule.
+
+## Continue another team's Schedule
+
+Adopt the whole Schedule instead of recreating its items. Only the active
+adopting team's commander can adopt, and that team must have no Schedule yet.
+An active source must offer to that team; a cancelled source needs no offer.
+Team names and IDs both work.
+
+```sh
+# Source commander, while the source team is active:
+gaebu schedule offer --to successor-team
+gaebu schedule offer --withdraw
+# Successor commander, after an offer or source cancellation:
+gaebu schedule adopt source-team
+gaebu schedule adopt source-team --evidence '<current user words authorizing handoff>'
+# A document left after its runtime team was purged:
+gaebu schedule adopt --path /project/schedule.md --evidence '<current user words>'
+```
+
+Adoption transfers the canonical registration, clears its delegated manager and
+offer, and retains item IDs, dependencies, counters, history and item holds. It
+retires every unretired inline dispatch, including completed or cancelled items,
+and clears owners on non-terminal items. Assign an owner with
+`schedule update <item> --owner-bu <unit>` before redispatching with the retired
+predecessor token. Open linked source duties become `handed_off`, without treating
+their work as accepted. Unlinked duties stay unchanged. Source members lose leases
+only when they have no remaining accepted duty.
+
+Any hold on a source bu or hot duty, in any status, refuses an evidence-free
+adoption with `held`, listing the targets and release conditions. Current-turn
+evidence from the adopting commander's session permits the transfer; it is checked
+again under the locks. Adoption clears only the own holds of linked open duties
+it closes. Source bu holds and all other duty holds remain in place; none are copied
+to the successor. Both teams' handoff records list each hold as cleared or kept,
+its release condition and the quote. `lifted_holds` counts cleared own duty holds.
+A handed-off duty under a held source bu stays hot until that hold is released.
+An existing item hold still blocks the successor until `schedule release` with
+the human's current words. The source's bound sessions are not needed.
+
+The document is saved before runtime publication. An interrupted transfer can
+leave retired tokens in the document while the old registration still exists;
+those tokens cannot materialize or progress, and retrying adoption finishes the
+transfer after checking current holds again. Retrying a finished transfer returns
+`existing: true` without repeating its handoff effects.
+
+The successor's registration retains the source and its accumulated predecessor
+team IDs. Its members can read predecessor duties only when the duty links to the
+same Schedule ID. Other foreign hot duties remain `no_grant`, and other foreign
+archived duties remain `not_found`. An unreadable predecessor archive becomes
+`not_found` with `predecessor archive unavailable`; ordinary expired or missing
+history keeps the usual retained-archive `not_found` message.
+
+Path adoption requires current-turn evidence even after old runtime holds have
+been purged: those holds cannot be recovered, and the handoff record says so. It
+starts with no predecessors and refuses a registered path, a copied document with
+an already registered Schedule ID, or an archive-segment filename.
 
 ## Form and reuse units
 

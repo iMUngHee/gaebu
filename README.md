@@ -106,12 +106,29 @@ before opening a store, raise it or back up the files if history must be kept.
 Each archive rolls at one eighth of that limit; the newest segment is retained
 and a failed deletion is reported for retry rather than silently discarded.
 
-Runtime state uses schema 5 and Schedule documents use schema 3. The first
+Runtime state uses schema 6 and Schedule documents use schema 3. The first
 runtime write preserves the exact old state in its versioned backup (including
-`state.v4.json`) and publishes both generations in the new schema. Existing
+`state.v5.json`) and publishes both generations in the new schema. Existing
 JSONL files become segment 1 in place; later files use `.<n>.jsonl`. Upgrade
 writers and reconnect persistent `gaebu mcp` processes before continuing work.
-See [the migration contract](docs/model.md#schema-5-migration).
+See [the migration contract](docs/model.md#schema-6-migration).
+
+0.6.0 lets a commander continue another team's whole Schedule with
+`schedule adopt <team>` after that team cancels or offers it with
+`schedule offer --to <team>`. Item IDs, dependencies, history and item holds
+stay with the file. Source runtime holds require current-turn `--evidence`;
+source bu holds stay in place. An unregistered populated document always needs
+`schedule adopt --path <file> --evidence <words>`; `attach` and existing-file
+`init` accept only empty documents unless already registered to the caller.
+New registrations and moves must be outside the runtime home.
+
+Cancelled teams are purged after 30 days unless a keeper's adopted Schedule
+protects their history. Purge permanently deletes their runtime rows and listed
+archive files; project files, unlisted leftovers, session logs and migration
+backups remain. `compact` can run a purge-only pass without an active seat;
+`purge_deferred` reports file removal that must be retried. See
+[handoff](docs/schedules.md#continue-another-teams-schedule) and
+[purge and recovery limits](docs/model.md#cancelled-team-purge).
 
 Keep all listed archive segments with a Schedule when backing up or moving it.
 `schedule move` requires every listed file; run `schedule archive` first to
@@ -127,7 +144,7 @@ See [Schedule storage](docs/schedules.md) for expiry and recovery behavior.
 holes. Healing permanently deletes older history, including unlisted older segment
 files. It reports listed and unlisted removals separately and can be retried after a
 partial failure. Ordinary commands and automatic maintenance never heal. Storage
-schemas remain unchanged; see [hole recovery](docs/schedules.md#healing-an-archive-hole).
+schemas were unchanged by 0.5.1; see [hole recovery](docs/schedules.md#healing-an-archive-hole).
 
 ### Claude Code
 
