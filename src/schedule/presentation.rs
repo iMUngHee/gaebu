@@ -67,7 +67,12 @@ fn view_mode(store: &Store, st: &State, team: &str, all: bool) -> Result<Value> 
             || !authz::effective_grants(st,&m.id).iter().any(|g|g.verbs.contains(&Verb::Assign)&&!g.scope.is_empty()) {"unknown"}
             else if m.binding.state==BindingState::Bound && m.binding.session_id.as_deref().and_then(|id|store.last_seen(id)).is_some_and(|at|now_ms().saturating_sub(at)>7_200_000) {"quiet"}
             else {match m.binding.state {BindingState::Bound=>"bound",BindingState::Pending=>"pending",BindingState::Vacant=>"vacant"}};
-        json!({"member":m.id,"alias":m.binding.alias,"mode":if reg.manager.is_some(){"delegated"}else{"commander"},"state":state})
+        let evidence = match crate::ops::manager_evidence(st, team) {
+            Some(crate::model::Strength::Explicit) => "explicit",
+            Some(crate::model::Strength::Inferred) => "inferred",
+            None => "none",
+        };
+        json!({"member":m.id,"alias":m.binding.alias,"mode":if reg.manager.is_some(){"delegated"}else{"commander"},"state":state,"evidence":evidence})
     });
         let mut items: Vec<Value> = schedule
             .items

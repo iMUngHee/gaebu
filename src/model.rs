@@ -133,7 +133,7 @@ pub struct Team {
     pub project: String,
     /// Member holding the root grant (가절월).
     pub commander: String,
-    /// The commander's own bu (승상부 by default).
+    /// The commander's own bu (named after the commander's title).
     pub root_bu: String,
     pub status: TeamStatus,
     pub created_at: Ms,

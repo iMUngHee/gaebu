@@ -28,7 +28,7 @@ fn member(id: &str, bu: &str, sup: Option<&str>, title: &str, alias: &str) -> Me
     }
 }
 
-/// 승상 gapu commands 좌장군 nuzu, who heads 좌장군부 with 속관 주부 bepo.
+/// 대장군 gapu commands 좌장군 nuzu, who heads 좌장군부 with 속관 주부 bepo.
 fn fixture() -> State {
     let mut st = State {
         rev: 7,
@@ -48,7 +48,7 @@ fn fixture() -> State {
         },
     );
     for (id, parent, name, head) in [
-        ("b-1", None, "승상부", "m-1"),
+        ("b-1", None, "대장군부", "m-1"),
         ("b-2", Some("b-1"), "좌장군부", "m-2"),
     ] {
         st.bus.insert(
@@ -66,7 +66,7 @@ fn fixture() -> State {
         );
     }
     st.members
-        .insert("m-1".into(), member("m-1", "b-1", None, "승상", "gapu"));
+        .insert("m-1".into(), member("m-1", "b-1", None, "대장군", "gapu"));
     st.members.insert(
         "m-2".into(),
         member("m-2", "b-2", Some("m-1"), "좌장군", "nuzu"),
@@ -196,7 +196,7 @@ fn card_contains_chain_superior_duty_peers_leases() {
     let c = card::build(&st, "m-3", 1_000, Some(1_000)).expect("card");
     let text = card::render(&c);
     assert!(
-        text.contains("대협 → 가절월을 받은 승상 gapu → 좌장군 nuzu → 좌장군부 속관 주부 bepo"),
+        text.contains("대협 → 가절월을 받은 대장군 gapu → 좌장군 nuzu → 좌장군부 속관 주부 bepo"),
         "{text}"
     );
     assert_eq!(c.superior.as_deref(), Some("좌장군 nuzu"));
@@ -486,10 +486,10 @@ fn inferred_root_grant_render() {
     st.grants.insert("g-1".into(), grant(Strength::Inferred));
     let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
     assert!(
-        text.contains("대협 → 가절월(추론)을 받은 승상 gapu"),
+        text.contains("대협 → 가절월(추론)을 받은 대장군 gapu"),
         "{text}"
     );
     st.grants.insert("g-1".into(), grant(Strength::Explicit));
     let text = card::render(&card::build(&st, "m-3", 1_000, Some(1_000)).unwrap());
-    assert!(text.contains("대협 → 가절월을 받은 승상 gapu"), "{text}");
+    assert!(text.contains("대협 → 가절월을 받은 대장군 gapu"), "{text}");
 }

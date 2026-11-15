@@ -28,6 +28,8 @@ pub enum Reason {
     /// A human hold covers the duty; only the human lifts it.
     Held,
     PagerUnavailable,
+    /// Bus go two deep: the commander's, and those directly below it.
+    DepthLimit,
 }
 
 impl Reason {
@@ -52,6 +54,7 @@ impl Reason {
             Reason::StoreUnsupported => "store_unsupported",
             Reason::Held => "held",
             Reason::PagerUnavailable => "pager_unavailable",
+            Reason::DepthLimit => "depth_limit",
         }
     }
 }

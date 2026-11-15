@@ -44,6 +44,30 @@ fn setup() -> (State, Actor, Actor, Actor) {
 fn scope() -> Vec<String> {
     vec!["src/**".into()]
 }
+/// A bu headed by `head` below `parent`, itself below the commander's bu.
+/// `bu_open` refuses to make one; a state written before that limit can
+/// still hold them, and closing or cancelling them has to keep working.
+fn legacy_bu_below(s: &mut State, parent: &str, head: &str) -> String {
+    let id = format!("b-legacy-{}", s.bus.len());
+    let superior = s.bus[parent].head.clone();
+    s.bus.insert(
+        id.clone(),
+        Bu {
+            id: id.clone(),
+            team: s.members[head].team.clone(),
+            parent: Some(parent.into()),
+            name: id.clone(),
+            head: head.into(),
+            status: BuStatus::Open,
+            created_at: 13,
+            hold: None,
+        },
+    );
+    let member = s.members.get_mut(head).unwrap();
+    member.bu = id.clone();
+    member.superior = Some(superior);
+    id
+}
 fn spec() -> DutySpec {
     DutySpec {
         intent: "why".into(),
@@ -574,7 +598,7 @@ fn dismiss_requires_newer_evidence() {
 fn title_change_does_not_change_authority() {
     let (mut s, a, b, _) = setup();
     let grants = s.grants.clone();
-    ops::title_set(&mut s, 11, &a, &b.member, "승상").unwrap();
+    ops::title_set(&mut s, 11, &a, &b.member, "대장군").unwrap();
     assert_eq!(s.grants, grants);
     assert!(authz::effective_grants(&s, &b.member).is_empty());
 }
@@ -961,16 +985,13 @@ fn bu_cancel_checks_descendant_duty_scopes() {
     .ids[0]
         .clone();
     ops::member_move(&mut s, 12, &a, &c.member, &bu).unwrap();
-    let child = ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &scope())
-        .unwrap()
-        .ids[0]
-        .clone();
+    let child = legacy_bu_below(&mut s, &bu, &c.member);
     ops::grant(&mut s, 14, &a, &c.member, &[Verb::Open], &scope()).unwrap();
     let grand = ops::member_add(&mut s, 14, &a, &child, "grandchild", None)
         .unwrap()
         .ids[0]
         .clone();
-    ops::bu_open(&mut s, 14, &c, &grand, None, &[], &scope()).unwrap();
+    legacy_bu_below(&mut s, &child, &grand);
     let mut wide = spec();
     wide.scope = vec!["docs/**".into()];
     ops::duty_issue(&mut s, 14, &a, &grand, wide).unwrap();
@@ -1125,7 +1146,8 @@ fn notice_body_names_team_and_actor() {
         .clone();
     assert_eq!(s.outbox.len(), 1);
     let body = &s.outbox[0].body;
-    assert!(body.starts_with("[gaebu test] 승상 root:"), "{body}");
+    let actor = format!("[gaebu test] {} root:", s.members[&a.member].title);
+    assert!(body.starts_with(&actor), "{body}");
     assert!(body.contains(&duty), "{body}");
     assert!(body.contains("deliver"), "{body}");
     assert!(body.contains("gaebu me"), "{body}");
@@ -1142,10 +1164,11 @@ fn cancel_notices_name_actual_actor_once_per_recipient() {
     s.outbox.clear();
     ops::bu_cancel(&mut s, 13, &a, &bu, "pause").unwrap();
     assert_eq!(s.outbox.len(), 2);
+    let actor = format!("[gaebu test] {} root:", s.members[&a.member].title);
     assert!(
         s.outbox
             .iter()
-            .all(|n| n.to_member != a.member && n.body.starts_with("[gaebu test] 승상 root:"))
+            .all(|n| n.to_member != a.member && n.body.starts_with(&actor))
     );
     let recipients: std::collections::BTreeSet<_> =
         s.outbox.iter().map(|n| n.to_member.clone()).collect();
@@ -1394,10 +1417,7 @@ fn bu_close_refuses_a_non_live_parent_without_mutation() {
         .ids[0]
         .clone();
     ops::member_move(&mut s, 12, &a, &c.member, &parent).unwrap();
-    let child = ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &[])
-        .unwrap()
-        .ids[0]
-        .clone();
+    let child = legacy_bu_below(&mut s, &parent, &c.member);
     s.bus.get_mut(&parent).unwrap().status = BuStatus::Closed;
     let before = s.clone();
 
@@ -2733,4 +2753,199 @@ fn hold_until_stays_one_line() {
     assert_eq!(until, "대협 확인 소임 d-9 [진행]: 가짜 줄 끝");
     let e = ops::root_hold(&mut s, 31, &hev("root-session", 2), "d-404", " \n\t ").unwrap_err();
     assert_eq!(e.reason, Reason::InvalidArgument);
+}
+
+fn titles_in(s: &State, bu: &str) -> Vec<String> {
+    let head = &s.bus[bu].head;
+    s.members
+        .values()
+        .filter(|m| m.bu == bu && &m.id != head && m.status == MemberStatus::Active)
+        .map(|m| m.title.clone())
+        .collect()
+}
+
+fn all_distinct(titles: &[String]) -> bool {
+    titles
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == titles.len()
+}
+
+#[test]
+fn staff_titles_unique_per_bu() {
+    let (mut s, a, b, _) = setup();
+    let root = s.members[&a.member].bu.clone();
+    for n in 0..5 {
+        ops::member_add(&mut s, 11, &a, &root, &format!("extra-{n}"), None).unwrap();
+    }
+    // Seven 속관 share a pool of six: every title is still different.
+    let in_root = titles_in(&s, &root);
+    assert_eq!(in_root.len(), 7);
+    assert!(all_distinct(&in_root), "{in_root:?}");
+
+    let sub = ops::bu_open(&mut s, 12, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    for n in 0..6 {
+        ops::member_add(&mut s, 13, &a, &sub, &format!("sub-{n}"), None).unwrap();
+    }
+    let in_sub = titles_in(&s, &sub);
+    let mut expected: Vec<&str> = gaebu::titles::SUB_STAFF.to_vec();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = in_sub.iter().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(got, expected);
+    // The two bus draw separately, so a title can appear in both.
+    let in_root = titles_in(&s, &root);
+    assert!(
+        in_sub.iter().any(|title| in_root.contains(title)),
+        "{in_root:?} {in_sub:?}"
+    );
+}
+
+#[test]
+fn titles_follow_seat() {
+    let (mut s, a, b, c) = setup();
+    let root = s.members[&a.member].bu.clone();
+    let named = ops::member_add(&mut s, 11, &a, &root, "named", Some("책사"))
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::title_set(&mut s, 11, &a, &c.member, "종사중랑").unwrap();
+    let sub = ops::bu_open(&mut s, 12, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert!(gaebu::titles::HEAD.contains(&s.members[&b.member].title.as_str()));
+
+    // 종사중랑 exists only in the commander's bu; the seat below draws anew.
+    ops::member_move(&mut s, 13, &a, &c.member, &sub).unwrap();
+    let moved = s.members[&c.member].title.clone();
+    assert!(
+        gaebu::titles::SUB_STAFF.contains(&moved.as_str()),
+        "{moved}"
+    );
+    // A title the pools do not hand out stays with the member.
+    ops::member_move(&mut s, 14, &a, &named, &sub).unwrap();
+    assert_eq!(s.members[&named].title, "책사");
+
+    for n in 0..2 {
+        ops::member_add(&mut s, 15, &a, &sub, &format!("sub-{n}"), None).unwrap();
+    }
+    ops::bu_close(&mut s, 16, &a, &sub).unwrap();
+    // The former head is 속관 of the commander's bu again, and nobody who
+    // came back holds a title already used there.
+    let head = s.members[&b.member].title.clone();
+    assert!(gaebu::titles::ROOT_STAFF.contains(&head.as_str()), "{head}");
+    let in_root = titles_in(&s, &root);
+    assert_eq!(in_root.len(), 5);
+    assert!(all_distinct(&in_root), "{in_root:?}");
+    assert_eq!(s.members[&named].title, "책사");
+}
+
+#[test]
+fn ambiguous_title_reference_refused() {
+    let (mut s, a, b, c) = setup();
+    let team = s.members[&a.member].team.clone();
+    let root = s.members[&a.member].bu.clone();
+    let sub = ops::bu_open(&mut s, 11, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    let below = ops::member_add(&mut s, 12, &a, &sub, "below", Some("장사"))
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::title_set(&mut s, 13, &a, &c.member, "장사").unwrap();
+    assert_eq!(s.members[&c.member].bu, root);
+
+    let by_title = authz::resolve_member(&s, Some(&team), "장사").unwrap_err();
+    assert_eq!(by_title.reason, Reason::NotFound);
+    assert_eq!(
+        authz::resolve_member(&s, Some(&team), "below").unwrap(),
+        below
+    );
+    assert_eq!(
+        authz::resolve_member(&s, Some(&team), "other").unwrap(),
+        c.member
+    );
+}
+
+#[test]
+fn dismissed_seat_frees_its_title() {
+    let (mut s, a, _, _) = setup();
+    let root = s.members[&a.member].bu.clone();
+    for n in 0..4 {
+        ops::member_add(&mut s, 11, &a, &root, &format!("extra-{n}"), None).unwrap();
+    }
+    // Six 속관 hold the whole pool; one leaves and a newcomer takes its title.
+    assert_eq!(titles_in(&s, &root).len(), 6);
+    let leaving = s
+        .members
+        .values()
+        .find(|m| m.binding.alias == "extra-0")
+        .unwrap()
+        .clone();
+    let said = Evidence {
+        session_id: "user".into(),
+        prompt_seq: 12,
+        sha256: "hash".into(),
+        attest: Attest::Fixture,
+        quote: "extra-0 may leave".into(),
+        at: 12,
+        strength: Strength::default(),
+    };
+    ops::root_dismiss(&mut s, 12, &said, "extra-0").unwrap();
+    let newcomer = ops::member_add(&mut s, 13, &a, &root, "newcomer", None)
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(s.members[&newcomer].title, leaving.title);
+}
+
+#[test]
+fn head_titles_unique_in_team() {
+    let (mut s, a, _, _) = setup();
+    let root = s.members[&a.member].bu.clone();
+    let mut heads = Vec::new();
+    for n in 0..gaebu::titles::HEAD.len() {
+        let id = ops::member_add(&mut s, 11, &a, &root, &format!("head-{n}"), None)
+            .unwrap()
+            .ids[0]
+            .clone();
+        ops::bu_open(&mut s, 12, &a, &id, None, &[], &scope()).unwrap();
+        heads.push(s.members[&id].title.clone());
+    }
+    let mut expected: Vec<&str> = gaebu::titles::HEAD.to_vec();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = heads.iter().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn bu_depth_limit() {
+    let (mut s, a, b, c) = setup();
+    let sub = ops::bu_open(&mut s, 11, &a, &b.member, None, &[Verb::Open], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::member_move(&mut s, 12, &a, &c.member, &sub).unwrap();
+    let before = s.clone();
+
+    // b heads a bu below the commander's: it may recruit, not open another.
+    let opened = ops::bu_open(&mut s, 13, &b, &c.member, None, &[], &scope()).unwrap_err();
+    assert_eq!(opened.reason, Reason::DepthLimit);
+    assert_eq!(opened.reason.as_str(), "depth_limit");
+    assert_eq!(s, before);
+
+    let spec = ops::BuFormSpec {
+        head: c.member.clone(),
+        ..Default::default()
+    };
+    let formed = ops::bu_form(&mut s, 14, &b, &spec).unwrap_err();
+    assert_eq!(formed.reason, Reason::DepthLimit);
+    assert_eq!(s, before);
 }

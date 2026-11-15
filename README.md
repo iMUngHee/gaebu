@@ -38,7 +38,7 @@ reconstructed from history.
 | 소임 | A duty: intent, outcome, scope, decision rights, escalation triggers, done criteria. |
 | 팀기록 | Decisions, handoffs and changes worth keeping. |
 
-Titles (승상, 대도독, 좌장군, 주부, ...) are display only. Authority comes from
+Titles (대장군, 좌장군, 주부, 황문시랑, ...) are display only. Authority comes from
 grants, and grants only narrow as they go down the tree.
 
 Scheduling can stay with the commander or be delegated to a separate manager.

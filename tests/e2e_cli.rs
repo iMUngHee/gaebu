@@ -323,10 +323,28 @@ fn delegated_schedule_nested_team_hold_and_review_work_through_cli() {
         gaebu(&pager, &["schedule", "init", project.to_str().unwrap()]),
         0
     );
-    assert_eq!(
+    // Seating a manager is the human's directive: it needs their words.
+    assert_ne!(
         gaebu(
             &pager,
             &["schedule", "manager", "manager", "--scope", "src/**"]
+        ),
+        0
+    );
+    let words = "manager가 일정을 맡는다";
+    user_says(&store, "boss-session", words);
+    assert_eq!(
+        gaebu(
+            &pager,
+            &[
+                "schedule",
+                "manager",
+                "manager",
+                "--scope",
+                "src/**",
+                "--evidence",
+                words,
+            ]
         ),
         0
     );

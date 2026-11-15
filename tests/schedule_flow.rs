@@ -1,13 +1,13 @@
 mod common;
 
 use gaebu::{
-    Reason, Result, authz,
+    Reason, Result, authz, evidence,
     identity::{Caller, Source as CallerSource},
     model::*,
     ops::{self, SeedSpec},
     pager::{HostStatus, Pager, WhoAmI},
     schedule,
-    store::{CLI_DEADLINE, Store},
+    store::{CLI_DEADLINE, EventKind, Store},
 };
 use serde_json::{Value, json};
 use std::{
@@ -109,6 +109,44 @@ impl Fixture {
     }
     fn call(&self, name: &str, args: Value) -> Result<Value> {
         schedule::call(&self.store, &QuietPager, &self.root, name, &args)
+    }
+    /// The human types `words` into the commander's session.
+    fn says(&self, words: &str) {
+        self.store
+            .session(&self.root.session_id)
+            .append(
+                now_ms(),
+                EventKind::UserPrompt,
+                Some(evidence::sha256_hex(words)),
+                Some(words.into()),
+                None,
+            )
+            .unwrap();
+    }
+    /// The commander seats `member` as Schedule manager on words the human
+    /// just said.
+    fn seat_manager(&self, member: &str, scope: &[&str], words: &str) -> Result<Value> {
+        self.says(words);
+        let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+        schedule::set_manager(&self.store, &self.root, member, &scope, words, false)
+    }
+    fn title_of(&self, session: &str) -> String {
+        let st = self.store.read_current().unwrap();
+        authz::member_for_session(&st, session)
+            .unwrap()
+            .title
+            .clone()
+    }
+    fn manager_evidence(&self) -> String {
+        let st = self.store.read_current().unwrap();
+        let team = authz::member_for_session(&st, "root-session")
+            .unwrap()
+            .team
+            .clone();
+        schedule::view(&self.store, &st, &team).unwrap()["manager"]["evidence"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
     fn add(&self, title: &str, deps: &[&str]) -> String {
         self.call(
@@ -421,7 +459,8 @@ fn corrupt_current_with_valid_previous_cannot_prove_dispatch_absent() {
 #[test]
 fn separate_manager_can_route_work_but_cannot_command_sibling_worker() {
     let f = Fixture::new();
-    schedule::set_manager(&f.store, &f.root, "manager", &["src/**".into()]).unwrap();
+    f.seat_manager("manager", &["src/**"], "let manager run the Schedule")
+        .unwrap();
     let manager = Caller {
         session_id: "manager-session".into(),
         tool: Some(Tool::Codex),
@@ -461,7 +500,8 @@ fn separate_manager_can_route_work_but_cannot_command_sibling_worker() {
         .reason,
         Reason::OutOfScope
     );
-    schedule::set_manager(&f.store, &f.root, "commander", &[]).unwrap();
+    f.seat_manager("commander", &[], "take the Schedule back yourself")
+        .unwrap();
     f.dispatch(&item, "api").unwrap();
     let st = f.store.read_current().unwrap();
     let manager_id = authz::member_for_session(&st, "manager-session")
@@ -476,7 +516,6 @@ fn separate_manager_can_route_work_but_cannot_command_sibling_worker() {
 
 #[test]
 fn hold_blocks_scheduled_execution_but_allows_independent_lease_and_cleanup() {
-    use gaebu::{evidence, store::EventKind};
     let f = Fixture::new();
     let item = f.add("held", &[]);
     let dispatch = f.dispatch(&item, "api").unwrap();
@@ -609,7 +648,6 @@ fn linked_dispatch_rejects_foreign_origin_and_unknown_nested_fields() {
 
 #[test]
 fn recovery_preserves_verified_source_after_prompt_log_rolls_away() {
-    use gaebu::{evidence, store::EventKind};
     let f = Fixture::new();
     let item = f.add("source recovery", &[]);
     let prompt = "please deliver this worker result";
@@ -1135,4 +1173,229 @@ fn schedule_dispatch_child() {
         alias: None,
     };
     schedule::call(&store,&QuietPager,&caller,"schedule_dispatch",&json!({"item":item,"key":"api","assignee":worker,"spec":{"intent":"why","outcome":"result","scope":["src/**"],"decision_rights":"internals","escalate_on":[],"done_criteria":"tests"}})).unwrap();
+}
+
+#[test]
+fn manager_requires_evidence() {
+    let f = Fixture::new();
+    let seat = |words: &str| {
+        schedule::set_manager(
+            &f.store,
+            &f.root,
+            "manager",
+            &["src/**".into()],
+            words,
+            false,
+        )
+    };
+    let manager_of = || {
+        let st = f.store.read_current().unwrap();
+        st.schedules.values().next().unwrap().manager.clone()
+    };
+    let words = "let manager run the Schedule";
+
+    // Nothing the human said yet.
+    assert_eq!(seat(words).unwrap_err().reason, Reason::NoUserEvidence);
+    // Words the human did not say this turn.
+    f.says("start the work");
+    assert_eq!(seat(words).unwrap_err().reason, Reason::NoUserEvidence);
+    // The turn that carried the words has ended.
+    f.says(words);
+    f.store
+        .session(&f.root.session_id)
+        .append(now_ms(), EventKind::Stop, None, None, None)
+        .unwrap();
+    assert_eq!(seat(words).unwrap_err().reason, Reason::NoUserEvidence);
+    assert_eq!(manager_of(), None);
+
+    f.says(words);
+    seat(words).unwrap();
+    let st = f.store.read_current().unwrap();
+    let manager_id = authz::member_for_session(&st, "manager-session")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(manager_of(), Some(manager_id.clone()));
+    let recorded: Vec<_> = st
+        .root_actions
+        .iter()
+        .filter(|(key, _)| key.ends_with(&format!(":schedule-manager:{manager_id}")))
+        .collect();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].1.evidence.as_ref().unwrap().quote, words);
+
+    // Removing the manager is a directive too.
+    assert_eq!(
+        schedule::set_manager(&f.store, &f.root, "commander", &[], "unsaid", false)
+            .unwrap_err()
+            .reason,
+        Reason::NoUserEvidence
+    );
+    assert_eq!(manager_of(), Some(manager_id));
+}
+
+#[test]
+fn manager_title_follows_role() {
+    let f = Fixture::new();
+    let before = f.title_of("manager-session");
+    assert_eq!(f.manager_evidence(), "none");
+
+    f.seat_manager("manager", &["src/**"], "let manager run the Schedule")
+        .unwrap();
+    assert_eq!(f.title_of("manager-session"), gaebu::titles::LIAISON);
+    assert_eq!(f.manager_evidence(), "inferred");
+    // The title addresses the seat, as any stored title does.
+    let st = f.store.read_current().unwrap();
+    let manager_id = authz::member_for_session(&st, "manager-session")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        authz::resolve_member(&st, None, gaebu::titles::LIAISON).unwrap(),
+        manager_id
+    );
+
+    // The human confirms it in words naming the action and the target.
+    let confirmed = "make manager the 황문시랑";
+    f.says(confirmed);
+    schedule::set_manager(&f.store, &f.root, "manager", &[], confirmed, true).unwrap();
+    assert_eq!(f.manager_evidence(), "explicit");
+    assert_eq!(f.title_of("manager-session"), gaebu::titles::LIAISON);
+
+    // A head can be the manager; it gets a head's title back afterwards.
+    schedule::transaction(&f.store, &f.root, |st, actor| {
+        ops::bu_open(
+            st,
+            now_ms(),
+            actor,
+            &f.worker_id,
+            None,
+            &[Verb::Assign],
+            &["src/**".into()],
+        )
+    })
+    .unwrap();
+    let head_title = f.title_of("worker-session");
+    assert!(gaebu::titles::HEAD.contains(&head_title.as_str()));
+    f.seat_manager("worker", &[], "worker runs the Schedule from now on")
+        .unwrap();
+    assert_eq!(f.title_of("worker-session"), gaebu::titles::LIAISON);
+    // The seat it replaced is 속관 of the commander's bu again.
+    let returned = f.title_of("manager-session");
+    assert!(
+        gaebu::titles::ROOT_STAFF.contains(&returned.as_str()),
+        "{returned}"
+    );
+    assert!(gaebu::titles::ROOT_STAFF.contains(&before.as_str()));
+
+    f.seat_manager("commander", &[], "take the Schedule back yourself")
+        .unwrap();
+    let restored = f.title_of("worker-session");
+    assert!(
+        gaebu::titles::HEAD.contains(&restored.as_str()),
+        "{restored}"
+    );
+    // Evidence describes a separate manager; the commander needs none.
+    assert_eq!(f.manager_evidence(), "none");
+}
+
+#[test]
+fn manager_keeps_its_title_when_its_seat_changes() {
+    let f = Fixture::new();
+    f.seat_manager("manager", &["src/**"], "let manager run the Schedule")
+        .unwrap();
+    let st = f.store.read_current().unwrap();
+    let manager_id = authz::member_for_session(&st, "manager-session")
+        .unwrap()
+        .id
+        .clone();
+
+    // The manager becomes a head: its unit is named for a head's title.
+    let unit = schedule::transaction(&f.store, &f.root, |st, actor| {
+        ops::bu_open(st, now_ms(), actor, &manager_id, None, &[], &[])
+    })
+    .unwrap()
+    .ids[0]
+        .clone();
+    assert_eq!(f.title_of("manager-session"), gaebu::titles::LIAISON);
+    let st = f.store.read_current().unwrap();
+    let head_title = st.bus[&unit].name.trim_end_matches('부').to_owned();
+    assert!(
+        gaebu::titles::HEAD.contains(&head_title.as_str()),
+        "{head_title}"
+    );
+
+    // Closing its unit returns it to the commander's bu, still the manager.
+    schedule::transaction(&f.store, &f.root, |st, actor| {
+        ops::bu_close(st, now_ms(), actor, &unit)
+    })
+    .unwrap();
+    assert_eq!(f.title_of("manager-session"), gaebu::titles::LIAISON);
+}
+
+#[test]
+fn manager_directives_in_one_turn_apply_in_order() {
+    let f = Fixture::new();
+    let words = "manager runs the Schedule, no, worker does, no, manager after all";
+    f.says(words);
+    let grants = || f.store.read_current().unwrap().grants.len();
+    let seat = |member: &str, scope: &[&str], explicit: bool| {
+        let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+        schedule::set_manager(&f.store, &f.root, member, &scope, words, explicit).unwrap()
+    };
+    let before = grants();
+    seat("manager", &["src/**"], false);
+    assert_eq!(grants(), before + 1);
+    // The same directive again mints no second grant.
+    seat("manager", &["src/**"], false);
+    assert_eq!(grants(), before + 1);
+
+    seat("worker", &["src/**"], false);
+    assert_eq!(f.title_of("worker-session"), gaebu::titles::LIAISON);
+    // Back to the first member within the same turn: it is the manager again.
+    let answer = seat("manager", &[], false);
+    let st = f.store.read_current().unwrap();
+    let manager_id = authz::member_for_session(&st, "manager-session")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(answer["manager"], manager_id.as_str());
+    assert_eq!(
+        st.schedules.values().next().unwrap().manager,
+        Some(manager_id)
+    );
+    assert_eq!(f.title_of("manager-session"), gaebu::titles::LIAISON);
+    assert_ne!(f.title_of("worker-session"), gaebu::titles::LIAISON);
+
+    // Confirming it explicitly in that turn is recorded.
+    assert_eq!(f.manager_evidence(), "inferred");
+    seat("manager", &[], true);
+    assert_eq!(f.manager_evidence(), "explicit");
+
+    // A later directive about something else does not speak for the manager.
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            let team = st.teams.keys().next().unwrap().clone();
+            let rev = st.rev + 100;
+            st.root_actions.insert(
+                "root-session:99:hold:d-1".into(),
+                RootAction {
+                    team,
+                    rev,
+                    at: now_ms(),
+                    evidence: Some(Evidence {
+                        session_id: "root-session".into(),
+                        prompt_seq: 99,
+                        sha256: "hash".into(),
+                        attest: Attest::Fixture,
+                        quote: "wait".into(),
+                        at: now_ms(),
+                        strength: Strength::Inferred,
+                    }),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.manager_evidence(), "explicit");
 }

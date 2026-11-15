@@ -288,7 +288,10 @@ pub(super) fn adopt(store: &Store, caller: &Caller, args: &Input) -> Result<Valu
             .unwrap_or_default();
         if let Some(source) = &source {
             predecessors.insert(source.clone());
-            st.schedules.remove(source);
+            // The source team no longer has a Schedule for anyone to manage.
+            if let Some(handed) = st.schedules.remove(source) {
+                ops::move_liaison_title(st, handed.manager.as_deref(), None);
+            }
         }
         predecessors.remove(&target);
         st.schedules.insert(

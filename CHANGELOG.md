@@ -9,6 +9,53 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.7.0 — 2026-11-16
+
+### Changed
+
+- Default titles are Wei-dynasty general ranks. Commanders draw from 대장군,
+  표기장군, 거기장군 and 위장군; heads of units below the commander's from
+  twelve 장군 titles; 속관 from one list for the commander's unit and another
+  for units below it. A new team's root unit is named after its commander
+  (대장군부, ...), no longer always 승상부.
+- A seat draws its title by a fixed hash of its team and member ids instead
+  of taking the first unused one, so commanders of different teams differ.
+- 속관 titles are unique within a unit, no longer across the team. The same
+  title can appear in two units, and a title then stops addressing a member:
+  `no single active member matches` is returned and the alias or id still
+  works.
+- A member that moves to another unit, or returns from a closed one, draws a
+  new title for its new seat when its title is one of the default titles.
+  Any other title stays, including one set with `gaebu title` and the titles
+  of earlier releases (승상, 연, ...). The check reads the title text alone,
+  so a hand-set title equal to a default one is treated as a default.
+- `gaebu schedule manager` requires `--evidence <words>` quoting the human's
+  current turn, for seating, replacing and removing the manager, and accepts
+  `--explicit`. It sets the manager's title to 황문시랑 and gives a replaced
+  or removed manager a title for the seat it holds; a seated manager keeps
+  the title when it moves or becomes a head. `schedule show` adds
+  `manager.evidence`: `explicit` or `inferred` for a separate manager, `none`
+  while the commander schedules. Repeating a directive with `--scope` no
+  longer mints another grant.
+
+### Added
+
+- `bu open` and `bu form` are refused with the new reason `depth_limit` when
+  the caller's unit is itself below the commander's: units go two deep.
+- `rules/gaebu.md` and `docs/protocol.md` describe the 편성안: the format an
+  agent proposes a formation in before the human grants 가절월, and the order
+  in which a 황문시랑 can be seated.
+
+### Compatibility
+
+- Runtime schema 6 and Schedule schema 3 are unchanged. Stored titles, unit
+  names and units deeper than two levels are left as they are; deeper units
+  can still be closed and cancelled.
+- After upgrading, add `--evidence` to any `schedule manager` call and drop
+  the separate `gaebu title <member> 황문시랑`. A manager seated earlier
+  keeps its seat and reports `manager.evidence: none`.
+- Copy the updated `rules/gaebu.md` wherever agents load it from.
+
 ## 0.6.1 — 2026-11-16
 
 ### Fixed

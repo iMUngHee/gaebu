@@ -126,10 +126,17 @@ pub enum ScheduleCmd {
     Attach {
         path: std::path::PathBuf,
     },
+    /// Root directive: seat, replace or remove (`commander`) the separate
+    /// Schedule manager, quoting the human's current-turn words.
     Manager {
         member: String,
         #[arg(long, value_delimiter = ',')]
         scope: Vec<String>,
+        #[arg(long)]
+        evidence: String,
+        /// The user's words name both this action and its target.
+        #[arg(long)]
+        explicit: bool,
     },
     Show {
         #[arg(conflicts_with = "all")]
@@ -373,9 +380,12 @@ pub fn run_cli(cmd: ScheduleCmd, json_output: bool, pager: &dyn Pager) -> Result
         }
         ScheduleCmd::Init { path } => runtime::register(&store, &caller, &path, true),
         ScheduleCmd::Attach { path } => runtime::register(&store, &caller, &path, false),
-        ScheduleCmd::Manager { member, scope } => {
-            runtime::set_manager(&store, &caller, &member, &scope)
-        }
+        ScheduleCmd::Manager {
+            member,
+            scope,
+            evidence,
+            explicit,
+        } => runtime::set_manager(&store, &caller, &member, &scope, &evidence, explicit),
         ScheduleCmd::Show { item, all, .. } => {
             let mut args = json!({"all":all});
             if let Some(item) = item {

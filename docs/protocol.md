@@ -7,8 +7,48 @@ project's PM system owns implementation plans. Gaebu does not replace either.
 
 The human appoints the holder of 가절월 and designates available sessions. The
 holder may organize those members into 부 and delegate 개부권 through the `open`
-verb. Titles such as 승상, 좌장군 and 주부 are adaptable Three Kingdoms motifs;
-titles carry no authority. Authority comes from valid grants alone.
+verb. Titles such as 대장군, 좌장군 and 주부 are Wei-dynasty general ranks used
+as adaptable motifs; titles carry no authority. Authority comes from valid
+grants alone.
+
+## 편성안: propose a formation before any command
+
+When the human gives a plan and asks for a 편성안, propose and wait. Gaebu
+assigns titles and unit names at appointment, so the proposal names neither.
+
+```markdown
+## 편성안
+- 목표: <한 줄>
+- 인원: 총 N (Claude a · Codex b)
+- 지휘관 부: 지휘관(본인, 임명 전) + 속관 k — <직접 맡을 결과물>
+- 하위 부: 없음 | 하위 부 1: 장 1 + 속관 m — <결과물> / 두는 이유: <한 줄>
+- 소임 초안:
+  - <결과물> · 범위 <경로> · 완료 기준 <검증>
+- 공유 자원: <임대가 필요한 경로·자원, 없으면 없음>
+- 확인 필요: 황문시랑을 둘지 · <그 밖에 사람이 정할 것, 최대 1개>
+```
+
+1. The human gives a plan and asks for a 편성안.
+2. The agent replies in the format above and runs no state-changing command.
+3. The human grants 가절월 and confirms the members in one instruction, for
+   example "가절월 줄게, nawi·bepo를 속관으로".
+4. The agent runs `appoint` and `assign` with those words as evidence. A seat
+   for the session running them is bound at once.
+5. The agent continues with `bu form` and `duty issue` where the plan needs
+   them.
+6. If the human asked for a 황문시랑, the agent registers the Schedule, waits
+   until that seat is bound, and runs `schedule manager`.
+
+A unit below the commander's is the exception: propose one only when two or
+more bundled outcomes each need a head and workers. Ask everything in the one
+proposal, since a separate question about units reads as an instruction to
+form them.
+
+Evidence is the human's current turn only. A subordinate's seat is confirmed
+by its own session's next hook, so step 6 rarely fits in the turn of step 3.
+When that turn has ended, report that the seat is ready and ask the human to
+state the 황문시랑 instruction again; quote the new words, never the earlier
+turn.
 
 ## A. Issue an outcome brief
 

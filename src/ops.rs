@@ -118,7 +118,7 @@ pub fn root_appoint(
     let gid = st.mint("g");
     let title = title
         .map(str::to_owned)
-        .unwrap_or_else(|| titles::pick(titles::Seat::Commander, &[]));
+        .unwrap_or_else(|| titles::pick(titles::Seat::Commander, &[], &format!("{tid}:{mid}")));
     st.teams.insert(
         tid.clone(),
         Team {
@@ -653,6 +653,14 @@ pub fn bu_open(
     let a = authz::check_actor(st, actor)?.clone();
     scope_for_verbs(verbs, scope)?;
     authz::require(st, &a.id, Verb::Open, scope)?;
+    // The new bu goes below the actor's own, so only the commander's bu,
+    // which has no parent, can take one.
+    if st.bus.get(&a.bu).is_some_and(|b| b.parent.is_some()) {
+        return refuse(
+            Reason::DepthLimit,
+            "a bu below the commander's cannot open another; recruit into it instead",
+        );
+    }
     let h = find_member(st, head)?.clone();
     below(st, &a, &h)?;
     if st
@@ -670,7 +678,7 @@ pub fn bu_open(
     }
     let scope = scope::normalize_list(scope)?;
     let bid = st.mint("b");
-    let title = pick_title(st, &a.team, titles::Seat::Head);
+    let title = pick_title(st, &a.team, &a.bu, titles::Seat::Head, &h.id);
     st.bus.insert(
         bid.clone(),
         Bu {
@@ -686,10 +694,13 @@ pub fn bu_open(
             hold: None,
         },
     );
+    let is_liaison = holds_liaison_title(st, &h);
     let m = st.members.get_mut(&h.id).unwrap();
     m.bu = bid.clone();
     m.superior = Some(a.id.clone());
-    m.title = title;
+    if !is_liaison {
+        m.title = title;
+    }
     if !verbs.is_empty() {
         grant(st, now, actor, &h.id, verbs, &scope)?;
     }
@@ -814,6 +825,9 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         })
         .collect();
     st.bus.get_mut(bu).unwrap().status = BuStatus::Closed;
+    for id in &returned {
+        retitle(st, id);
+    }
     if returned.is_empty() && b.status == BuStatus::Closed {
         return Ok(out("already closed", vec![bu.into()]));
     }
@@ -951,6 +965,7 @@ pub fn member_move(
     m.bu = bu.into();
     m.superior = Some(b.head);
     let id = m.id.clone();
+    retitle(st, &id);
     changed(
         st,
         now,
@@ -1877,10 +1892,10 @@ pub(crate) fn require_root_evidence(st: &State, ev: &Evidence) -> Result<()> {
     Ok(())
 }
 
-fn root_key(ev: &Evidence, action: &str, target: &str) -> String {
+pub(crate) fn root_key(ev: &Evidence, action: &str, target: &str) -> String {
     format!("{}:{}:{action}:{target}", ev.session_id, ev.prompt_seq)
 }
-fn root_done(st: &mut State, now: Ms, ev: &Evidence, key: String, team: &str) {
+pub(crate) fn root_done(st: &mut State, now: Ms, ev: &Evidence, key: String, team: &str) {
     st.root_actions.insert(
         key,
         RootAction {
@@ -1974,14 +1989,92 @@ fn below(st: &State, a: &Member, m: &Member) -> Result<()> {
     }
     Ok(())
 }
-fn pick_title(st: &State, team: &str, seat: titles::Seat) -> String {
+/// The seat a member holds now, which decides the pool its title comes from.
+pub(crate) fn seat_of(st: &State, member: &Member) -> titles::Seat {
+    if st
+        .teams
+        .get(&member.team)
+        .is_some_and(|t| t.commander == member.id)
+    {
+        titles::Seat::Commander
+    } else if st
+        .bus
+        .values()
+        .any(|b| b.head == member.id && b.status == BuStatus::Open)
+    {
+        titles::Seat::Head
+    } else {
+        staff_seat(st, &member.bu)
+    }
+}
+fn staff_seat(st: &State, bu: &str) -> titles::Seat {
+    if st.bus.get(bu).is_some_and(|b| b.parent.is_some()) {
+        titles::Seat::SubStaff
+    } else {
+        titles::Seat::RootStaff
+    }
+}
+/// A title for `member` in `seat`. Heads do not repeat within the team and
+/// 속관 do not repeat within `bu`; the same staff title may appear in two bus.
+fn pick_title(st: &State, team: &str, bu: &str, seat: titles::Seat, member: &str) -> String {
     let taken: Vec<_> = st
         .members
         .values()
-        .filter(|m| m.team == team)
+        .filter(|m| m.id != member && m.status == MemberStatus::Active)
+        .filter(|m| match seat {
+            titles::Seat::Commander => false,
+            titles::Seat::Head => m.team == team,
+            titles::Seat::RootStaff | titles::Seat::SubStaff => m.bu == bu,
+        })
         .map(|m| m.title.as_str())
         .collect();
-    titles::pick(seat, &taken)
+    titles::pick(seat, &taken, &format!("{team}:{member}"))
+}
+/// The team's seated Schedule manager keeps 황문시랑 whatever seat it holds.
+fn holds_liaison_title(st: &State, member: &Member) -> bool {
+    member.title == titles::LIAISON
+        && st
+            .schedules
+            .get(&member.team)
+            .is_some_and(|registration| registration.manager.as_deref() == Some(&member.id))
+}
+/// The Schedule manager's title goes to `to`; `from`, if it still carries
+/// it, gets a title for the seat it holds.
+pub(crate) fn move_liaison_title(st: &mut State, from: Option<&str>, to: Option<&str>) {
+    if let Some(from) = from.filter(|from| Some(*from) != to)
+        && st
+            .members
+            .get(from)
+            .is_some_and(|m| m.title == titles::LIAISON)
+    {
+        retitle(st, from);
+    }
+    if let Some(member) = to.and_then(|to| st.members.get_mut(to)) {
+        member.title = titles::LIAISON.into();
+    }
+}
+/// How firmly the human's words named the directive that seated the team's
+/// separate Schedule manager; `None` in commander mode and for a manager
+/// seated before directives were recorded.
+pub(crate) fn manager_evidence(st: &State, team: &str) -> Option<Strength> {
+    let manager = st.schedules.get(team)?.manager.as_deref()?;
+    let suffix = format!(":schedule-manager:{manager}");
+    st.root_actions
+        .iter()
+        .filter(|(key, action)| action.team == team && key.ends_with(&suffix))
+        .max_by_key(|(_, action)| action.rev)
+        .and_then(|(_, action)| action.evidence.as_ref())
+        .map(|evidence| evidence.strength)
+}
+/// Draw a new title for a member whose seat changed, unless its title is one
+/// the pools do not hand out.
+fn retitle(st: &mut State, member: &str) {
+    let m = &st.members[member];
+    if !titles::follows_seat(&m.title) || holds_liaison_title(st, m) {
+        return;
+    }
+    let title = pick_title(st, &m.team, &m.bu, seat_of(st, m), member);
+    st.members.get_mut(member).unwrap().title = title;
 }
 fn add_member(
     st: &mut State,
@@ -1995,7 +2088,7 @@ fn add_member(
     let id = st.mint("m");
     let title = title
         .map(str::to_owned)
-        .unwrap_or_else(|| pick_title(st, team, titles::Seat::Staff));
+        .unwrap_or_else(|| pick_title(st, team, bu, staff_seat(st, bu), &id));
     st.members.insert(
         id.clone(),
         Member {

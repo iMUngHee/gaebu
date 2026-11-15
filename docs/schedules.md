@@ -13,17 +13,26 @@ Gaebu's local runtime owns command authority, sessions, duties and leases.
 ## Start with the commander, delegate when useful
 
 The commander manages scheduling by default. A separate manager is optional;
-changing it does not change anyone's superior or move existing duties. The
-separate scheduling and liaison coordinator uses the display title 황문시랑.
-The commander retains its title when scheduling is combined. Display titles
-never grant authority; set the title explicitly when appointing the coordinator.
+changing it does not change anyone's superior or move existing duties.
+Seating, replacing and removing the manager are the human's directives: the
+commander runs the command and quotes the human's current-turn words, as for
+an appointment. Add `--explicit` when those words name both the action and
+the member.
 
 ```sh
 gaebu schedule init /absolute/project/schedule.md
-gaebu title coordinator 황문시랑
-gaebu schedule manager coordinator --scope 'src/**'
-gaebu schedule manager commander
+gaebu schedule manager coordinator --scope 'src/**' --evidence 'coordinator가 일정을 맡는다'
+gaebu schedule manager commander --evidence '일정은 다시 네가 맡아라'
 ```
+
+The manager's display title becomes 황문시랑. When the manager is replaced or
+removed, a member still carrying that title draws one for the seat it holds;
+the commander keeps its own title throughout. Display titles never grant
+authority. `schedule show` reports under `manager.evidence` whether the
+directive that seated a separate manager was `explicit` or `inferred`; it is
+`none` while the commander schedules and for a manager seated before
+directives were recorded. The manager keeps the title when it moves to
+another unit or becomes a head.
 
 The separate manager must be a bound subordinate with a valid, scoped `assign`
 grant. Supplying `--scope` delegates that scope through the existing grant checks.
@@ -109,7 +118,9 @@ gaebu bu form --head task-master --members worker-a,worker-b \
 Formation checks the whole change before publishing it: the head, selected
 workers, parent, narrowed grants and required `reassign` authority must all be
 valid. A failure leaves the previous seats, IDs, grants and notices intact.
-Existing `bu open` remains available when only a head should move.
+Existing `bu open` remains available when only a head should move. Both open
+units directly below the commander's; a head of such a unit recruits into it
+with `member add` and cannot open another below it (`depth_limit`).
 
 `gaebu bu close <bu>` requires a clean subordinate unit: no open duties, live
 leases, open child units, or incomplete, uncancelled Schedule items owned by

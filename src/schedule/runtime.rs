@@ -73,13 +73,26 @@ pub(super) fn refuse_runtime_home(store: &Store, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seat, replace or remove the separate Schedule manager. The commander runs
+/// it, and only on the human's current-turn words: who relays the human's
+/// instructions is the human's choice.
 pub fn set_manager(
     store: &Store,
     caller: &Caller,
     member: &str,
     scope: &[String],
+    quote: &str,
+    explicit: bool,
 ) -> Result<Value> {
+    let first = super::human_evidence(store, caller, quote, explicit)?;
     store.transact(CLI_DEADLINE, |st| {
+        // Checked again under the lock, so a Stop or a later prompt recorded
+        // while waiting still wins.
+        let evidence = super::human_evidence(store, caller, quote, explicit)?;
+        if evidence.sha256 != first.sha256 || evidence.prompt_seq != first.prompt_seq {
+            return Err(Error::new(Reason::NoUserEvidence, "current prompt changed"));
+        }
+        ops::require_root_evidence(st, &evidence)?;
         let actor = identity::actor(st, caller)?;
         let team = st.members[&actor.member].team.clone();
         commander(st, &actor, &team)?;
@@ -100,7 +113,11 @@ pub fn set_manager(
                     "schedule manager must be a bound subordinate",
                 ));
             }
-            if !scope.is_empty() {
+            // A repeat of the same words must not mint the grant again.
+            let repeat =
+                st.root_actions
+                    .contains_key(&ops::root_key(&evidence, "schedule-manager", &id));
+            if !scope.is_empty() && !repeat {
                 ops::grant(st, now_ms(), &actor, &id, &[Verb::Assign], scope)?;
             }
             if !authz::effective_grants(st, &id)
@@ -114,7 +131,17 @@ pub fn set_manager(
             }
             Some(id)
         };
-        st.schedules.get_mut(&team).unwrap().manager = selected.clone();
+        let key = ops::root_key(
+            &evidence,
+            "schedule-manager",
+            selected.as_deref().unwrap_or("commander"),
+        );
+        // Applied on every call: a repeat changes nothing, and one turn may
+        // name several managers in a row or confirm an inferred one.
+        let registration = st.schedules.get_mut(&team).unwrap();
+        let previous = std::mem::replace(&mut registration.manager, selected.clone());
+        ops::move_liaison_title(st, previous.as_deref(), selected.as_deref());
+        ops::root_done(st, now_ms(), &evidence, key, &team);
         Ok(json!({"manager":selected,"mode":if selected.is_some(){"delegated"}else{"commander"}}))
     })
 }

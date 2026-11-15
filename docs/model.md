@@ -23,19 +23,39 @@ software, not a historical reconstruction.
 Everything else keeps its technical name: member, binding, grant, lease,
 escalation, cancel, vacant, hold.
 
-Display titles (승상, 대도독, 좌장군, 주부, ...) are cosmetic. Authority comes
-only from grants.
+Display titles are cosmetic. Authority comes only from grants.
+
+| Seat | Titles |
+| --- | --- |
+| Commander | 대장군 · 표기장군 · 거기장군 · 위장군 |
+| Head of a bu below the commander's | 정동 · 정서 · 정남 · 정북 · 진동 · 진서 · 진남 · 진북 · 전 · 후 · 좌 · 우장군 |
+| 속관 of the commander's bu | 장사 · 사마 · 종사중랑 · 주부 · 기실독 · 참군 |
+| 속관 of a bu below it | 장사 · 사마 · 주부 · 공조사 · 문하독 · 녹사 |
+| Separate Schedule manager | 황문시랑 |
+
+A seat draws its title from its pool by a fixed hash of the team and member
+ids, so the same seat draws the same title wherever it is computed. Heads do
+not repeat within a team and 속관 do not repeat within a bu; the same staff
+title can appear in two bus. A full pool hands out a numbered title (`녹사2`).
+When a member moves to another bu or returns from a closed one, a title from
+these pools is drawn again for the new seat; any other title, including one a
+person set and one from an earlier release (승상, 연, ...), stays. The check
+looks at the title text alone. A title can address a member only while it is
+unique among the team's active members.
 
 ## Entities
 
 - **Runtime origin**: a stable `runtime_id`, initialized on the first committed write, qualifies local organization references and prevents another machine's numeric IDs from matching accidentally. Empty fresh reads remain empty.
 - **Schedule registration**: `State.schedules[team]` records a canonical absolute project artifact path, its immutable Schedule ID, optional manager member, optional `offer` target team ID and a `predecessors` set of inherited team IDs. No manager means the commander retains scheduling. Registration is local authority; the file cannot create grants. Adoption transfers the registration and accumulates predecessors, excluding its new owner. See [Schedule operations](schedules.md).
 - **Team**: one commander and everyone under them. `project` is a label that
-  scopes are relative to. `root_bu` is the commander's own bu (승상부 by
-  default). `status` is `active` or `cancelled`.
+  scopes are relative to. `root_bu` is the commander's own bu (named after
+  the commander's title, 대장군부 for example). `status` is `active` or `cancelled`.
 - **Bu**: `parent` (none for the root bu), `head` (a member), `name` (the
   head's title + 부 by default), `status`: `open`, `closed` or `cancelled`, and
-  an optional `hold` over every duty in it and in the bus below it.
+  an optional `hold` over every duty in it and in the bus below it. Bus go
+  two deep: only the commander's bu can have one opened below it, and a
+  deeper `bu open` or `bu form` is refused with `depth_limit`. A state that
+  already holds deeper bus keeps them, and they can be closed or cancelled.
 - **Member**: a seat. It has a stable id, `bu`, `superior` (none only for the
   commander), `title`, `status` (`active` or `dismissed`) and a binding.
 - **Binding**: which session currently speaks for the member.
@@ -187,7 +207,7 @@ working).
 `not_member`, `no_grant`, `invalid_scope`, `no_user_evidence`,
 `unresolved_caller`, `not_found`, `invalid_argument`, `conflict`, `busy`,
 `store_write_failed`, `store_corrupt`, `store_unsupported`, `held`,
-`pager_unavailable`.
+`pager_unavailable`, `depth_limit`.
 
 `store_unsupported` means the state was written by a newer schema; nothing
 falls back from it. `held` names the effective release condition and how many
