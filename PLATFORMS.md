@@ -63,6 +63,16 @@ unlink/sync failures, retry, legacy migration and failed publication are covered
 by the helper, Schedule and runtime tests. These are synthetic filesystem failures,
 not physical power-loss tests.
 
+## 0.6.0 Schedule handoff and cancelled-team purge
+
+Linux 7.2.15-1-omarchy, Rust 1.99.0, 2026-11-16: fmt, strict clippy,
+`cargo test` (including doctests), nextest (466 passed, 7 helper tests skipped)
+and native mod tests (26 passed) succeed in an isolated repository-local `TMPDIR`.
+Real CLI/MCP processes exercise handoff, retries, predecessor reads, redispatch,
+seatless purge and evidence-backed path adoption. Failure-injection tests cover
+publication, unlink/sync retry, repair and legacy Schedule path protection;
+physical power-loss persistence remains untested.
+
 ## Pending checks
 
 - Windows: implement directory flush in `store::sync_dir` by opening the directory
