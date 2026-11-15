@@ -239,7 +239,7 @@ fn compact(
             return Ok(result);
         }
         let archive = store.home().join("archive");
-        fs::create_dir_all(&archive).map_err(write_error)?;
+        fs::create_dir_all(&archive).map_err(store::write_error)?;
         let protected = st.home_schedules.clone();
         let mut lengths = st.archives.clone();
         let mut totals: [Maintenance; 3] = std::array::from_fn(|_| Maintenance::default());
@@ -249,7 +249,7 @@ fn compact(
         let mut skipped = Vec::new();
         for (batch_team, batch) in &batches {
             let dir = team_dir(store, batch_team)?;
-            fs::create_dir_all(&dir).map_err(write_error)?;
+            fs::create_dir_all(&dir).map_err(store::write_error)?;
             let lengths = lengths.entry(batch_team.clone()).or_default();
             let bounds = batch
                 .duties
@@ -504,7 +504,7 @@ fn duty_number(id: &str) -> Option<u64> {
 fn rows<T: Serialize>(entries: &[T]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for entry in entries {
-        serde_json::to_writer(&mut bytes, entry).map_err(write_error)?;
+        serde_json::to_writer(&mut bytes, entry).map_err(store::write_error)?;
         bytes.push(b'\n');
     }
     Ok(bytes)
@@ -662,10 +662,6 @@ fn archived_duty(store: &Store, st: &State, team: &str, duty: &str) -> Result<Op
         }
     }
     Ok(found)
-}
-
-fn write_error(error: impl std::fmt::Display) -> Error {
-    Error::new(Reason::StoreWriteFailed, error.to_string())
 }
 
 fn corrupt(message: impl Into<String>) -> Error {

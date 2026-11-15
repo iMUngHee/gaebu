@@ -474,7 +474,7 @@ impl SessionLog {
     }
 }
 
-fn write_error(e: impl std::fmt::Display) -> Error {
+pub(crate) fn write_error(e: impl std::fmt::Display) -> Error {
     Error::new(Reason::StoreWriteFailed, e.to_string())
 }
 

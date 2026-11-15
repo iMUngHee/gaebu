@@ -1,7 +1,7 @@
 //! State retirement precedes removal of positively owned runtime files.
 
 use crate::{
-    Error, Reason, Result, archive,
+    Result, archive,
     model::*,
     store::{self, Store},
 };
@@ -100,15 +100,15 @@ pub(crate) fn remove_pending(store: &Store, st: &mut State) -> Vec<Value> {
                                 std::io::ErrorKind::NotFound
                                     | std::io::ErrorKind::DirectoryNotEmpty
                             ) => {}
-                        Err(e) => return Err(write_error(e)),
+                        Err(e) => return Err(store::write_error(e)),
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(write_error(e)),
+                Err(e) => return Err(store::write_error(e)),
             }
             match sync(&parent) {
                 Ok(()) => Ok(()),
-                Err(_) if !parent.try_exists().map_err(write_error)? => sync(store.home()),
+                Err(_) if !parent.try_exists().map_err(store::write_error)? => sync(store.home()),
                 Err(e) => Err(e),
             }
         })();
@@ -122,14 +122,10 @@ pub(crate) fn remove_pending(store: &Store, st: &mut State) -> Vec<Value> {
     deferred
 }
 
-fn write_error(error: std::io::Error) -> Error {
-    Error::new(Reason::StoreWriteFailed, error.to_string())
-}
-
 fn sync(path: &Path) -> Result<()> {
     #[cfg(test)]
     if FAILED_SYNC.with_borrow(|p| p.as_deref() == Some(path)) {
-        return Err(write_error(std::io::Error::other(
+        return Err(store::write_error(std::io::Error::other(
             "injected purge directory sync failure",
         )));
     }
@@ -144,6 +140,7 @@ std::thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Reason;
     use crate::ops::{self, SeedSpec};
     use std::{
         path::PathBuf,
