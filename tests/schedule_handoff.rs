@@ -343,11 +343,11 @@ fn handoff_closes_source_duties() {
     let st = f.store.read_current().unwrap();
     assert_eq!(st.duties[duty].status, DutyStatus::HandedOff);
     assert_eq!(st.duties[duty].version, previous_version + 1);
-    for side in 0..2 {
+    for team in &f.teams[..2] {
         assert_eq!(
             st.records
                 .iter()
-                .filter(|r| r.team == f.teams[side].id && r.kind == RecordKind::Handoff)
+                .filter(|r| r.team == team.id && r.kind == RecordKind::Handoff)
                 .count(),
             1
         );
