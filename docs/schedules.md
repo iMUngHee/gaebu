@@ -268,8 +268,8 @@ fence. CLI/MCP preserve surrounding prose, refuse unknown fields and stale
 revisions, and replace the file under a fixed sidecar OS lock. Unknown legacy
 prose is refused without overwrite; it is not silently imported.
 
-Runtime schema 5 retains schema 3's qualified local member/unit references with runtime and
-team origin. A Schedule copied from another computer cannot accidentally bind
+Runtime schema 6 retains schema 3's qualified local member/unit references with
+runtime and team origin. A Schedule copied from another computer cannot accidentally bind
 its `m-3` to an unrelated local `m-3`. Unknown joins stay unresolved. The
 supported write path is CLI/MCP against one registered canonical file; separate
 machines concurrently editing separate copies and manual edits bypassing its

@@ -1486,3 +1486,98 @@ fn adoption_rechecks_same_words_from_a_new_prompt_under_the_state_lock() {
     assert!(error.message.contains("current prompt changed"));
     assert_eq!(fs::read(&f.path).unwrap(), before);
 }
+
+#[test]
+fn held_team_purged_then_path_adopt_needs_evidence() {
+    let f = Fixture::new();
+    let item = f.add("continue after purge", &[]);
+    let evidence = f.prompt(0, "hold this source team until a new human decision");
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            ops::root_hold(
+                st,
+                now_ms(),
+                &evidence,
+                &f.teams[0].bu,
+                "new human decision",
+            )
+        })
+        .unwrap();
+    f.call(0, "schedule_update", json!({"item":item,"owner_bu":null}))
+        .unwrap();
+    f.cancel(0);
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.teams.get_mut(&f.teams[0].id).unwrap().cancelled_at =
+                Some(now_ms() - 31 * 24 * 60 * 60 * 1000);
+            Ok(())
+        })
+        .unwrap();
+    let result = gaebu::compact::run(&f.store, &f.teams[1].id, None).unwrap();
+    assert_eq!(result["purged"][0]["team"], f.teams[0].id);
+    assert!(
+        !f.store
+            .read_current()
+            .unwrap()
+            .teams
+            .contains_key(&f.teams[0].id)
+    );
+    let before = fs::read(&f.path).unwrap();
+    for create in [false, true] {
+        let error = schedule::register(&f.store, &f.teams[1].root, &f.path, create).unwrap_err();
+        assert_eq!(error.reason, Reason::Conflict);
+        assert!(error.message.contains("adopt --path"));
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+    }
+    assert_eq!(
+        f.call(1, "schedule_adopt", json!({"path":f.path}))
+            .unwrap_err()
+            .reason,
+        Reason::NoUserEvidence
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    let words = "adopt the purged team's Schedule and resume its work";
+    f.prompt(1, words);
+    assert_eq!(
+        f.call(1, "schedule_adopt", json!({"path":f.path,"evidence":words}))
+            .unwrap()["adopted"],
+        true
+    );
+    let state = f.store.read_current().unwrap();
+    assert!(state.schedules[&f.teams[1].id].predecessors.is_empty());
+    assert!(
+        state
+            .records
+            .iter()
+            .filter(|r| r.kind == RecordKind::Handoff)
+            .all(|r| r.text.contains("not recoverable") && r.text.contains(words))
+    );
+}
+
+#[test]
+fn repeated_handoff_accumulates_predecessors_and_retains_contract_reads() {
+    let f = Fixture::new();
+    let item = f.add("multi-team continuation", &[]);
+    let issued = f.dispatch(&item);
+    f.offer(1);
+    f.adopt(1).unwrap();
+    f.call(1, "schedule_offer", json!({"to":"c"})).unwrap();
+    f.call(2, "schedule_adopt", json!({"team":"b"})).unwrap();
+    let state = f.store.read_current().unwrap();
+    let registration = &state.schedules[&f.teams[2].id];
+    assert_eq!(
+        registration.predecessors,
+        std::collections::BTreeSet::from([f.teams[0].id.clone(), f.teams[1].id.clone()])
+    );
+    assert!(registration.manager.is_none());
+    assert!(registration.offer.is_none());
+    assert!(!state.schedules.contains_key(&f.teams[1].id));
+    let duty = gaebu::compact::full_duty(
+        &f.store,
+        &state,
+        &f.teams[2].worker.session_id,
+        issued["duty"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(duty.team, f.teams[0].id);
+}
