@@ -185,12 +185,15 @@ fn compact(
     if !explicit {
         let snapshot = store.read_view()?;
         let now = crate::model::now_ms();
-        if !crate::purge::needed(&snapshot, now)
-            && counts(&candidates(&snapshot, now, team, retired))
+        // Without a team there is no archive pass, only purge work.
+        let eligible = if team.is_empty() {
+            0
+        } else {
+            counts(&candidates(&snapshot, now, team, retired))
                 .iter()
                 .sum::<usize>()
-                < threshold
-        {
+        };
+        if !crate::purge::needed(&snapshot, now) && eligible < threshold {
             return Ok(empty());
         }
     }

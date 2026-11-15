@@ -486,7 +486,9 @@ fn schema5_state_adopts_schema6() {
         legacy["schedules"] = serde_json::json!({
             "inside": {"schedule_id":"old-inside", "path":document, "manager":null},
             "missing": {"schedule_id":"old-missing", "path":access.join("missing/sub/schedule.md"), "manager":null},
-            "outside": {"schedule_id":"old-outside", "path":external.join("schedule.md"), "manager":null}
+            "outside": {"schedule_id":"old-outside", "path":external.join("schedule.md"), "manager":null},
+            // A parent that is a regular file cannot be resolved; migration must not fail on it.
+            "unresolvable": {"schedule_id":"old-unresolvable", "path":external.join("schedule.md/child.md"), "manager":null}
         });
         let original = serde_json::to_vec(&legacy).unwrap();
         fs::write(access.join("state.json"), &original).unwrap();

@@ -630,7 +630,6 @@ fn root_op(
                 "the current prompt changed while waiting; restate the instruction",
             ));
         }
-        ops::require_root_evidence(st, &ev)?;
         f(st, now, &ev)
     })?;
     crate::compact::auto(store, "", None);

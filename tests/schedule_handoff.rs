@@ -851,6 +851,26 @@ fn adopt_path_unregistered_document() {
         Reason::NoUserEvidence
     );
     assert_eq!(fs::read(&f.path).unwrap(), before);
+    // Words not later than the newest purged cancellation cannot resume a Schedule.
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.root_evidence_floor = u64::MAX;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.call(1, "schedule_adopt", json!({"path":f.path,"evidence":words}))
+            .unwrap_err()
+            .reason,
+        Reason::NoUserEvidence
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    f.store
+        .transact(CLI_DEADLINE, |st| {
+            st.root_evidence_floor = 0;
+            Ok(())
+        })
+        .unwrap();
     f.call(1, "schedule_adopt", json!({"path":f.path,"evidence":words}))
         .unwrap();
     let doc = schedule::read_document(&f.path).unwrap().schedule;

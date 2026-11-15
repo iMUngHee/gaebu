@@ -566,6 +566,8 @@ fn seatless_compact_purges() {
             caller("unseated")
         };
         assert!(gaebu::schedule::compact(&f.store, &who, true).is_err());
+        let dir = f.store.home().join("archive").join(&f.team);
+        assert!(dir.exists());
         assert_eq!(
             gaebu::schedule::compact(&f.store, &who, false).unwrap()["purged"]
                 .as_array()
@@ -573,6 +575,8 @@ fn seatless_compact_purges() {
                 .len(),
             1
         );
+        assert!(!dir.exists());
+        assert!(f.state().purge_pending.is_empty());
     }
 }
 

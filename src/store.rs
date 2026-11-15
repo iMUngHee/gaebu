@@ -568,7 +568,12 @@ fn read_state(path: &Path) -> Result<Option<Loaded>> {
             }
             let home = canonical_path(path.parent().unwrap_or_else(|| Path::new(".")))?;
             for registration in state.schedules.values() {
-                let schedule = canonical_path(Path::new(&registration.path))?;
+                // A path that no longer resolves cannot be under the runtime
+                // home in any way removal could reach; failing here would
+                // make every command fail until the filesystem is repaired.
+                let Ok(schedule) = canonical_path(Path::new(&registration.path)) else {
+                    continue;
+                };
                 if schedule.starts_with(&home) {
                     state
                         .home_schedules

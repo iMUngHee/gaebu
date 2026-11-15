@@ -158,6 +158,8 @@ pub(super) fn adopt(store: &Store, caller: &Caller, args: &Input) -> Result<Valu
             if first.as_ref().is_none_or(|first|first.sha256!=verified.sha256 || first.prompt_seq!=verified.prompt_seq) {
                 return Err(Error::new(Reason::NoUserEvidence,"current prompt changed"));
             }
+            // Words older than the newest purged cancellation may predate a hold that purge erased.
+            ops::require_root_evidence(st,&verified)?;
             Some(verified)
         } else {None};
         if source.is_none() && evidence.is_none() {

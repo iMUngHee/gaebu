@@ -432,7 +432,7 @@ publication leftovers. Normal explicit maintenance and heal still remove their
 usual unlisted runtime segments while respecting `home_schedules`.
 
 Purge raises `root_evidence_floor` to the greatest cancellation time it removes.
-Every root directive requires evidence strictly newer than that floor; old
+Every root directive, and the evidence given to `schedule adopt`, must be strictly newer than that floor; old
 appointments cannot replay after their idempotency keys disappear. A refused
 old instruction must be restated by the human.
 
