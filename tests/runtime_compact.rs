@@ -439,10 +439,10 @@ impl Pager for QuietPager {
     fn whoami(&self, _: Option<&str>) -> gaebu::Result<WhoAmI> {
         unreachable!()
     }
-    fn host_status(&self, _: &str) -> gaebu::Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> gaebu::Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _: &str, _: &str) -> gaebu::Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> gaebu::Result<()> {
         Ok(())
     }
 }
@@ -997,10 +997,10 @@ impl Pager for NoPager {
     fn whoami(&self, _: Option<&str>) -> gaebu::Result<WhoAmI> {
         panic!("bound hook needs no pager identity")
     }
-    fn host_status(&self, _: &str) -> gaebu::Result<HostStatus> {
+    fn hosts(&self) -> gaebu::Result<gaebu::pager::Hosts> {
         panic!("bound hook needs no roster")
     }
-    fn send(&self, _: &str, _: &str) -> gaebu::Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> gaebu::Result<()> {
         panic!("hook must not send")
     }
 }
@@ -2215,10 +2215,10 @@ impl Pager for CliPager {
             tool: Some("codex".into()),
         })
     }
-    fn host_status(&self, _: &str) -> gaebu::Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> gaebu::Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _: &str, _: &str) -> gaebu::Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> gaebu::Result<()> {
         Ok(())
     }
 }

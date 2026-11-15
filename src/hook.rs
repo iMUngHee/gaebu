@@ -357,7 +357,7 @@ fn emit(stdout: &mut dyn Write, event: &str, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pager::{HostStatus, WhoAmI};
+    use crate::pager::WhoAmI;
     use std::cell::Cell;
 
     #[test]
@@ -373,10 +373,10 @@ mod tests {
                     tool: None,
                 })
             }
-            fn host_status(&self, _: &str) -> Result<HostStatus> {
+            fn hosts(&self) -> Result<crate::pager::Hosts> {
                 unreachable!()
             }
-            fn send(&self, _: &str, _: &str) -> Result<()> {
+            fn send(&self, _: &crate::pager::Message<'_>) -> Result<()> {
                 unreachable!()
             }
         }

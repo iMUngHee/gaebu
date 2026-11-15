@@ -127,15 +127,20 @@ pub fn actor(st: &State, caller: &Caller) -> Result<Actor> {
 pub fn refresh_bindings(store: &Store, pager: &dyn Pager) -> Result<Vec<String>> {
     let st = store.read()?;
     let mut observations = Vec::new();
+    // Read lazily and once: most calls have no bound member to check.
+    let mut hosts = None;
     for member in st.members.values().filter(|m| {
         m.status == MemberStatus::Active && m.binding.state == crate::model::BindingState::Bound
     }) {
         let Some(session) = member.binding.session_id.as_deref() else {
             continue;
         };
-        let status = pager
-            .host_status(&member.binding.alias)
-            .unwrap_or(crate::pager::HostStatus::Unknown);
+        let status = hosts
+            .get_or_insert_with(|| pager.hosts())
+            .as_ref()
+            .map_or(crate::pager::HostStatus::Unknown, |hosts| {
+                hosts.status(&member.binding.alias)
+            });
         let reason = if status == crate::pager::HostStatus::Gone {
             Some("pager_gone")
         } else if status == crate::pager::HostStatus::Unknown {

@@ -66,10 +66,10 @@ impl Pager for FakePager {
             tool: Some("codex".into()),
         })
     }
-    fn host_status(&self, _: &str) -> Result<HostStatus> {
-        Ok(self.0)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(self.0))
     }
-    fn send(&self, _: &str, _: &str) -> Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
         panic!("hook must not send notices")
     }
 }
@@ -633,10 +633,10 @@ fn live_host_alias_movement_vacates_old_binding() {
                 tool: None,
             })
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
-            Ok(HostStatus::Live)
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+            Ok(gaebu::pager::Hosts::all(HostStatus::Live))
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
             panic!("observation must not send")
         }
     }
@@ -714,10 +714,10 @@ fn missing_pager_name_is_unknown_not_alias_movement() {
         fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
             gaebu::pager::parse_whoami(&format!("session: {} (via flag)\n", session.unwrap()))
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
-            Ok(HostStatus::Live)
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+            Ok(gaebu::pager::Hosts::all(HostStatus::Live))
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
             Ok(())
         }
     }
@@ -772,11 +772,11 @@ fn mcp_mutation_refuses_when_refresh_fails() {
         fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
             unreachable!()
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
             self.0.send(()).unwrap();
-            Ok(HostStatus::Gone)
+            Ok(gaebu::pager::Hosts::all(HostStatus::Gone))
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
             Ok(())
         }
     }
@@ -834,10 +834,10 @@ fn hook_pending_lookup_is_throttled_until_revision_changes() {
                 tool: None,
             })
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
             panic!("hook must not poll roster")
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
             panic!("hook must not send")
         }
     }

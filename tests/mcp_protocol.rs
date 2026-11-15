@@ -13,10 +13,10 @@ impl Pager for FakePager {
     fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
         Err(gaebu::Error::new(Reason::UnresolvedCaller, "no identity"))
     }
-    fn host_status(&self, _: &str) -> Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _: &str, _: &str) -> Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
         Ok(())
     }
 }
@@ -184,10 +184,11 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
                 tool: Some("claude".into()),
             })
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
-            Ok(HostStatus::Unknown)
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+            Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
         }
-        fn send(&self, to: &str, _: &str) -> Result<()> {
+        fn send(&self, message: &gaebu::pager::Message<'_>) -> Result<()> {
+            let to = message.target;
             assert!(["worker-session", "commander-session"].contains(&to));
             Ok(())
         }
@@ -346,10 +347,10 @@ fn escalation_withdraw_tool() {
                 tool: Some("claude".into()),
             })
         }
-        fn host_status(&self, _: &str) -> Result<HostStatus> {
-            Ok(HostStatus::Unknown)
+        fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+            Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
             Ok(())
         }
     }

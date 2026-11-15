@@ -289,7 +289,7 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
             "member {} ({alias}) dismissed; downstream grants revoked",
             m.id
         ),
-        Notify::Act,
+        Notify::Act(NoticeKind::Release),
     );
     Ok(out("dismissed", vec![m.id]))
 }
@@ -328,7 +328,7 @@ pub fn root_cancel_team(st: &mut State, now: Ms, ev: &Evidence, team: &str) -> R
         &author,
         &affected,
         &format!("team {} cancelled", t.id),
-        Notify::Act,
+        Notify::Act(NoticeKind::Release),
     );
     root_done(st, now, ev, key, &t.id);
     Ok(out("team cancelled", vec![t.id]))
@@ -403,7 +403,7 @@ pub fn root_hold(
         &author,
         &affected,
         &format!("{target} held until: {until}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Release),
     );
     Ok(out("held", vec![target.into()]))
 }
@@ -431,7 +431,7 @@ pub fn root_release(st: &mut State, now: Ms, ev: &Evidence, target: &str) -> Res
             "{target} released (held for '{}', released for '{}')",
             old.evidence.quote, ev.quote
         ),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     if let Some(r) = st.records.last_mut() {
         r.kind = RecordKind::Decision;
@@ -710,7 +710,7 @@ pub fn bu_open(
         &a.id,
         &[h.id],
         &format!("bu {bid} opened"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("bu opened", vec![bid]))
 }
@@ -837,7 +837,7 @@ pub fn bu_close(st: &mut State, now: Ms, actor: &Actor, bu: &str) -> Result<Outc
         &a.id,
         &returned,
         &format!("bu {bu} closed; active members returned to {}", parent.id),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("bu closed", vec![bu.into()]))
 }
@@ -879,7 +879,7 @@ pub fn bu_cancel(
         &a.id,
         &affected,
         &format!("bu {bu} cancelled: {reason}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Release),
     );
     Ok(out("bu cancelled", vec![bu.into()]))
 }
@@ -972,7 +972,7 @@ pub fn member_move(
         &a.id,
         std::slice::from_ref(&id),
         &format!("member {id} moved to bu {bu}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("member moved", vec![id]))
 }
@@ -1098,7 +1098,7 @@ pub fn revoke(st: &mut State, now: Ms, actor: &Actor, grant: &str) -> Result<Out
         &a.id,
         &[g.grantee],
         &format!("grant {grant} revoked"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("revoked", vec![grant.into()]))
 }
@@ -1175,7 +1175,14 @@ pub fn duty_issue(
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
-    changed(st, now, &a.id, &[m.id], &message, Notify::Act);
+    changed(
+        st,
+        now,
+        &a.id,
+        &[m.id],
+        &message,
+        Notify::Act(NoticeKind::Update),
+    );
     Ok(out(
         if st.duties[&id].scope.is_empty() {
             "duty issued (no scope: the assignee can take no lease)"
@@ -1232,7 +1239,11 @@ pub fn duty_respond(
             "duty {duty} {}",
             if accept { "accepted" } else { "declined" }
         ),
-        if accept { Notify::Record } else { Notify::Act },
+        if accept {
+            Notify::Record
+        } else {
+            Notify::Act(NoticeKind::Update)
+        },
     );
     Ok(out("duty response recorded", vec![duty.into()]))
 }
@@ -1283,7 +1294,7 @@ pub fn duty_progress(
         if status == DutyStatus::Accepted {
             Notify::Record
         } else {
-            Notify::Act
+            Notify::Act(NoticeKind::Update)
         },
     );
     Ok(out("duty progress recorded", vec![duty.into()]))
@@ -1336,7 +1347,7 @@ pub fn duty_amend(
         &a.id,
         &[assignee],
         &format!("duty {duty} amended; acceptance required"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("duty amended", vec![duty.into()]))
 }
@@ -1374,7 +1385,7 @@ pub fn duty_cancel(
         &a.id,
         &[assignee],
         &format!("duty {duty} cancelled: {reason}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Release),
     );
     Ok(out("duty cancelled", vec![duty.into()]))
 }
@@ -1545,7 +1556,7 @@ pub fn lease_force_release(
         &a.id,
         &[l.holder],
         &format!("lease {lease} force released: {reason}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("lease force released", vec![lease.into()]))
 }
@@ -1605,7 +1616,7 @@ pub fn escalate(
                 &a.id,
                 &to.into_iter().collect::<Vec<_>>(),
                 &format!("escalation {} rerouted: {}", e.id, e.question),
-                Notify::Act,
+                Notify::Act(NoticeKind::Update),
             );
             return Ok(out("escalation rerouted", vec![e.id]));
         }
@@ -1645,7 +1656,7 @@ pub fn escalate(
         &a.id,
         &to.into_iter().collect::<Vec<_>>(),
         &text,
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     match replaced {
         Some(old) => Ok(out(
@@ -1695,7 +1706,7 @@ pub fn escalation_withdraw(
         &a.id,
         &e.to.into_iter().collect::<Vec<_>>(),
         &format!("escalation {escalation} withdrawn{why}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("escalation withdrawn", vec![escalation.into()]))
 }
@@ -1758,7 +1769,7 @@ pub fn reroute_escalations(st: &mut State, now: Ms) {
             &from,
             &to.into_iter().collect::<Vec<_>>(),
             &format!("escalation {id} rerouted: {question}"),
-            Notify::Act,
+            Notify::Act(NoticeKind::Update),
         );
     }
 }
@@ -1795,7 +1806,7 @@ pub fn escalation_answer(
         &a.id,
         &[from],
         &format!("escalation {escalation} answered: {answer}"),
-        Notify::Act,
+        Notify::Act(NoticeKind::Update),
     );
     Ok(out("escalation answered", vec![escalation.into()]))
 }
@@ -2184,9 +2195,9 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) -> Vec<String> {
 /// Whether a change interrupts its recipients (plan gaebu-v0-2, Decision 13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notify<'a> {
-    /// The recipient must do or stop doing something: a pager notice to the
-    /// bound session of each affected member.
-    Act,
+    /// The recipient must do or stop doing something: a pager notice of the
+    /// given kind to the bound session of each affected member.
+    Act(NoticeKind),
     /// Visible on the next card; only the team record.
     Record,
     /// This member's seat awaits its session: a pager notice to the seat's
@@ -2251,7 +2262,7 @@ pub(crate) fn record_change(
     });
     let recipients: Vec<(String, String)> = match notify {
         Notify::Record => return,
-        Notify::Act => affected
+        Notify::Act(_) => affected
             .iter()
             .filter_map(|id| Some((id.clone(), st.members.get(id)?.binding.session_id.clone()?)))
             .collect(),
@@ -2262,6 +2273,10 @@ pub(crate) fn record_change(
             .map(|m| (m.id.clone(), m.binding.alias.clone()))
             .into_iter()
             .collect(),
+    };
+    let kind = match notify {
+        Notify::Act(kind) => kind,
+        Notify::Record | Notify::Seat(_) => NoticeKind::Update,
     };
     let key = notice_key(&body);
     for (member, target) in recipients {
@@ -2290,6 +2305,7 @@ pub(crate) fn record_change(
             created_at: now,
             attempts: 0,
             claimed_at: None,
+            kind,
         });
     }
 }

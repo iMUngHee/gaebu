@@ -656,10 +656,10 @@ impl Pager for FakePager {
             tool: Some("codex".into()),
         })
     }
-    fn host_status(&self, _: &str) -> gaebu::Result<HostStatus> {
-        Ok(HostStatus::Live)
+    fn hosts(&self) -> gaebu::Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Live))
     }
-    fn send(&self, _: &str, _: &str) -> gaebu::Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> gaebu::Result<()> {
         Ok(())
     }
 }

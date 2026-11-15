@@ -36,10 +36,10 @@ impl Pager for QuietPager {
             tool: None,
         })
     }
-    fn host_status(&self, _: &str) -> Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _: &str, _: &str) -> Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
         Ok(())
     }
 }

@@ -327,7 +327,7 @@ pub(super) fn adopt(store: &Store, caller: &Caller, args: &Input) -> Result<Valu
                 &actor.member,
                 &affected,
                 &text,
-                ops::Notify::Act,
+                ops::Notify::Act(crate::model::NoticeKind::Update),
                 (RecordKind::Handoff, source),
             );
         }

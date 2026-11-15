@@ -19,10 +19,10 @@ impl Pager for NoPager {
             tool: Some("claude".into()),
         })
     }
-    fn host_status(&self, _alias: &str) -> Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _to: &str, _body: &str) -> Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
         Ok(())
     }
 }

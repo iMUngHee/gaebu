@@ -807,6 +807,7 @@ fn notice_serializes_target_as_to_session() {
                 created_at: 1,
                 attempts: 0,
                 claimed_at: None,
+                kind: Default::default(),
             });
             Ok(())
         })
@@ -969,4 +970,31 @@ fn array_shaped_legacy_state_is_corrupt_not_a_panic() {
         home.store().read().unwrap_err().reason,
         Reason::StoreCorrupt
     );
+}
+
+#[test]
+fn notice_kind_round_trips() {
+    use gaebu::model::{Notice, NoticeKind};
+    let notice = Notice {
+        id: "n-1".into(),
+        to_member: "m-1".into(),
+        target: "s-1".into(),
+        body: "b".into(),
+        text: "b".into(),
+        created_at: 1,
+        attempts: 0,
+        claimed_at: None,
+        kind: NoticeKind::Release,
+    };
+    let mut json = serde_json::to_value(&notice).unwrap();
+    assert_eq!(json["kind"], "release");
+    assert_eq!(
+        serde_json::from_value::<Notice>(json.clone()).unwrap(),
+        notice
+    );
+
+    // A state written before notices carried a kind.
+    json.as_object_mut().unwrap().remove("kind");
+    let old: Notice = serde_json::from_value(json).unwrap();
+    assert_eq!(old.kind, NoticeKind::Update);
 }

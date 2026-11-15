@@ -977,10 +977,10 @@ mod tests {
                 tool: Some("codex".into()),
             })
         }
-        fn host_status(&self, _: &str) -> Result<crate::pager::HostStatus> {
-            Ok(crate::pager::HostStatus::Unknown)
+        fn hosts(&self) -> Result<crate::pager::Hosts> {
+            Ok(crate::pager::Hosts::all(crate::pager::HostStatus::Unknown))
         }
-        fn send(&self, _: &str, _: &str) -> Result<()> {
+        fn send(&self, _: &crate::pager::Message<'_>) -> Result<()> {
             Ok(())
         }
     }

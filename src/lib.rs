@@ -22,6 +22,7 @@ pub mod pager;
 mod purge;
 pub mod schedule;
 pub mod scope;
+pub mod stalled;
 pub mod store;
 pub mod titles;
 

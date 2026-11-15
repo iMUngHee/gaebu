@@ -28,10 +28,10 @@ impl Pager for QuietPager {
             tool: None,
         })
     }
-    fn host_status(&self, _: &str) -> Result<HostStatus> {
-        Ok(HostStatus::Unknown)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        Ok(gaebu::pager::Hosts::all(HostStatus::Unknown))
     }
-    fn send(&self, _: &str, _: &str) -> Result<()> {
+    fn send(&self, _: &gaebu::pager::Message<'_>) -> Result<()> {
         Ok(())
     }
 }
@@ -41,10 +41,11 @@ impl Pager for NoticePager {
     fn whoami(&self, session: Option<&str>) -> Result<WhoAmI> {
         QuietPager.whoami(session)
     }
-    fn host_status(&self, alias: &str) -> Result<HostStatus> {
-        QuietPager.host_status(alias)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        QuietPager.hosts()
     }
-    fn send(&self, target: &str, _: &str) -> Result<()> {
+    fn send(&self, message: &gaebu::pager::Message<'_>) -> Result<()> {
+        let target = message.target;
         self.0.borrow_mut().push(target.to_owned());
         Ok(())
     }

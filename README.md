@@ -209,6 +209,7 @@ root directives quoting them are refused.
 ```sh
 gaebu me                         # my card and duties
 gaebu board                      # the whole roster
+gaebu stalled                    # work waiting on a resting session
 gaebu schedule show              # operational queue, review and next decisions
 gaebu duty show d-12              # full contract, including completed work
 gaebu bu open --head nuzu --verbs assign,open --scope 'src/**'

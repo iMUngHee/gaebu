@@ -21,6 +21,12 @@ struct FakePager {
     current: RefCell<String>,
     aliases: HashMap<String, String>,
     sent: RefCell<Vec<(String, String)>>,
+    /// Every `send` attempt's event id and kind, refused ones included.
+    attempts: RefCell<Vec<(String, gaebu::model::NoticeKind)>>,
+    /// How often the roster was read.
+    roster_reads: Cell<u32>,
+    /// What the roster says about each alias; `None` makes the read fail.
+    roster: RefCell<Option<gaebu::pager::Hosts>>,
     /// Makes every `send` fail, as when the target is not live.
     refuse: Cell<bool>,
     /// Per `send`: whether the stored state already held a pending seat with
@@ -37,6 +43,9 @@ impl FakePager {
                 .map(|(s, a)| (s.to_string(), a.to_string()))
                 .collect(),
             sent: RefCell::new(Vec::new()),
+            attempts: RefCell::new(Vec::new()),
+            roster_reads: Cell::new(0),
+            roster: RefCell::new(Some(gaebu::pager::Hosts::all(HostStatus::Live))),
             refuse: Cell::new(false),
             pending_at_send: RefCell::new(Vec::new()),
         }
@@ -58,10 +67,18 @@ impl Pager for FakePager {
             tool: Some("codex".into()),
         })
     }
-    fn host_status(&self, _alias: &str) -> Result<HostStatus> {
-        Ok(HostStatus::Live)
+    fn hosts(&self) -> Result<gaebu::pager::Hosts> {
+        self.roster_reads.set(self.roster_reads.get() + 1);
+        self.roster.borrow().clone().ok_or_else(|| {
+            gaebu::error::Error::new(gaebu::Reason::PagerUnavailable, "roster unavailable")
+        })
     }
-    fn send(&self, target: &str, body: &str) -> Result<()> {
+    fn send(&self, message: &gaebu::pager::Message<'_>) -> Result<()> {
+        let target = message.target;
+        let body = message.body;
+        self.attempts
+            .borrow_mut()
+            .push((message.event.to_string(), message.kind));
         if self.refuse.get() {
             return Err(gaebu::error::Error::new(
                 gaebu::Reason::PagerUnavailable,
@@ -658,6 +675,7 @@ fn claimed_notice_is_retried_after_a_stale_claim_and_not_lost() {
                     created_at: now,
                     attempts: 0,
                     claimed_at: claimed,
+                    kind: Default::default(),
                 });
             }
             Ok(())
@@ -1631,4 +1649,142 @@ fn self_seat_rebind_rerun_binds_a_pending_seat() {
     let seat = binding_of(&store, "nuzu");
     assert_eq!(seat.state, BindingState::Bound);
     assert_eq!(seat.session_id.as_deref(), Some("s-new"));
+}
+
+fn queue_notice(store: &Store, id: &str, kind: gaebu::model::NoticeKind) {
+    let now = gaebu::model::now_ms();
+    store
+        .transact(gaebu::store::CLI_DEADLINE, |st| {
+            st.outbox.push(gaebu::model::Notice {
+                id: id.into(),
+                to_member: "m-x".into(),
+                target: "s-x".into(),
+                body: "b".into(),
+                text: "b".into(),
+                created_at: now,
+                attempts: 0,
+                claimed_at: None,
+                kind,
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn notice_carries_event_and_kind() {
+    use gaebu::model::NoticeKind;
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[]);
+    queue_notice(&store, "n-stop", NoticeKind::Release);
+
+    // pager refuses the first attempt; the retry names the same event.
+    pager.refuse.set(true);
+    gaebu::cli::flush_outbox(&store, &pager);
+    pager.refuse.set(false);
+    gaebu::cli::flush_outbox(&store, &pager);
+    let attempts = pager.attempts.borrow().clone();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    let (event, kind) = &attempts[0];
+    assert_eq!(*kind, NoticeKind::Release);
+    let runtime = store.read().unwrap().runtime_id;
+    assert_eq!(event, &format!("gaebu-{runtime}-n-stop-release"));
+    assert!(store.read().unwrap().outbox.is_empty());
+
+    // The same notice without its kind, as an older binary would leave it,
+    // is a different event: pager refuses one event sent with two kinds.
+    queue_notice(&store, "n-stop", NoticeKind::Update);
+    gaebu::cli::flush_outbox(&store, &pager);
+    let (resent, kind) = pager.attempts.borrow().last().unwrap().clone();
+    assert_eq!(kind, NoticeKind::Update);
+    assert_ne!(&resent, event);
+}
+
+#[test]
+fn pager_send_arguments_keep_text_after_the_separator() {
+    let message = gaebu::pager::Message {
+        target: "nawi",
+        body: "--human is only text here",
+        event: "gaebu-r-n-1-release",
+        kind: gaebu::model::NoticeKind::Release,
+    };
+    assert_eq!(
+        gaebu::pager::send_args(&message),
+        [
+            "send",
+            "--event",
+            "gaebu-r-n-1-release",
+            "--kind",
+            "release",
+            "--",
+            "nawi",
+            "--human is only text here",
+        ]
+    );
+}
+
+#[test]
+fn refresh_calls_who_once() {
+    use gaebu::model::now_ms;
+    use gaebu::ops::{self, SeedSpec};
+    use gaebu::pager::Hosts;
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[]);
+    let aliases = ["one", "two", "three", "four"];
+    store
+        .transact(gaebu::store::CLI_DEADLINE, |st| {
+            ops::dev_seed(
+                st,
+                now_ms(),
+                &SeedSpec {
+                    team: "roster".into(),
+                    project: "p".into(),
+                    commander_alias: "boss".into(),
+                    commander_session: Some("s-boss".into()),
+                    commander_tool: Some(Tool::Codex),
+                    members: aliases
+                        .iter()
+                        .map(|a| (a.to_string(), Some(format!("s-{a}")), Some(Tool::Codex)))
+                        .collect(),
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let state_of = |alias: &str| binding_of(&store, alias).state;
+
+    // Five bound members, one roster read.
+    assert!(
+        gaebu::identity::refresh_bindings(&store, &pager)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(pager.roster_reads.get(), 1);
+
+    // A roster that cannot be read, or does not list an alias, proves nothing.
+    *pager.roster.borrow_mut() = None;
+    assert!(
+        gaebu::identity::refresh_bindings(&store, &pager)
+            .unwrap()
+            .is_empty()
+    );
+    *pager.roster.borrow_mut() = Some(Hosts::from_rows(vec![("one".into(), HostStatus::Live)]));
+    assert!(
+        gaebu::identity::refresh_bindings(&store, &pager)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(state_of("two"), BindingState::Bound);
+
+    // Only an alias the roster reports gone loses its seat.
+    *pager.roster.borrow_mut() = Some(Hosts::from_rows(vec![
+        ("one".into(), HostStatus::Live),
+        ("two".into(), HostStatus::Gone),
+    ]));
+    let vacated = gaebu::identity::refresh_bindings(&store, &pager).unwrap();
+    assert_eq!(vacated.len(), 1);
+    assert_eq!(state_of("two"), BindingState::Vacant);
+    assert_eq!(state_of("one"), BindingState::Bound);
+    assert_eq!(state_of("three"), BindingState::Bound);
 }

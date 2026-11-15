@@ -150,6 +150,13 @@ enum Cmd {
     /// Canonical project schedules and operational work distribution.
     #[command(subcommand)]
     Schedule(crate::schedule::ScheduleCmd),
+    /// List work that waits on a session observed to be resting. Reads
+    /// only, and needs no session of its own.
+    Stalled {
+        /// Minutes a wait must have lasted to be listed.
+        #[arg(long, default_value_t = 10)]
+        after: u64,
+    },
     /// Archive eligible terminal runtime history.
     Compact {
         /// Permanently delete older history to repair missing-segment holes (commander only).
@@ -489,6 +496,7 @@ impl From<KindArg> for RecordKind {
 pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
     let pager = CliPager {
         timeout: Duration::from_secs(3),
+        program: "pager".into(),
     };
     run_with(args, &pager)
 }
@@ -730,6 +738,7 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             };
             let pager = CliPager {
                 timeout: Duration::from_millis(1_500),
+                program: "pager".into(),
             };
             crate::hook::run_stdio(tool.into(), &store, &pager);
             Ok(())
@@ -996,6 +1005,17 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             })
         }
         Cmd::Schedule(cmd) => crate::schedule::run_cli(cmd, json, pager),
+        Cmd::Stalled { after } => {
+            let store = open_store()?;
+            let report =
+                crate::stalled::find(&store, pager, after.saturating_mul(60_000), now_ms())?;
+            if json {
+                print_json(&report);
+            } else {
+                print!("{}", crate::stalled::render(&report));
+            }
+            Ok(())
+        }
         Cmd::Compact { heal } => {
             let store = open_store()?;
             let caller = mutating_caller(pager)?;

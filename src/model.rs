@@ -472,6 +472,26 @@ pub struct RootAction {
     pub evidence: Option<Evidence>,
 }
 
+/// The pager `--kind` a notice is sent with. pager wakes a paused recipient
+/// only for the kinds it treats as important, which `Update` is not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    #[default]
+    Update,
+    /// The recipient has to stop something: a cancellation, dismissal or hold.
+    Release,
+}
+
+impl NoticeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoticeKind::Update => "update",
+            NoticeKind::Release => "release",
+        }
+    }
+}
+
 /// A pending pager notification, flushed after commit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Notice {
@@ -491,6 +511,10 @@ pub struct Notice {
     /// `NOTICE_CLAIM_MS` is stale (the sender died) and the notice is sent again.
     #[serde(default)]
     pub claimed_at: Option<Ms>,
+    /// Absent in states written before notices carried a kind, and dropped
+    /// when an older binary rewrites the state: both read as `Update`.
+    #[serde(default)]
+    pub kind: NoticeKind,
 }
 
 /// How long a flush may hold a notice before another flush may retry it.

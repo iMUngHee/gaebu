@@ -122,10 +122,14 @@ unique among the team's active members.
   entries without it use `answered_at`, then `created_at`, for retention.
 - **Record**: `kind` (`decision`, `handoff`, `change`, `note`), `author`,
   `refs`, `text`.
-- **Outbox**: notices waiting to be delivered with `pager send <target>`, where
-  the target is the recipient's session id, or its pager alias while the seat
-  is pending. `body` is what is sent; `text` is the body without its record id, the
-  dedupe key. See [Notices](#notices).
+- **Outbox**: notices waiting to be delivered with `pager send`, where the
+  target is the recipient's session id, or its pager alias while the seat is
+  pending. `body` is what is sent; `text` is the body without its record id, the
+  dedupe key. `kind` is the pager kind: `release` for a cancellation, a
+  dismissal and a hold, which pager delivers even to a recipient whose wakes
+  are paused, and `update` for everything else. Each notice is sent with the
+  event id `gaebu-<runtime id>-<notice id>-<kind>`, so the same session
+  sending it again does not create new mail. See [Notices](#notices).
 
 ## Scope patterns
 

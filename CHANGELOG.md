@@ -9,6 +9,48 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.8.0 — 2026-11-16
+
+### Added
+
+- `gaebu stalled [--json] [--after <minutes>]` lists work that waits on a
+  session observed to be resting: a seat never confirmed, a formed team with
+  no work, an accepted duty whose assignee stopped, a duty waiting on a
+  member who stopped, a ready Schedule item whose task master stopped, and a
+  duty whose assignee's host is gone. It needs no session, changes nothing,
+  and names who should hear of each finding without sending anything. See
+  [stall detection](docs/stalled.md) for what it can and cannot observe.
+- Notices sent through pager carry `--event` and `--kind`. A notice the same
+  session sends again is the same pager message instead of new mail; a
+  resend by another session can still duplicate. Cancellations, dismissals
+  and holds go out as `release`, which pager delivers to a recipient whose
+  wakes are paused; everything else stays `update`.
+
+### Fixed
+
+- The HOST column of `pager who` is read by its position. Since pager added
+  a THREAD column, whose value is `unknown` for every Claude session, a
+  Claude session reported gone was read as unknown and kept its seat.
+- The roster is read with `pager who --all`, so a session gone for more
+  than twelve hours is still seen as gone.
+
+### Changed
+
+- A binding refresh runs `pager who` once instead of once per bound member.
+- With the two fixes above, a seat whose Claude session pager reports gone
+  now becomes vacant and its exclusive leases are released on the next
+  command that refreshes bindings. This is the documented behavior; it did
+  not happen before.
+
+### Compatibility
+
+- Runtime schema 6 and Schedule schema 3 are unchanged. Queued notices gain
+  a `kind` field. An older binary that rewrites the state drops it, and such
+  a notice is then sent as `update` under a different event id, so pager
+  does not refuse it; it loses the paused-wake delivery and may arrive
+  twice.
+- `--event` and `--kind` need a pager that accepts them (0.7.2 does).
+
 ## 0.7.0 — 2026-11-16
 
 ### Changed

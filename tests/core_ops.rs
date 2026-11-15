@@ -2949,3 +2949,44 @@ fn bu_depth_limit() {
     assert_eq!(formed.reason, Reason::DepthLimit);
     assert_eq!(s, before);
 }
+
+#[test]
+fn stop_work_notices_are_marked_for_release() {
+    let (mut s, a, b, c) = setup();
+    let kind_of_last = |s: &mut State| {
+        let kind = s.outbox.last().expect("a notice was queued").kind;
+        s.outbox.clear();
+        kind
+    };
+    let duty = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Update);
+
+    // A hold is spoken in a session of the team it covers.
+    let said = |seq: u64| Evidence {
+        session_id: "root-session".into(),
+        ..ev(seq)
+    };
+    ops::root_hold(&mut s, 21, &said(21), &duty, "until reviewed").unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+    ops::root_release(&mut s, 22, &said(22), &duty).unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Update);
+    ops::duty_cancel(&mut s, 23, &a, &duty, "no longer needed").unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+
+    let bu = ops::bu_open(&mut s, 24, &a, &b.member, None, &[], &scope())
+        .unwrap()
+        .ids[0]
+        .clone();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Update);
+    ops::bu_cancel(&mut s, 25, &a, &bu, "stop").unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+
+    ops::root_dismiss(&mut s, 26, &ev(26), "other").unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+    assert_eq!(s.members[&c.member].status, MemberStatus::Dismissed);
+    ops::root_cancel_team(&mut s, 27, &ev(27), "test").unwrap();
+    assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+}
