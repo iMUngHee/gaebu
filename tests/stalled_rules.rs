@@ -12,7 +12,7 @@ use gaebu::{
 };
 use serde_json::json;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
@@ -24,19 +24,70 @@ const MINUTE: Ms = 60_000;
 /// The threshold every test judges with.
 const AFTER: Ms = 10 * MINUTE;
 
-/// pager as a roster only: `None` makes the read fail.
-struct Roster(RefCell<Option<Hosts>>);
+/// One `pager send` as the fake received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sent {
+    target: String,
+    body: String,
+    event: String,
+    kind: NoticeKind,
+    automation: Option<(String, String)>,
+}
+
+/// pager as a roster and a sink for reports.
+struct Roster {
+    /// `None` makes the roster read fail.
+    hosts: RefCell<Option<Hosts>>,
+    /// Every `send` attempted, refused ones included.
+    sent: RefCell<Vec<Sent>>,
+    refuse: Cell<bool>,
+}
 
 impl Pager for Roster {
     fn whoami(&self, _: Option<&str>) -> Result<WhoAmI> {
         panic!("stall detection resolves no caller")
     }
     fn hosts(&self) -> Result<Hosts> {
-        self.0.borrow().clone().ok_or_else(|| {
+        self.hosts.borrow().clone().ok_or_else(|| {
             gaebu::error::Error::new(gaebu::Reason::PagerUnavailable, "roster unavailable")
         })
     }
-    fn send(&self, _: &Message<'_>) -> Result<()> {
+    fn send(&self, message: &Message<'_>) -> Result<()> {
+        self.sent.borrow_mut().push(Sent {
+            target: message.target.into(),
+            body: message.body.into(),
+            event: message.event.into(),
+            kind: message.kind,
+            automation: message
+                .automation
+                .map(|a| (a.name.to_owned(), a.task.to_owned())),
+        });
+        if self.refuse.get() {
+            return Err(gaebu::error::Error::new(
+                gaebu::Reason::PagerUnavailable,
+                "no alias matches",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The human's notifier: records each line; `fail` makes it report failure.
+#[derive(Default)]
+struct Notifier {
+    lines: RefCell<Vec<String>>,
+    fail: Cell<bool>,
+}
+
+impl stalled::notify::Human for Notifier {
+    fn tell(&self, body: &str) -> Result<()> {
+        self.lines.borrow_mut().push(body.to_owned());
+        if self.fail.get() {
+            return Err(gaebu::error::Error::new(
+                gaebu::Reason::PagerUnavailable,
+                "notifier failed",
+            ));
+        }
         Ok(())
     }
 }
@@ -48,6 +99,7 @@ struct World {
     dir: PathBuf,
     store: Store,
     pager: Roster,
+    human: Notifier,
     now: Ms,
 }
 
@@ -65,7 +117,12 @@ impl World {
             _cleanup: common::RemoveOnDrop(dir.clone()),
             dir,
             store,
-            pager: Roster(RefCell::new(Some(Hosts::all(HostStatus::Live)))),
+            pager: Roster {
+                hosts: RefCell::new(Some(Hosts::all(HostStatus::Live))),
+                sent: RefCell::new(Vec::new()),
+                refuse: Cell::new(false),
+            },
+            human: Notifier::default(),
             now,
         };
         world.tx(|st| {
@@ -175,6 +232,21 @@ impl World {
             .unwrap()
             .findings
     }
+    /// One `stalled --notify` run at `now`.
+    fn notify_at(&self, now: Ms) -> stalled::notify::Summary {
+        stalled::notify::run(&self.store, &self.pager, &self.human, AFTER, now).unwrap()
+    }
+    /// The sends attempted since the last call.
+    fn sends(&self) -> Vec<Sent> {
+        std::mem::take(&mut *self.pager.sent.borrow_mut())
+    }
+    /// The lines the human's notifier got since the last call.
+    fn told(&self) -> Vec<String> {
+        std::mem::take(&mut *self.human.lines.borrow_mut())
+    }
+    fn ledger(&self) -> PathBuf {
+        self.dir.join("runtime/stalled-notify.json")
+    }
     fn of(&self, kind: Kind) -> Vec<Finding> {
         self.findings()
             .into_iter()
@@ -194,7 +266,7 @@ impl World {
                 (name.to_owned(), status)
             })
             .collect();
-        *self.pager.0.borrow_mut() = Some(Hosts::from_rows(rows));
+        *self.pager.hosts.borrow_mut() = Some(Hosts::from_rows(rows));
     }
 }
 
@@ -559,7 +631,7 @@ fn kind_unknown_when_the_schedule_or_roster_cannot_be_read() {
     assert_eq!(unknown.len(), 1);
     assert_eq!(unknown[0].subject, w.team());
 
-    *w.pager.0.borrow_mut() = None;
+    *w.pager.hosts.borrow_mut() = None;
     let unknown = w.of(Kind::Unknown);
     assert!(unknown.iter().any(|f| f.subject == "pager"));
 }
@@ -591,12 +663,12 @@ fn routing_and_key() {
     w.gone("clerk");
     assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "boss");
     // With both gone, only the human is left.
-    *w.pager.0.borrow_mut() = Some(Hosts::from_rows(vec![
+    *w.pager.hosts.borrow_mut() = Some(Hosts::from_rows(vec![
         ("boss".into(), HostStatus::Gone),
         ("clerk".into(), HostStatus::Gone),
     ]));
     assert_eq!(w.of(Kind::IdleAfterStop)[0].report_to, Recipient::Human);
-    *w.pager.0.borrow_mut() = Some(Hosts::all(HostStatus::Live));
+    *w.pager.hosts.borrow_mut() = Some(Hosts::all(HostStatus::Live));
 
     // The manager is never told about its own rest.
     let clerk_duty = w.accepted("clerk");
@@ -864,4 +936,520 @@ fn a_held_unit_waits_on_nobody() {
     });
     assert_eq!(w.of(Kind::TeamIdle).len(), 1);
     assert_eq!(w.of(Kind::SeatPending).len(), 1);
+}
+
+/// The human's words in the commander's session, for a hold or its release.
+fn said(seq: u64) -> Evidence {
+    Evidence {
+        session_id: "s-boss".into(),
+        prompt_seq: seq,
+        sha256: format!("hash{seq}"),
+        attest: Attest::Fixture,
+        quote: "wait".into(),
+        at: now_ms(),
+        strength: Strength::Explicit,
+    }
+}
+
+#[test]
+fn notify_sends_one_message_per_finding() {
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.stops("aide", 30);
+    // A second duty that cannot be judged: listed, never sent.
+    w.accepted("clerk");
+    w.stops("clerk", 30);
+    w.store
+        .session("s-clerk")
+        .mark_unrecorded(w.now - 20 * MINUTE)
+        .unwrap();
+    let finding = w.of(Kind::IdleAfterStop).remove(0);
+    assert_eq!(w.of(Kind::Unknown).len(), 1);
+
+    let done = w.notify_at(w.now);
+    assert_eq!(
+        (done.sent, done.human, done.failed, done.deferred),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(
+        w.sends(),
+        [Sent {
+            target: "boss".into(),
+            body: format!(
+                "[어사대] 소임 {duty}의 담당 aide가 쉬는 것으로 관측됨 (1회차). 확인: gaebu stalled"
+            ),
+            event: format!("{}-{}-r1", finding.key, w.now),
+            kind: NoticeKind::Failure,
+            automation: Some(("gaebu-stalled".into(), w.team())),
+        }]
+    );
+    assert!(w.told().is_empty());
+}
+
+#[test]
+fn notify_bodies_name_what_each_kind_observed() {
+    let w = World::new();
+    // host_gone, and a seat never confirmed.
+    let gone_duty = w.accepted("aide");
+    w.gone("aide");
+    let clerk = w.id("clerk");
+    w.tx(|st| {
+        let binding = &mut st.members.get_mut(&clerk).unwrap().binding;
+        binding.state = BindingState::Pending;
+        binding.designated_at = w.now - 20 * MINUTE;
+        Ok(())
+    });
+    w.notify_at(w.now);
+    let mut bodies: Vec<String> = w.sends().into_iter().map(|sent| sent.body).collect();
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        [
+            "[어사대] clerk의 자리가 아직 확정되지 않음 (1회차). 확인: gaebu stalled".to_owned(),
+            format!(
+                "[어사대] 소임 {gone_duty}의 담당 aide 세션이 떠난 것으로 보임 (1회차). 확인: gaebu stalled"
+            ),
+        ]
+    );
+
+    // A proposed duty and a ready item, each waiting on a resting member.
+    let w = World::new();
+    let proposed = w.proposes("aide");
+    w.stops("aide", 30);
+    let clerk = w.id("clerk");
+    w.schedule();
+    let item = w.item("ready work");
+    w.tx(|st| {
+        st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
+        Ok(())
+    });
+    w.stops("boss", 30);
+    // Adding the item flushed the duty's own notice through pager.
+    w.sends();
+    w.notify_at(w.now);
+    let mut bodies: Vec<String> = w.sends().into_iter().map(|sent| sent.body).collect();
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        [
+            format!(
+                "[어사대] 소임 {proposed}가 aide를 기다리는데 쉬는 것으로 관측됨 (1회차). 확인: gaebu stalled"
+            ),
+            format!(
+                "[어사대] 일정 {item}가 배분 가능한데 boss가 쉬는 것으로 관측됨 (1회차). 확인: gaebu stalled"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn notify_rounds_back_off() {
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).sent, 1);
+    let first = w.sends().remove(0);
+
+    // Nothing more until the interval has passed.
+    assert_eq!(w.notify_at(t).sent, 0);
+    assert_eq!(w.notify_at(t + AFTER - 1).sent, 0);
+    assert!(w.sends().is_empty());
+
+    // Round two after the threshold, round three after twice that.
+    let t2 = t + AFTER;
+    assert_eq!(w.notify_at(t2).sent, 1);
+    let second = w.sends().remove(0);
+    assert_eq!(second.event, first.event.replace("-r1", "-r2"));
+    assert_eq!(second.body, first.body.replace("1회차", "2회차"));
+    assert_eq!(w.notify_at(t2 + 2 * AFTER - 1).sent, 0);
+    let t3 = t2 + 2 * AFTER;
+    assert_eq!(w.notify_at(t3).sent, 1);
+    assert_eq!(w.sends()[0].event, first.event.replace("-r1", "-r3"));
+
+    // Then the human, once, and nobody after that.
+    assert_eq!(w.notify_at(t3 + 4 * AFTER - 1).human, 0);
+    let last = w.notify_at(t3 + 4 * AFTER);
+    assert_eq!((last.sent, last.human), (0, 1));
+    let told = w.told();
+    assert_eq!(told.len(), 1);
+    assert!(told[0].starts_with("[어사대] 소임 "), "{}", told[0]);
+    assert!(
+        told[0].ends_with("세 번 알린 뒤에도 그대로임"),
+        "{}",
+        told[0]
+    );
+    let later = w.notify_at(t3 + 100 * AFTER);
+    assert_eq!((later.sent, later.human, later.failed), (0, 0, 0));
+    assert!(w.sends().is_empty());
+    assert!(w.told().is_empty());
+}
+
+#[test]
+fn notify_survives_failure() {
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+
+    // pager refuses: the round is not counted, and the retry is the same
+    // event with the same text.
+    w.pager.refuse.set(true);
+    let failed = w.notify_at(t);
+    assert_eq!((failed.sent, failed.failed), (0, 1));
+    let first = w.sends().remove(0);
+    w.pager.refuse.set(false);
+    assert_eq!(w.notify_at(t + 1).sent, 1);
+    assert_eq!(w.sends(), std::slice::from_ref(&first));
+    // Sent now: the next attempt is round two, on schedule.
+    assert_eq!(w.notify_at(t + 2).sent, 0);
+    // A later round that pager refuses is retried on the next run, not
+    // after another whole interval.
+    w.pager.refuse.set(true);
+    assert_eq!(w.notify_at(t + 1 + AFTER).failed, 1);
+    w.pager.refuse.set(false);
+    assert_eq!(w.notify_at(t + 2 + AFTER).sent, 1);
+    let second = w.sends();
+    assert_eq!(second.len(), 2);
+    assert_eq!(second[0], second[1]);
+    assert!(second[0].event.ends_with("-r2"));
+
+    // A recipient pager can never resolve: three tries, then the human.
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    w.pager.refuse.set(true);
+    for attempt in 0..3 {
+        let run = w.notify_at(t + attempt);
+        assert_eq!((run.sent, run.failed), (0, 1));
+    }
+    let attempts = w.sends();
+    assert_eq!(attempts.len(), 3);
+    assert!(attempts.iter().all(|sent| sent == &attempts[0]));
+    let told = w.told();
+    assert_eq!(told.len(), 1);
+    assert!(told[0].ends_with("알림을 전달하지 못함"), "{}", told[0]);
+    let after = w.notify_at(t + 10);
+    assert_eq!((after.sent, after.failed, after.human), (0, 0, 0));
+    assert!(w.sends().is_empty());
+}
+
+#[test]
+fn notify_recurrence_and_recipient() {
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).sent, 1);
+    let first = w.sends().remove(0);
+
+    // A hold hides the finding for a run; the wait behind it did not end.
+    w.tx(|st| ops::root_hold(st, now_ms(), &said(1), &duty, "a moment"));
+    assert_eq!(w.notify_at(t + 1).sent, 0);
+    w.tx(|st| ops::root_release(st, now_ms(), &said(2), &duty));
+    assert_eq!(w.notify_at(t + 2).sent, 0);
+    assert_eq!(w.notify_at(t + AFTER).sent, 1);
+    assert_eq!(w.sends()[0].event, first.event.replace("-r1", "-r2"));
+
+    // Another member becomes the one to tell: that is a first report.
+    let clerk = w.id("clerk");
+    w.schedule();
+    w.tx(|st| {
+        st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
+        Ok(())
+    });
+    assert_eq!(w.notify_at(t + AFTER + 1).sent, 1);
+    let to_clerk = w.sends().remove(0);
+    assert_eq!(to_clerk.target, "clerk");
+    assert!(to_clerk.event.ends_with(&format!("-{}-r1", t + AFTER + 1)));
+
+    // Unseen for a week, the entry goes; the same finding then starts over
+    // under an event pager has not seen.
+    w.tx(|st| ops::root_hold(st, now_ms(), &said(3), &duty, "a week"));
+    let week = 7 * 24 * 60 * MINUTE;
+    w.notify_at(t + 2 * AFTER);
+    w.notify_at(t + 2 * AFTER + week - 1);
+    assert!(
+        fs::read_to_string(w.ledger())
+            .unwrap()
+            .contains(&to_clerk.body)
+    );
+    w.notify_at(t + 2 * AFTER + week);
+    assert!(
+        !fs::read_to_string(w.ledger())
+            .unwrap()
+            .contains(&to_clerk.body)
+    );
+    w.tx(|st| ops::root_release(st, now_ms(), &said(4), &duty));
+    let back = t + 3 * AFTER + week;
+    assert_eq!(w.notify_at(back).sent, 1);
+    let again = w.sends().remove(0);
+    assert_eq!(again.body, to_clerk.body);
+    assert!(again.event.ends_with(&format!("-{back}-r1")));
+    assert_ne!(again.event, to_clerk.event);
+}
+
+#[test]
+fn notify_recovers_from_corrupt_record() {
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+    w.notify_at(t);
+    let before = w.sends().remove(0);
+    fs::write(w.ledger(), "{ not json").unwrap();
+
+    let run = w.notify_at(t + 5);
+    // The unreadable file is kept aside and the human hears of it once.
+    let aside = w
+        .dir
+        .join(format!("runtime/stalled-notify.corrupt-{}.json", t + 5));
+    assert_eq!(fs::read_to_string(&aside).unwrap(), "{ not json");
+    let told = w.told();
+    assert_eq!(told.len(), 1);
+    assert!(told[0].contains("보낸 기록을 읽을 수 없어"), "{}", told[0]);
+    // Rounds restart under events that cannot collide with the lost ones.
+    assert_eq!((run.sent, run.human), (1, 1));
+    let after = w.sends().remove(0);
+    assert_eq!(after.body, before.body);
+    assert_ne!(after.event, before.event);
+    assert!(after.event.ends_with(&format!("-{}-r1", t + 5)));
+    assert!(w.notify_at(t + 6).human == 0 && w.told().is_empty());
+}
+
+#[test]
+fn notify_human_path() {
+    // No member can be told about a resting commander.
+    let w = World::new();
+    w.stops("boss", 30);
+    let run = w.notify_at(w.now);
+    assert_eq!((run.sent, run.human), (0, 1));
+    assert_eq!(
+        w.told(),
+        [
+            "[어사대] 팀 watch에 열린 소임과 일정이 없고 지휘관이 쉬는 것으로 관측됨. 확인: gaebu stalled — 보고받을 구성원이 없음"
+        ]
+    );
+    assert!(w.sends().is_empty());
+    // Once per finding.
+    assert_eq!(w.notify_at(w.now + 100 * AFTER).human, 0);
+    assert!(w.told().is_empty());
+
+    // A notifier that keeps failing is tried three times and left alone.
+    let w = World::new();
+    w.stops("boss", 30);
+    w.human.fail.set(true);
+    for _ in 0..3 {
+        let run = w.notify_at(w.now);
+        assert_eq!((run.human, run.failed), (0, 1));
+    }
+    assert_eq!(w.told().len(), 3);
+    let run = w.notify_at(w.now);
+    assert_eq!((run.human, run.failed), (0, 0));
+    assert!(w.told().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn notify_human_command_gets_the_line_as_data() {
+    use stalled::notify::{Human, Shell};
+    let dir = std::env::temp_dir().join(format!("gaebu-notifier-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let _cleanup = common::RemoveOnDrop(dir.clone());
+    let out = dir.join("out");
+    let line = format!(
+        "stop; touch {0}/a $(touch {0}/b) `touch {0}/c`",
+        dir.display()
+    );
+    let timeout = std::time::Duration::from_secs(10);
+    let shell = Shell {
+        command: Some(format!(
+            "printf '%s' \"$GAEBU_STALLED_BODY\" > '{}'",
+            out.display()
+        )),
+        timeout,
+    };
+    shell.tell(&line).unwrap();
+    assert_eq!(fs::read_to_string(&out).unwrap(), line);
+    // Nothing in the line ran.
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+    let failing = Shell {
+        command: Some("exit 3".into()),
+        timeout,
+    };
+    assert!(failing.tell("x").is_err());
+    // A notifier that hangs is cut off instead of holding the run.
+    let hanging = Shell {
+        command: Some("sleep 30".into()),
+        timeout: std::time::Duration::from_millis(200),
+    };
+    let started = std::time::Instant::now();
+    let cut = hanging.tell("x").unwrap_err();
+    assert!(cut.message.contains("timed out"), "{cut}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // Without a command the line goes to standard error.
+    Shell {
+        command: None,
+        timeout,
+    }
+    .tell("printed")
+    .unwrap();
+}
+
+#[test]
+fn notify_refuses_a_ledger_it_cannot_read() {
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    // Not missing and not garbled: unreadable. Starting over from nothing
+    // would send every round again.
+    fs::create_dir_all(w.ledger()).unwrap();
+    assert!(stalled::notify::run(&w.store, &w.pager, &w.human, AFTER, w.now).is_err());
+    assert!(w.sends().is_empty());
+}
+
+#[test]
+fn notify_caps_and_prunes() {
+    let w = World::new();
+    for _ in 0..7 {
+        w.accepted("aide");
+    }
+    w.stops("aide", 30);
+    let first = w.notify_at(w.now);
+    assert_eq!((first.sent, first.deferred), (5, 2));
+    let sent = w.sends();
+    assert!(sent.iter().all(|s| s.target == "boss"));
+    // The two held back go out next, and the five already sent do not repeat.
+    let second = w.notify_at(w.now + 1);
+    assert_eq!((second.sent, second.deferred), (2, 0));
+    let rest = w.sends();
+    assert!(rest.iter().all(|s| !sent.contains(s)));
+    assert_eq!(w.notify_at(w.now + 2).sent, 0);
+}
+
+#[test]
+fn notify_leaves_state_alone() {
+    let w = World::new();
+    w.schedule();
+    w.item("ready work");
+    w.accepted("aide");
+    w.stops("aide", 30);
+    w.stops("boss", 30);
+    let before = snapshot(&w.dir);
+
+    let run = w.notify_at(w.now);
+    assert!(run.sent + run.human >= 2);
+    let after = snapshot(&w.dir);
+    let home = w.dir.join("runtime");
+    let own = [
+        home.join("stalled-notify.json"),
+        home.join("stalled-notify.lock"),
+    ];
+    // Nothing it read was written, and it wrote only its own two files.
+    for (path, bytes) in &before {
+        assert_eq!(after.get(path), Some(bytes), "{}", path.display());
+    }
+    let new: Vec<_> = after
+        .keys()
+        .filter(|path| !before.contains_key(*path))
+        .collect();
+    assert_eq!(new, own.iter().collect::<Vec<_>>());
+}
+
+/// Against a real pager 0.8.0 or later. Run with `PAGER_DB` pointing at a
+/// scratch database and `GAEBU_TEST_PAGER` at the binary:
+/// `cargo test --test stalled_rules real_pager -- --ignored`.
+#[test]
+#[ignore = "needs a pager binary and a scratch PAGER_DB"]
+fn real_pager_delivers_an_automation_report() {
+    use gaebu::pager::CliPager;
+    use std::process::Command;
+    let program = PathBuf::from(std::env::var("GAEBU_TEST_PAGER").expect("GAEBU_TEST_PAGER"));
+    let db = std::env::var("PAGER_DB").expect("PAGER_DB must name a scratch database");
+    assert!(!db.contains(".pager/msg.db"), "refusing the real inbox");
+    let run = |args: &[&str]| {
+        let out = Command::new(&program).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&[
+        "attach",
+        "--session",
+        "s-boss",
+        "--tool",
+        "claude",
+        "--root",
+        "/tmp",
+    ]);
+    run(&["alias", "boss", "--session", "s-boss"]);
+
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.stops("aide", 30);
+    let pager = CliPager {
+        timeout: std::time::Duration::from_secs(5),
+        program: program.clone(),
+    };
+    // The roster of the scratch database knows none of the team: unknown
+    // hosts keep their seats and stay eligible recipients.
+    let first = stalled::notify::run(&w.store, &pager, &w.human, AFTER, w.now).unwrap();
+    assert_eq!((first.sent, first.failed), (1, 0));
+    let inbox = run(&["ls", "--session", "s-boss"]);
+    assert_eq!(
+        inbox.matches("automation:gaebu-stalled").count(),
+        1,
+        "{inbox}"
+    );
+    assert!(inbox.contains(&duty), "{inbox}");
+
+    // A second run sends nothing, and resending round one by hand is the
+    // same pager message.
+    let second = stalled::notify::run(&w.store, &pager, &w.human, AFTER, w.now + 1).unwrap();
+    assert_eq!(second.sent, 0);
+    fs::remove_file(w.ledger()).unwrap();
+    let third = stalled::notify::run(&w.store, &pager, &w.human, AFTER, w.now).unwrap();
+    assert_eq!(third.sent, 1);
+    let inbox = run(&["ls", "--session", "s-boss"]);
+    assert_eq!(
+        inbox.matches("automation:gaebu-stalled").count(),
+        1,
+        "{inbox}"
+    );
+}
+
+#[test]
+fn notify_reads_what_a_person_or_an_older_release_left() {
+    // Bytes that are not text are set aside like any ledger that cannot be
+    // parsed, instead of stopping every run.
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    fs::write(w.ledger(), [0xff, 0xfe, 0x00]).unwrap();
+    let run = w.notify_at(w.now);
+    assert_eq!((run.sent, run.human), (1, 1));
+    assert!(w.told()[0].contains("보낸 기록을 읽을 수 없어"));
+
+    // An entry with fields missing and a round no run would write: it is
+    // read, and counts as past its last round.
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    w.notify_at(w.now);
+    w.sends();
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(w.ledger()).unwrap()).unwrap();
+    for entry in ledger["entries"].as_object_mut().unwrap().values_mut() {
+        let first_seen = entry["first_seen"].clone();
+        *entry = json!({"first_seen": first_seen, "round": 900, "sent": true});
+    }
+    fs::write(w.ledger(), ledger.to_string()).unwrap();
+    let run = w.notify_at(w.now + 1);
+    assert_eq!((run.sent, run.human), (0, 1));
+    assert!(w.sends().is_empty());
+    assert!(w.told()[0].ends_with("세 번 알린 뒤에도 그대로임"));
 }

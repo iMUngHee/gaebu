@@ -9,6 +9,33 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.9.0 — 2026-11-16
+
+### Added
+
+- `gaebu stalled --notify` reports each stall finding that is due, for a
+  timer to run. A member in `report_to` gets one pager message per finding
+  from the sessionless sender `automation:gaebu-stalled`, in at most three
+  rounds at growing intervals; then, or when nobody can be told or a report
+  cannot be delivered, the human is told once through the command in
+  `GAEBU_STALLED_NOTIFY` (the line arrives in `GAEBU_STALLED_BODY`), or on
+  standard error. See [reporting findings](docs/stalled.md#reporting-findings)
+  for the rounds, the limits and timer examples.
+- What was sent is kept in `stalled-notify.json` in the Gaebu home, with
+  `stalled-notify.lock` beside it. The state, the session logs and the
+  Schedules are still only read.
+- Findings carry `team_name`.
+
+### Compatibility
+
+- Runtime schema 6 and Schedule schema 3 are unchanged.
+- `--notify` needs pager 0.8.0 or later for `--automation`. With an older
+  pager every send fails and, after three runs, the human is told instead.
+  pager 0.8.0 moves its own database to a schema older pagers cannot open:
+  upgrade the installed pager and restart running pager MCP servers
+  together. `gaebu stalled` without `--notify` works with any pager.
+- Registering the timer is left to the machine's own setup.
+
 ## 0.8.0 — 2026-11-16
 
 ### Added

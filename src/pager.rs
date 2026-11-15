@@ -64,6 +64,16 @@ pub struct Message<'a> {
     /// storing a retry by the same sender as new mail.
     pub event: &'a str,
     pub kind: NoticeKind,
+    /// Set when no session is sending: a timer. pager shows the sender as
+    /// `automation:<name>` and scopes the event to the name and task.
+    pub automation: Option<Automation<'a>>,
+}
+
+/// pager's sessionless sender (`--automation <name> --task <task>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Automation<'a> {
+    pub name: &'a str,
+    pub task: &'a str,
 }
 
 pub trait Pager {
@@ -107,16 +117,18 @@ impl Pager for CliPager {
 /// The arguments after `pager`. Flags precede `--` so a target or body that
 /// starts with a dash is still read as text.
 pub fn send_args<'a>(message: &Message<'a>) -> Vec<&'a str> {
-    vec![
+    let mut args = vec![
         "send",
         "--event",
         message.event,
         "--kind",
         message.kind.as_str(),
-        "--",
-        message.target,
-        message.body,
-    ]
+    ];
+    if let Some(automation) = message.automation {
+        args.extend(["--automation", automation.name, "--task", automation.task]);
+    }
+    args.extend(["--", message.target, message.body]);
+    args
 }
 
 impl CliPager {
@@ -284,6 +296,7 @@ pub fn flush_outbox(store: &Store, pager: &dyn Pager) {
             body: &n.body,
             event: &event,
             kind: n.kind,
+            automation: None,
         };
         match pager.send(&message) {
             Ok(()) => delivered.push(n.id.clone()),

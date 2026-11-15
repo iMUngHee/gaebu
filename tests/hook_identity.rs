@@ -178,6 +178,7 @@ fn cli_pager_runs_pager_with_the_documented_arguments() {
             body: "--human is only text here",
             event: "gaebu-r-n-1-release",
             kind: NoticeKind::Release,
+            automation: None,
         })
         .unwrap();
     assert_eq!(

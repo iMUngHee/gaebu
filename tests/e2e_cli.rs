@@ -1708,6 +1708,7 @@ fn pager_send_arguments_keep_text_after_the_separator() {
         body: "--human is only text here",
         event: "gaebu-r-n-1-release",
         kind: gaebu::model::NoticeKind::Release,
+        automation: None,
     };
     assert_eq!(
         gaebu::pager::send_args(&message),

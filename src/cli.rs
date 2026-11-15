@@ -156,6 +156,10 @@ enum Cmd {
         /// Minutes a wait must have lasted to be listed.
         #[arg(long, default_value_t = 10)]
         after: u64,
+        /// Report each finding instead of listing it: to a member through
+        /// pager, to the human through `GAEBU_STALLED_NOTIFY`. For a timer.
+        #[arg(long)]
+        notify: bool,
     },
     /// Archive eligible terminal runtime history.
     Compact {
@@ -1005,10 +1009,28 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
             })
         }
         Cmd::Schedule(cmd) => crate::schedule::run_cli(cmd, json, pager),
-        Cmd::Stalled { after } => {
+        Cmd::Stalled { after, notify } => {
             let store = open_store()?;
-            let report =
-                crate::stalled::find(&store, pager, after.saturating_mul(60_000), now_ms())?;
+            let after = after.saturating_mul(60_000);
+            if notify {
+                let human = crate::stalled::notify::Shell {
+                    command: std::env::var("GAEBU_STALLED_NOTIFY")
+                        .ok()
+                        .filter(|command| !command.trim().is_empty()),
+                    timeout: crate::stalled::notify::HUMAN_TIMEOUT,
+                };
+                let done = crate::stalled::notify::run(&store, pager, &human, after, now_ms())?;
+                if json {
+                    print_json(&done);
+                } else {
+                    println!(
+                        "[어사대] 보냄 {} · 대협에게 {} · 실패 {} · 미룸 {}",
+                        done.sent, done.human, done.failed, done.deferred
+                    );
+                }
+                return Ok(());
+            }
+            let report = crate::stalled::find(&store, pager, after, now_ms())?;
             if json {
                 print_json(&report);
             } else {

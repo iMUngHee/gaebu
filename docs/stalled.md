@@ -67,8 +67,8 @@ duty vacant; the finding stays.
 
 Each finding carries `report_to`: the team's Schedule manager, else its
 commander, else the human. A member is skipped when it is the one waited on,
-holds no confirmed seat, or has a host pager reports gone. The command only
-computes this; it sends nothing.
+holds no confirmed seat, or has a host pager reports gone. Without
+`--notify` the command only computes this and sends nothing.
 
 ## Keys
 
@@ -92,3 +92,127 @@ The session is part of the key because event numbers count within one
 session only. The member who would hear of the finding is not part of it.
 A hold, or one failed read, can hide a finding and bring it back under the
 same key: the wait did not end in between.
+
+## Reporting findings
+
+```sh
+gaebu stalled --notify            # report what is due, then exit
+gaebu stalled --notify --after 30
+```
+
+`--notify` is meant for a timer. It finds the same stalls and reports each
+one that is due: to the member in `report_to` through pager, or to the human
+through a command the human configures. `unknown` findings are never
+reported; they only appear in the list.
+
+It still writes nothing to the state, the session logs or the Schedules. It
+keeps its own two files in the Gaebu home: `stalled-notify.json`, the ledger
+of what was sent, and `stalled-notify.lock`, so that a timer and a person do
+not run it at once.
+
+### To a member
+
+Each finding is one pager message, sent without a session:
+
+```sh
+pager send --event <key>-<first seen>-r<round> --kind failure \
+  --automation gaebu-stalled --task <team id> -- <alias> <text>
+```
+
+The recipient sees the sender `automation:gaebu-stalled`. The wake arrives as
+an ordinary pager poke, which Gaebu's hook never takes for the human's words,
+so a report cannot authorize a root directive. This needs pager 0.8.0 or
+later; an older pager refuses `--automation` and the send counts as failed.
+
+- **Rounds.** The first report goes out when the finding is first seen, the
+  second `--after` minutes after the first was accepted, the third twice
+  that later. If the finding is still there four times `--after` after the
+  third, the human is told once and that finding is not reported again.
+- **One text per round.** The text holds nothing that changes between runs.
+  A run that dies between recording a round and sending it sends the same
+  event and text again, which pager treats as the message it already has.
+- **Failures.** A send pager rejects leaves the round as it was. After three
+  rejections of the same round the human is told instead, so a recipient
+  pager cannot resolve is not retried by every run for ever. "Accepted" means
+  pager stored the message, not that anyone read it.
+- **Limit.** One member gets at most five reports from one run. The rest go
+  out on later runs.
+- **A change of recipient** starts over at round one for the new recipient.
+- **A finding that goes away** keeps its rounds for seven days. If it comes
+  back under the same key, as it does after a hold is lifted, the rounds
+  continue where they stopped. After seven days the entry is dropped, and a
+  later return starts at round one under an event pager has not seen.
+
+### To the human
+
+The human is told when a finding has nobody to report to, when three rounds
+changed nothing, and when a report could not be delivered. Set
+`GAEBU_STALLED_NOTIFY` to a command:
+
+```sh
+export GAEBU_STALLED_NOTIFY='notify-send "개부" "$GAEBU_STALLED_BODY"'
+```
+
+The command runs through `sh -c` with the line in `GAEBU_STALLED_BODY`. The
+line is never part of the command text. What the command prints goes to
+standard error, and so does the line itself when the variable is not set, so
+standard output carries only the run's summary. The shell is killed if it
+has not finished in 30 seconds; a process it started in the background can
+outlive it. Each line is delivered once; a command that fails is tried on
+three runs and then given up with a line on standard error. `sh` has to
+exist, which on Windows it does not by default. If the run dies after the command
+succeeded and before that is recorded, the line is delivered once more.
+
+### When the ledger cannot be read
+
+A ledger that does not parse is moved to
+`stalled-notify.corrupt-<time>.json`, the human is told, and an empty ledger
+takes its place. Findings still present then get up to three rounds again,
+under new events. A ledger that cannot be opened at all stops the run with
+an error and nothing is sent.
+
+### Timers
+
+Run it as the user who owns the Gaebu home and the pager database, every few
+minutes. The interval only decides how soon a due report goes out; rounds
+are spaced by `--after`.
+
+systemd (`~/.config/systemd/user/gaebu-stalled.service` and `.timer`):
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gaebu stalled --notify
+```
+
+```ini
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+Give the service `GAEBU_STALLED_NOTIFY` through an `EnvironmentFile=`.
+
+launchd (`~/Library/LaunchAgents/dev.gaebu.stalled.plist`): a job whose
+`ProgramArguments` are `gaebu`, `stalled`, `--notify` with `StartInterval`
+set to `300`.
+
+Windows Task Scheduler:
+
+```powershell
+schtasks /Create /SC MINUTE /MO 5 /TN gaebu-stalled /TR "gaebu stalled --notify"
+```
+
+These three entries are sketches: none of them has been installed and run.
+The command they run has.
+
+### Moving to pager 0.8.0
+
+pager 0.8.0 moves its database to schema 6, which an older pager cannot
+open. Upgrade the installed pager, then restart every running pager MCP
+server and session that holds the old binary. Until then `--notify` fails
+its sends and reports nothing to members; `gaebu stalled` without `--notify`
+works with any pager.

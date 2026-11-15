@@ -1,10 +1,13 @@
 //! Stall detection: work that waits on a session observed to be resting.
 //!
-//! Reading only. Nothing here refreshes bindings or writes the state, a
+//! Detection reads only: it never refreshes bindings or writes the state, a
 //! session log or a Schedule, so a timer may run it as often as it likes.
+//! `notify` adds reporting, which keeps a ledger of its own beside them.
 //! A finding is an observation, not a verdict: "resting" means a `Stop` was
 //! recorded and no later turn was, which a person typing to that session and
 //! a turn the hook failed to record both look like.
+
+pub mod notify;
 
 use crate::authz;
 use crate::error::Result;
@@ -56,6 +59,7 @@ pub enum Recipient {
 pub struct Finding {
     pub kind: Kind,
     pub team: String,
+    pub team_name: String,
     /// The seat, duty, Schedule item or team the finding is about.
     pub subject: String,
     pub waiting_on: Option<Party>,
@@ -244,9 +248,16 @@ impl<'a> Scan<'a> {
             waited,
             anchor,
         ]);
+        let team_name = self
+            .st
+            .teams
+            .get(team)
+            .map(|team| team.name.clone())
+            .unwrap_or_default();
         self.findings.push(Finding {
             kind,
             team: team.into(),
+            team_name,
             subject: subject.into(),
             waiting_on: waiting,
             report_to,

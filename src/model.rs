@@ -481,6 +481,8 @@ pub enum NoticeKind {
     Update,
     /// The recipient has to stop something: a cancellation, dismissal or hold.
     Release,
+    /// Something is unresolved and nobody is acting on it: a stall report.
+    Failure,
 }
 
 impl NoticeKind {
@@ -488,6 +490,7 @@ impl NoticeKind {
         match self {
             NoticeKind::Update => "update",
             NoticeKind::Release => "release",
+            NoticeKind::Failure => "failure",
         }
     }
 }
