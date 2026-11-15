@@ -173,6 +173,7 @@ fn caller(session: &str) -> Caller {
         session_id: session.into(),
         tool: Some(Tool::Codex),
         source: Source::PagerNative,
+        alias: None,
     }
 }
 fn words(session: &str, at: u64, quote: &str) -> Evidence {

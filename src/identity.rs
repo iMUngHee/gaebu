@@ -26,6 +26,8 @@ pub struct Caller {
     pub session_id: String,
     pub tool: Option<Tool>,
     pub source: Source,
+    /// The pager alias of this session, when pager reported one.
+    pub alias: Option<String>,
 }
 
 impl Caller {
@@ -51,6 +53,7 @@ pub fn from_pager(p: &dyn Pager) -> Result<Caller> {
         session_id: who.session_id,
         tool,
         source,
+        alias: who.alias,
     })
 }
 
@@ -80,6 +83,7 @@ pub fn for_mcp(p: &dyn Pager, store: &Store, thread_id: Option<&str>) -> Result<
             session_id: id.into(),
             tool: Some(Tool::Codex),
             source: Source::McpThreadMeta,
+            alias: None,
         });
     }
     let caller = from_pager(p)?;

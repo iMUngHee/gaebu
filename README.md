@@ -54,7 +54,9 @@ See [schedules and nested units](docs/schedules.md) for setup and recovery.
    nawi를 속관으로 주마." The agent interprets it and runs
    `gaebu appoint`/`gaebu assign`. It quotes the user's words with
    `--evidence`, and Gaebu checks that the quote really is in that session's
-   current user prompt. Peer and pager text does not count.
+   current user prompt. Peer and pager text does not count. A seat for the
+   session that ran the command is bound at once; every other seat is
+   pending until its own session's hook confirms it.
 2. The commander organizes autonomously. It can open a 부 (`gaebu bu open`)
    and issue duties (`gaebu duty issue`). Subordinates may sub-delegate within
    what they were given.

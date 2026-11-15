@@ -630,7 +630,11 @@ fn root_op(
                 "the current prompt changed while waiting; restate the instruction",
             ));
         }
-        f(st, now, &ev)
+        let mut out = f(st, now, &ev)?;
+        if let (Some(alias), Some(tool)) = (&caller.alias, caller.tool) {
+            ops::bind_own_seat(st, now, &caller.session_id, tool, alias, &mut out)?;
+        }
+        Ok(out)
     })?;
     crate::compact::auto(store, "", None);
     print_outcome(json, &out);

@@ -91,6 +91,7 @@ impl Fixture {
             session_id: session.into(),
             tool: Some(Tool::Codex),
             source: CallerSource::PagerNative,
+            alias: None,
         };
         let root = caller("root-session");
         let worker = caller("worker-session");
@@ -425,6 +426,7 @@ fn separate_manager_can_route_work_but_cannot_command_sibling_worker() {
         session_id: "manager-session".into(),
         tool: Some(Tool::Codex),
         source: CallerSource::PagerNative,
+        alias: None,
     };
     assert_eq!(
         f.call(
@@ -779,6 +781,7 @@ fn each_runtime_contract_corruption_refuses_worker_acceptance_without_commit() {
                 session_id: "manager-session".into(),
                 tool: Some(Tool::Codex),
                 source: CallerSource::PagerNative,
+                alias: None,
             }
         } else {
             f.worker.clone()
@@ -928,6 +931,7 @@ fn task_master_ownership_needs_a_real_accepted_superior_duty_for_leases() {
         session_id: "manager-session".into(),
         tool: Some(Tool::Codex),
         source: CallerSource::PagerNative,
+        alias: None,
     };
     assert_eq!(
         schedule::transaction(&f.store, &master, |st, actor| ops::lease_acquire(
@@ -1128,6 +1132,7 @@ fn schedule_dispatch_child() {
         session_id: "root-session".into(),
         tool: Some(Tool::Codex),
         source: CallerSource::PagerNative,
+        alias: None,
     };
     schedule::call(&store,&QuietPager,&caller,"schedule_dispatch",&json!({"item":item,"key":"api","assignee":worker,"spec":{"intent":"why","outcome":"result","scope":["src/**"],"decision_rights":"internals","escalate_on":[],"done_criteria":"tests"}})).unwrap();
 }

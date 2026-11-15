@@ -202,6 +202,14 @@ pub fn root_assign(
     for alias in aliases {
         let key = root_key(ev, "assign", alias);
         if st.root_actions.contains_key(&key) {
+            // Report the active seat holding this alias, so a repeat can
+            // still bind a caller's own pending seat.
+            ids.extend(
+                st.members
+                    .values()
+                    .find(|m| m.status == MemberStatus::Active && m.binding.alias == *alias)
+                    .map(|m| m.id.clone()),
+            );
             continue;
         }
         if alias == to_alias {
@@ -347,7 +355,7 @@ pub fn root_rebind(
         .unwrap_or_else(|| st.teams[&m.team].commander.clone());
     rebind(st, now, &author, &m.id, new_alias)?;
     root_done(st, now, ev, key, &m.team);
-    Ok(out("rebind pending", vec![m.id]))
+    Ok(out("rebound; awaiting target hook", vec![m.id]))
 }
 
 // ----- binding lifecycle (hook / observers) -----
@@ -543,6 +551,64 @@ pub fn confirm_binding(
         );
     }
     Ok(id)
+}
+
+/// Bind the seat a root directive just created or re-pointed when it is the
+/// caller's own. That seat's session is the one running the directive, so no
+/// later hook would be woken to confirm it and the seat would stay pending.
+pub fn bind_own_seat(
+    st: &mut State,
+    now: Ms,
+    session_id: &str,
+    tool: Tool,
+    alias: &str,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    let own = outcome.ids.iter().any(|id| {
+        st.members.get(id).is_some_and(|m| {
+            m.status == MemberStatus::Active
+                && m.binding.state == BindingState::Pending
+                && m.binding.alias == alias
+                && !authz::bu_cancelled(st, &m.bu)
+        })
+    });
+    if !own {
+        return Ok(());
+    }
+    // `confirm_binding` leaves the seat pending for a session bound elsewhere,
+    // and the hook skips pending checks for a session it already knows.
+    if let Some(held) = st.members.values().find(|m| {
+        m.status == MemberStatus::Active
+            && m.binding.state == BindingState::Bound
+            && m.binding.session_id.as_deref() == Some(session_id)
+    }) {
+        return refuse(
+            Reason::Conflict,
+            format!(
+                "this session already holds seat {}; dismiss or rebind it first",
+                held.id
+            ),
+        );
+    }
+    if confirm_binding(st, now, session_id, tool, alias)?.is_none() {
+        return Ok(());
+    }
+    // The directive's own summary says its seats await their hooks; say
+    // instead what is true of them after this.
+    let all_bound = outcome
+        .ids
+        .iter()
+        .filter_map(|id| st.members.get(id))
+        .all(|m| m.binding.state == BindingState::Bound);
+    if all_bound {
+        let done = outcome.summary.split(';').next().unwrap_or_default();
+        outcome.summary = format!("{done}; bound to this session");
+    } else {
+        outcome
+            .summary
+            .push_str("; this session's own seat is bound");
+    }
+    Ok(())
 }
 
 /// Mark a member vacant (`pager_gone`, `alias_moved`, ...); releases its
@@ -2170,5 +2236,107 @@ mod tests {
         assert!(pages(BindingState::Bound).is_empty());
         assert!(pages(BindingState::Vacant).is_empty());
         assert_eq!(pages(BindingState::Pending), ["boss"]);
+    }
+
+    fn fixture_evidence(seq: u64) -> Evidence {
+        Evidence {
+            session_id: "user".into(),
+            prompt_seq: seq,
+            sha256: "hash".into(),
+            attest: Attest::Fixture,
+            quote: "user instruction".into(),
+            at: seq,
+            strength: crate::model::Strength::default(),
+        }
+    }
+
+    #[test]
+    fn own_seat_summary_says_what_is_bound() {
+        let mut st = State::default();
+        let mut made = root_appoint(
+            &mut st,
+            10,
+            &fixture_evidence(10),
+            "boss",
+            Some("t"),
+            "p",
+            None,
+        )
+        .unwrap();
+        bind_own_seat(&mut st, 11, "s-boss", Tool::Claude, "boss", &mut made).unwrap();
+        assert_eq!(made.summary, "appointed; bound to this session");
+
+        // One of the two seats still waits for its own session.
+        let aliases = ["aide".to_string(), "clerk".to_string()];
+        let mut made = root_assign(&mut st, 20, &fixture_evidence(20), &aliases, "boss").unwrap();
+        bind_own_seat(&mut st, 21, "s-aide", Tool::Claude, "aide", &mut made).unwrap();
+        assert_eq!(
+            made.summary,
+            "assigned; awaiting target hooks; this session's own seat is bound"
+        );
+    }
+
+    #[test]
+    fn own_seat_refusal_is_a_conflict() {
+        let mut st = State::default();
+        root_appoint(
+            &mut st,
+            10,
+            &fixture_evidence(10),
+            "boss",
+            Some("t"),
+            "p",
+            None,
+        )
+        .unwrap();
+        confirm_binding(&mut st, 11, "s", Tool::Claude, "boss").unwrap();
+        let mut made = root_appoint(
+            &mut st,
+            20,
+            &fixture_evidence(20),
+            "dori",
+            Some("u"),
+            "p",
+            None,
+        )
+        .unwrap();
+        let refused = bind_own_seat(&mut st, 21, "s", Tool::Claude, "dori", &mut made).unwrap_err();
+        assert_eq!(refused.reason, Reason::Conflict);
+    }
+
+    /// A seat in a cancelled bu cannot be confirmed, so it is no reason to
+    /// refuse a session that holds another seat.
+    #[test]
+    fn own_seat_in_a_cancelled_bu_is_left_alone() {
+        let mut st = State::default();
+        root_appoint(
+            &mut st,
+            10,
+            &fixture_evidence(10),
+            "boss",
+            Some("t"),
+            "p",
+            None,
+        )
+        .unwrap();
+        confirm_binding(&mut st, 11, "s", Tool::Claude, "boss").unwrap();
+        let dori = root_appoint(
+            &mut st,
+            20,
+            &fixture_evidence(20),
+            "dori",
+            Some("u"),
+            "p",
+            None,
+        )
+        .unwrap()
+        .ids[0]
+            .clone();
+        root_cancel_team(&mut st, 30, &fixture_evidence(30), "u").unwrap();
+        let mut made = root_rebind(&mut st, 40, &fixture_evidence(40), &dori, "moved").unwrap();
+        let before = made.summary.clone();
+        bind_own_seat(&mut st, 41, "s", Tool::Claude, "moved", &mut made).unwrap();
+        assert_eq!(made.summary, before);
+        assert_eq!(st.members[&dori].binding.state, BindingState::Pending);
     }
 }

@@ -490,13 +490,19 @@ fn natural_language_appointment_to_delegation() {
         0
     );
 
-    // Seats are pending until each session's own hook confirms.
+    // gapu ran the appointment itself, so its seat is bound at once; nawi's
+    // seat is pending until its own session's hook confirms.
     let st = store.read().unwrap();
-    assert!(
+    let state_of = |alias: &str| {
         st.members
             .values()
-            .all(|m| m.binding.state == BindingState::Pending)
-    );
+            .find(|m| m.binding.alias == alias)
+            .unwrap()
+            .binding
+            .state
+    };
+    assert_eq!(state_of("gapu"), BindingState::Bound);
+    assert_eq!(state_of("nawi"), BindingState::Pending);
     session_start(&store, &pager, "s-gapu");
     session_start(&store, &pager, "s-nawi");
     let st = store.read().unwrap();
@@ -689,6 +695,19 @@ fn assign_pages_pending_alias_then_poke_binds() {
     let (_g, _dir, store) = setup();
     let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
     appoint_gapu_then_assign_nawi(&store, &pager, || {
+        // Another team's seat is pending, so nawi's hook has a check to run.
+        user_says(&store, "s-user", "dori에게 가절월을 준다");
+        pager.as_session("s-user");
+        let other = [
+            "appoint",
+            "dori",
+            "--team",
+            "other",
+            "--evidence",
+            "dori에게 가절월을 준다",
+        ];
+        assert_eq!(gaebu(&pager, &other), 0);
+        pager.as_session("s-gapu");
         // nawi's session checked for a pending seat before it had one; the
         // stamp from that check must not hide the seat assigned afterwards.
         prompt_arrives(&store, &pager, "s-nawi", "unrelated work");
@@ -1328,4 +1347,270 @@ fn compose_heartbeat_marks_only_the_sighting() {
             .iter()
             .all(|e| e.kind != EventKind::ModHeartbeat)
     );
+}
+
+fn binding_of(store: &Store, alias: &str) -> gaebu::model::Binding {
+    let st = store.read().unwrap();
+    st.members
+        .values()
+        .find(|m| m.status == gaebu::model::MemberStatus::Active && m.binding.alias == alias)
+        .unwrap()
+        .binding
+        .clone()
+}
+
+fn appoint_gapu(pager: &FakePager) -> i32 {
+    let appoint = [
+        "appoint",
+        "gapu",
+        "--team",
+        "gaebu",
+        "--evidence",
+        "gapu에게 가절월을 준다",
+    ];
+    gaebu(pager, &appoint)
+}
+
+fn assign_nawi(pager: &FakePager) -> i32 {
+    let assign = [
+        "assign",
+        "nawi",
+        "--to",
+        "gapu",
+        "--evidence",
+        "nawi는 그 속관으로 둔다",
+    ];
+    gaebu(pager, &assign)
+}
+
+const FORMATION: &str = "gapu에게 가절월을 준다. nawi는 그 속관으로 둔다.";
+
+#[test]
+fn self_appoint_binds_in_same_turn() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    let seat = binding_of(&store, "gapu");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-gapu"));
+    // No page waits for a seat that already has its session.
+    assert!(store.read().unwrap().outbox.is_empty());
+    assert!(pager.sent.borrow().iter().all(|(to, _)| to != "gapu"));
+    // The same turn can act as the commander.
+    assert_eq!(gaebu(&pager, &["me"]), 0);
+}
+
+#[test]
+fn appoint_other_stays_pending() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu")]);
+    user_says(&store, "s-user", FORMATION);
+    pager.as_session("s-user");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    let seat = binding_of(&store, "gapu");
+    assert_eq!(seat.state, BindingState::Pending);
+    assert_eq!(seat.session_id, None);
+    assert!(pager.sent.borrow().iter().any(|(to, _)| to == "gapu"));
+}
+
+#[test]
+fn self_seat_assign_binds_the_assigning_session() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    user_says(&store, "s-nawi", FORMATION);
+    pager.as_session("s-nawi");
+    assert_eq!(appoint_gapu(&pager), 0);
+    assert_eq!(assign_nawi(&pager), 0);
+
+    let own = binding_of(&store, "nawi");
+    assert_eq!(own.state, BindingState::Bound);
+    assert_eq!(own.session_id.as_deref(), Some("s-nawi"));
+    assert_eq!(binding_of(&store, "gapu").state, BindingState::Pending);
+}
+
+#[test]
+fn self_seat_rebind_binds_the_new_session() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-new", "nuzu")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    // Evidence for a rebind must be newer than the seat.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    user_says(&store, "s-new", "gapu 자리는 nuzu로 바꿔");
+    pager.as_session("s-new");
+    let rebind = [
+        "rebind",
+        "gapu",
+        "--alias",
+        "nuzu",
+        "--evidence",
+        "gapu 자리는 nuzu로 바꿔",
+    ];
+    assert_eq!(gaebu(&pager, &rebind), 0);
+
+    let seat = binding_of(&store, "nuzu");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-new"));
+}
+
+#[test]
+fn self_seat_appoint_rerun_binds_a_pending_seat() {
+    let (_g, _dir, store) = setup();
+    // pager has no alias for the session yet, so its own seat starts pending.
+    let mut pager = FakePager::new(&[]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+    assert_eq!(binding_of(&store, "gapu").state, BindingState::Pending);
+
+    pager.aliases.insert("s-gapu".into(), "gapu".into());
+    assert_eq!(appoint_gapu(&pager), 0);
+    let seat = binding_of(&store, "gapu");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-gapu"));
+    assert_eq!(store.read().unwrap().teams.len(), 1);
+}
+
+#[test]
+fn self_seat_assign_rerun_binds_a_pending_seat() {
+    let (_g, _dir, store) = setup();
+    let mut pager = FakePager::new(&[]);
+    user_says(&store, "s-nawi", FORMATION);
+    pager.as_session("s-nawi");
+    assert_eq!(appoint_gapu(&pager), 0);
+    assert_eq!(assign_nawi(&pager), 0);
+    assert_eq!(binding_of(&store, "nawi").state, BindingState::Pending);
+
+    pager.aliases.insert("s-nawi".into(), "nawi".into());
+    assert_eq!(assign_nawi(&pager), 0);
+    let seat = binding_of(&store, "nawi");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-nawi"));
+    assert_eq!(store.read().unwrap().members.len(), 2);
+}
+
+#[test]
+fn self_appoint_refused_when_bound_elsewhere() {
+    let (_g, _dir, store) = setup();
+    let mut pager = FakePager::new(&[("s-gapu", "gapu")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+    let before = store.read().unwrap();
+
+    // pager now knows the session by another name; it still holds gapu's seat.
+    pager.aliases.insert("s-gapu".into(), "dori".into());
+    user_says(&store, "s-gapu", "dori에게도 가절월을 준다");
+    let second = [
+        "appoint",
+        "dori",
+        "--team",
+        "other",
+        "--evidence",
+        "dori에게도 가절월을 준다",
+    ];
+    assert_eq!(gaebu(&pager, &second), 1);
+
+    let after = store.read().unwrap();
+    assert_eq!(after.members, before.members);
+    assert_eq!(after.teams, before.teams);
+    assert_eq!(after.rev, before.rev);
+}
+
+#[test]
+fn self_seat_assign_binds_beside_another_bound_seat() {
+    let (_g, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-gapu", "gapu"), ("s-nawi", "nawi")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    // Another session's bound seat is no reason to refuse this one.
+    user_says(&store, "s-nawi", FORMATION);
+    pager.as_session("s-nawi");
+    assert_eq!(assign_nawi(&pager), 0);
+    let own = binding_of(&store, "nawi");
+    assert_eq!(own.state, BindingState::Bound);
+    assert_eq!(own.session_id.as_deref(), Some("s-nawi"));
+}
+
+#[test]
+fn self_seat_rebind_of_own_bound_seat_binds_again() {
+    let (_g, _dir, store) = setup();
+    let mut pager = FakePager::new(&[("s-gapu", "gapu")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    // The session is renamed in pager and the human re-points its seat.
+    pager.aliases.insert("s-gapu".into(), "nuzu".into());
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    user_says(&store, "s-gapu", "gapu 자리는 nuzu로 바꿔");
+    let rebind = [
+        "rebind",
+        "gapu",
+        "--alias",
+        "nuzu",
+        "--evidence",
+        "gapu 자리는 nuzu로 바꿔",
+    ];
+    assert_eq!(gaebu(&pager, &rebind), 0);
+    let seat = binding_of(&store, "nuzu");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-gapu"));
+}
+
+#[test]
+fn self_seat_rebind_rerun_binds_a_pending_seat() {
+    let (_g, _dir, store) = setup();
+    let mut pager = FakePager::new(&[("s-gapu", "gapu")]);
+    user_says(&store, "s-gapu", FORMATION);
+    pager.as_session("s-gapu");
+    assert_eq!(appoint_gapu(&pager), 0);
+
+    // pager does not know the new session by the new name yet.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    user_says(&store, "s-new", "gapu 자리는 nuzu로 바꿔");
+    pager.as_session("s-new");
+    let rebind = [
+        "rebind",
+        "gapu",
+        "--alias",
+        "nuzu",
+        "--evidence",
+        "gapu 자리는 nuzu로 바꿔",
+    ];
+    assert_eq!(gaebu(&pager, &rebind), 0);
+    let seat = binding_of(&store, "nuzu");
+    assert_eq!(seat.state, BindingState::Pending);
+
+    pager.aliases.insert("s-new".into(), "nuzu".into());
+    // The seat is addressed by id: its old alias no longer resolves.
+    let id = store
+        .read()
+        .unwrap()
+        .members
+        .values()
+        .find(|m| m.binding.alias == "nuzu")
+        .unwrap()
+        .id
+        .clone();
+    let again = [
+        "rebind",
+        id.as_str(),
+        "--alias",
+        "nuzu",
+        "--evidence",
+        "gapu 자리는 nuzu로 바꿔",
+    ];
+    assert_eq!(gaebu(&pager, &again), 0);
+    let seat = binding_of(&store, "nuzu");
+    assert_eq!(seat.state, BindingState::Bound);
+    assert_eq!(seat.session_id.as_deref(), Some("s-new"));
 }

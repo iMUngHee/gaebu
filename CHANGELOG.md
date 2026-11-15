@@ -9,6 +9,33 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.6.1 — 2026-11-16
+
+### Fixed
+
+- A root directive that seats the session running it (`appoint`, `assign` or
+  `rebind` naming that session's own pager alias) now binds the seat in the
+  same transaction and says so in its result (`appointed; bound to this
+  session`). Before, the seat
+  stayed pending until that session's next prompt, so a commander that
+  appointed itself could not issue duties in that turn and nothing woke it
+  afterwards.
+- Repeating `assign` with the same evidence reports the seats it already
+  made instead of none, so the repeat can still bind the caller's own seat.
+- A root `rebind` reports `rebound; awaiting target hook` instead of
+  `rebind pending`, matching `appoint` and `assign`.
+
+### Changed
+
+- A root directive that would seat the calling session is refused with
+  `conflict` when that session already holds another active seat. Such a
+  seat could never be confirmed. Dismiss or rebind the held seat first.
+
+### Compatibility
+
+- Runtime schema 6 and Schedule schema 3 are unchanged. Seats for other
+  sessions are pending as before.
+
 ## 0.6.0 — 2026-11-14
 
 ### Added

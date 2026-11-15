@@ -41,7 +41,10 @@ only from grants.
 - **Binding**: which session currently speaks for the member.
   - `pending`: designated by pager alias, not yet confirmed.
   - `bound`: the target session's own hook confirmed that pager reports the
-    same alias for it.
+    same alias for it. A root directive (`appoint`, `assign`, `rebind`) run
+    by the session it names binds that seat in the same transaction, since
+    no later hook would be woken to confirm it. The directive is refused
+    with `conflict` when that session already holds another seat.
   - `vacant`: the session was observed gone, the alias moved, or the seat was
     rebound.
   - "quiet" is not stored. A card shows it when a bound session has gone

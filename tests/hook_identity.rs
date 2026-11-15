@@ -67,6 +67,7 @@ fn cli_flag_identity_rejected_for_mutation() {
             session_id: "s".into(),
             tool: None,
             source: Source::Other(source.into()),
+            alias: None,
         };
         assert!(!caller.may_mutate());
         assert_eq!(

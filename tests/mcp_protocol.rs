@@ -266,6 +266,7 @@ fn mcp_me_duty_issue_accept_lease_and_cancel_flow() {
         session_id: "commander-session".into(),
         tool: Some(Tool::Claude),
         source: gaebu::identity::Source::PagerHost,
+        alias: None,
     };
     let project_home = home.with_extension("project");
     std::fs::create_dir_all(&project_home).unwrap();

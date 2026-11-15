@@ -689,6 +689,7 @@ fn vacant_seat_does_not_block_new_pending_on_same_session() {
         session_id: "fixture-codex".into(),
         tool: Some(Tool::Codex),
         source: identity::Source::McpThreadMeta,
+        alias: None,
     };
     assert_eq!(identity::actor(&state, &caller).unwrap().member, "new");
     let mut output = Vec::new();

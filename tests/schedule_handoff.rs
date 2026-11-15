@@ -108,6 +108,7 @@ impl Fixture {
             session_id: session,
             tool: Some(Tool::Codex),
             source: CallerSource::PagerNative,
+            alias: None,
         };
         let teams = ["a", "b", "c"]
             .into_iter()

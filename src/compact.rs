@@ -792,6 +792,7 @@ mod tests {
                     session_id: "root".into(),
                     tool: Some(Tool::Codex),
                     source: identity::Source::PagerNative,
+                    alias: None,
                 },
                 team,
                 hot,

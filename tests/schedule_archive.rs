@@ -94,6 +94,7 @@ impl Fixture {
             session_id: session.into(),
             tool: Some(Tool::Codex),
             source: CallerSource::PagerNative,
+            alias: None,
         };
         let root = caller("root-session");
         let worker = caller("worker-session");

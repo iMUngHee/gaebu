@@ -1231,6 +1231,7 @@ mod tests {
             session_id: "root-session".into(),
             tool: Some(Tool::Codex),
             source: crate::identity::Source::PagerNative,
+            alias: None,
         };
         let quote = "adopt the existing archive test Schedule";
         let log = store.session(&caller.session_id);

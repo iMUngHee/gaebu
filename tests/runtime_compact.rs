@@ -392,6 +392,7 @@ fn linked_duty_stays_hot_and_dispatch_retry_reuses_terminal_contract() {
         session_id: f.root.session_id.clone(),
         tool: Some(Tool::Codex),
         source: Source::PagerNative,
+        alias: None,
     };
     let project = std::env::temp_dir().join(format!(
         "gaebu-compact-project-{}-{}",
@@ -1817,6 +1818,7 @@ fn caller(actor: &Actor) -> gaebu::identity::Caller {
         session_id: actor.session_id.clone(),
         tool: Some(Tool::Codex),
         source: gaebu::identity::Source::PagerNative,
+        alias: None,
     }
 }
 
