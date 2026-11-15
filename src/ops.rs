@@ -32,6 +32,7 @@ pub fn root_appoint(
     project: &str,
     title: Option<&str>,
 ) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let key = root_key(ev, "appoint", alias);
     if let Some(action) = st.root_actions.get(&key) {
         return Ok(out(
@@ -191,6 +192,7 @@ pub fn root_assign(
     aliases: &[String],
     to_alias: &str,
 ) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let commander = alias_member(st, to_alias)?.clone();
     if st.teams[&commander.team].commander != commander.id || authz::bu_cancelled(st, &commander.bu)
     {
@@ -241,6 +243,7 @@ pub fn root_assign(
 /// Dismiss the member held by `alias`; revokes everything delegated below it.
 /// The evidence prompt must be newer than the member's appointment.
 pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let key = root_key(ev, "dismiss", alias);
     if st.root_actions.contains_key(&key) {
         return Ok(out("already dismissed", vec![]));
@@ -284,6 +287,7 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
 }
 
 pub fn root_cancel_team(st: &mut State, now: Ms, ev: &Evidence, team: &str) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let t = st
         .teams
         .values()
@@ -330,6 +334,7 @@ pub fn root_rebind(
     member: &str,
     new_alias: &str,
 ) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let m = find_member(st, member)?.clone();
     let key = root_key(ev, "rebind", &m.id);
     if st.root_actions.contains_key(&key) {
@@ -356,6 +361,7 @@ pub fn root_hold(
     target: &str,
     until: &str,
 ) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     // One line on the card: control characters and runs of whitespace collapse.
     let until = until
         .split(|c: char| c.is_whitespace() || c.is_control())
@@ -397,6 +403,7 @@ pub fn root_hold(
 /// Root directive: lift the human hold on a duty or bu. Holds above or below
 /// it stay.
 pub fn root_release(st: &mut State, now: Ms, ev: &Evidence, target: &str) -> Result<Outcome> {
+    require_root_evidence(st, ev)?;
     let key = root_key(ev, "release", target);
     if st.root_actions.contains_key(&key) {
         return Ok(out("already released", vec![target.into()]));
@@ -1794,6 +1801,16 @@ fn out(summary: &str, ids: Vec<String>) -> Outcome {
         ids,
     }
 }
+pub(crate) fn require_root_evidence(st: &State, ev: &Evidence) -> Result<()> {
+    if ev.at <= st.root_evidence_floor {
+        return refuse(
+            Reason::NoUserEvidence,
+            "evidence predates purged history; restate the instruction",
+        );
+    }
+    Ok(())
+}
+
 fn root_key(ev: &Evidence, action: &str, target: &str) -> String {
     format!("{}:{}:{action}:{target}", ev.session_id, ev.prompt_seq)
 }

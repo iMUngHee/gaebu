@@ -9,6 +9,104 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) trait ArchiveLocation {
+    fn base(&self) -> &Path;
+    fn protected(&self, _path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+}
+impl ArchiveLocation for Path {
+    fn base(&self) -> &Path {
+        self
+    }
+}
+impl ArchiveLocation for PathBuf {
+    fn base(&self) -> &Path {
+        self
+    }
+}
+
+/// Runtime paths always carry the frozen ownership exceptions from the state.
+pub(crate) struct RuntimePath<'a> {
+    base: PathBuf,
+    home_schedules: &'a std::collections::BTreeSet<String>,
+}
+impl<'a> RuntimePath<'a> {
+    pub(crate) fn new(
+        store: &crate::store::Store,
+        home_schedules: &'a std::collections::BTreeSet<String>,
+        team: &str,
+        stream: &str,
+    ) -> Result<Self> {
+        if team.is_empty()
+            || crate::store::sanitize(team) != team
+            || !matches!(stream, "duties" | "escalations" | "records")
+        {
+            return Err(corrupt("invalid runtime archive path"));
+        }
+        Ok(Self {
+            base: store
+                .home()
+                .join("archive")
+                .join(team)
+                .join(format!("{stream}.jsonl")),
+            home_schedules,
+        })
+    }
+    pub(crate) fn remove_committed(&self, number: u64) -> Result<()> {
+        match guarded_unlink(self, &segment_path(self, number)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+}
+impl ArchiveLocation for RuntimePath<'_> {
+    fn base(&self) -> &Path {
+        &self.base
+    }
+    fn protected(&self, path: &Path) -> Result<bool> {
+        if self.home_schedules.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.home_schedules.contains(
+            crate::store::canonical_path(path)?
+                .to_string_lossy()
+                .as_ref(),
+        ))
+    }
+}
+
+fn guarded_open(base: &(impl ArchiveLocation + ?Sized), path: &Path) -> Result<Option<File>> {
+    if base.protected(path)? {
+        Ok(None)
+    } else {
+        open_optional(path)
+    }
+}
+fn guarded_unlink(base: &(impl ArchiveLocation + ?Sized), path: &Path) -> std::io::Result<()> {
+    if base.protected(path).map_err(std::io::Error::other)? {
+        Ok(())
+    } else {
+        unlink_segment(path)
+    }
+}
+fn require_writable(base: &(impl ArchiveLocation + ?Sized), path: &Path) -> Result<()> {
+    if base.protected(path)? {
+        return Err(Error::new(
+            Reason::Conflict,
+            "runtime archive path is a protected Schedule",
+        ));
+    }
+    Ok(())
+}
+fn writable_last<S: Segment>(base: &(impl ArchiveLocation + ?Sized), segments: &[S]) -> Result<()> {
+    if let Some(last) = segments.last() {
+        require_writable(base, &segment_path(base, last.number()))?;
+    }
+    Ok(())
+}
+
 fn io_error(error: std::io::Error) -> Error {
     Error::new(Reason::StoreWriteFailed, error.to_string())
 }
@@ -155,21 +253,21 @@ pub(crate) trait Segment {
     fn bytes(&self) -> u64;
 }
 
-pub(crate) fn segment_path(base: &Path, number: u64) -> PathBuf {
+pub(crate) fn segment_path<P: ArchiveLocation + ?Sized>(base: &P, number: u64) -> PathBuf {
     if number == 1 {
-        base.to_owned()
+        base.base().to_owned()
     } else {
-        base.with_extension(format!("{number}.jsonl"))
+        base.base().with_extension(format!("{number}.jsonl"))
     }
 }
 
-fn segment_number(base: &Path, name: &std::ffi::OsStr) -> Option<u64> {
-    if Some(name) == base.file_name() {
+fn segment_number<P: ArchiveLocation + ?Sized>(base: &P, name: &std::ffi::OsStr) -> Option<u64> {
+    if Some(name) == base.base().file_name() {
         return Some(1);
     }
     let number = name
         .as_encoded_bytes()
-        .strip_prefix(base.file_stem()?.as_encoded_bytes())?
+        .strip_prefix(base.base().file_stem()?.as_encoded_bytes())?
         .strip_prefix(b".")?
         .strip_suffix(b".jsonl")?;
     let number = std::str::from_utf8(number).ok()?;
@@ -177,7 +275,10 @@ fn segment_number(base: &Path, name: &std::ffi::OsStr) -> Option<u64> {
     (parsed > 1 && parsed.to_string() == number).then_some(parsed)
 }
 
-pub(crate) fn expired_prefix<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
+pub(crate) fn expired_prefix<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<usize> {
     let mut previous = 0;
     let mut present = Vec::new();
     let mut expired = 0;
@@ -186,13 +287,13 @@ pub(crate) fn expired_prefix<S: Segment>(base: &Path, segments: &[S]) -> Result<
             return Err(corrupt("invalid archive segment bookkeeping"));
         }
         previous = segment.number();
-        if open_optional(&segment_path(base, segment.number()))?.is_some() {
+        if guarded_open(base, &segment_path(base, segment.number()))?.is_some() {
             present.push(segment.number());
         } else {
             // A reader may have observed an older file before a writer expired it.
             // Recheck only those observations before calling a missing file a hole.
             for number in &present {
-                if open_optional(&segment_path(base, *number))?.is_some() {
+                if guarded_open(base, &segment_path(base, *number))?.is_some() {
                     return Err(corrupt(
                         "archive has a missing segment after a retained segment",
                     ));
@@ -205,8 +306,8 @@ pub(crate) fn expired_prefix<S: Segment>(base: &Path, segments: &[S]) -> Result<
     Ok(expired)
 }
 
-fn inspect_heal_with<S: Segment>(
-    base: &Path,
+fn inspect_heal_with<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &[S],
     mut open: impl FnMut(&Path) -> Result<Option<File>>,
 ) -> Result<(usize, bool)> {
@@ -226,13 +327,20 @@ fn inspect_heal_with<S: Segment>(
     Ok((after_missing, hole))
 }
 
-pub(crate) fn has_hole<S: Segment>(base: &Path, segments: &[S]) -> Result<bool> {
-    Ok(inspect_heal_with(base, segments, open_optional)?.1)
+pub(crate) fn has_hole<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<bool> {
+    Ok(inspect_heal_with(base, segments, |path| guarded_open(base, path))?.1)
 }
 
 /// Read-only checks; the returned index excludes every segment heal may expire.
-pub(crate) fn precheck_heal<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
-    let (retained, _) = inspect_heal_with(base, segments, open_optional)?;
+pub(crate) fn precheck_heal<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<usize> {
+    writable_last(base, segments)?;
+    let (retained, _) = inspect_heal_with(base, segments, |path| guarded_open(base, path))?;
     if let Some(last) = segments.last().filter(|_| retained < segments.len()) {
         boundary(
             &mut open_prefix(&segment_path(base, last.number()), last.bytes(), false)?,
@@ -256,7 +364,10 @@ std::thread_local! {
     pub(crate) static FAILED_HEAL_SYNC: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Healed> {
+pub(crate) fn heal_holes<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<Healed> {
     #[cfg(test)]
     let mut calls = 0;
     heal_with(
@@ -269,7 +380,7 @@ pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Heal
                 if FAILED_HEAL_SYNC.with_borrow(|failed| {
                     failed
                         .as_ref()
-                        .is_some_and(|(path, at)| path == base && *at == calls)
+                        .is_some_and(|(path, at)| path == base.base() && *at == calls)
                 }) {
                     return Err(io_error(std::io::Error::from(
                         std::io::ErrorKind::PermissionDenied,
@@ -278,13 +389,13 @@ pub(crate) fn heal_holes<S: Segment>(base: &Path, segments: &[S]) -> Result<Heal
             }
             crate::store::sync_dir(parent(base)?)
         },
-        unlink_segment,
-        open_optional,
+        |path| guarded_unlink(base, path),
+        |path| guarded_open(base, path),
     )
 }
 
-fn heal_with<S: Segment>(
-    base: &Path,
+fn heal_with<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &[S],
     mut sync: impl FnMut() -> Result<()>,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
@@ -302,6 +413,7 @@ fn heal_with<S: Segment>(
         let entry = entry.map_err(io_error)?;
         if let Some(number) = segment_number(base, &entry.file_name())
             && number < cutoff
+            && !base.protected(&entry.path())?
         {
             let bytes = entry.metadata().map_err(io_error)?.len();
             files.insert(number, (entry.path(), bytes));
@@ -339,16 +451,22 @@ fn heal_with<S: Segment>(
     Ok(result)
 }
 
-fn parent(base: &Path) -> Result<&Path> {
-    base.parent()
+fn parent<P: ArchiveLocation + ?Sized>(base: &P) -> Result<&Path> {
+    base.base()
+        .parent()
         .ok_or_else(|| corrupt("archive path has no parent"))
 }
 
-fn trim_last<S: Segment>(base: &Path, segments: &[S], expired: usize) -> Result<()> {
+fn trim_last<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+    expired: usize,
+) -> Result<()> {
     if expired < segments.len() {
         let segment = segments
             .last()
             .ok_or_else(|| corrupt("missing archive segment"))?;
+        require_writable(base, &segment_path(base, segment.number()))?;
         let mut file = open_prefix(&segment_path(base, segment.number()), segment.bytes(), true)?;
         boundary(&mut file, segment.bytes())?;
         if file.metadata().map_err(io_error)?.len() > segment.bytes() {
@@ -360,7 +478,11 @@ fn trim_last<S: Segment>(base: &Path, segments: &[S], expired: usize) -> Result<
 }
 
 /// The returned prefix can leave bookkeeping only after this directory sync.
-pub(crate) fn prepare_segments<S: Segment>(base: &Path, segments: &[S]) -> Result<usize> {
+pub(crate) fn prepare_segments<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<usize> {
+    writable_last(base, segments)?;
     crate::store::sync_dir(parent(base)?)?;
     let expired = expired_prefix(base, segments)?;
     trim_last(base, segments, expired)?;
@@ -375,8 +497,8 @@ pub(crate) struct Appended {
 }
 
 /// Callers normalize the expired prefix before choosing a segment for new rows.
-pub(crate) fn append_segment<S: Segment>(
-    base: &Path,
+pub(crate) fn append_segment<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &[S],
     next: &mut u64,
     segment_bytes: u64,
@@ -406,6 +528,7 @@ pub(crate) fn append_segment<S: Segment>(
     let total = committed
         .checked_add(bytes.len() as u64)
         .ok_or_else(|| corrupt("archive byte count overflow"))?;
+    require_writable(base, &segment_path(base, number))?;
     append_prefix(&segment_path(base, number), committed, bytes)?;
     *next = following;
     Ok(Appended {
@@ -434,8 +557,8 @@ fn unlink_segment(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
-pub(crate) fn enforce_limit<S: Segment>(
-    base: &Path,
+pub(crate) fn enforce_limit<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &mut Vec<S>,
     limit: u64,
 ) -> Result<Enforcement<S>> {
@@ -444,12 +567,12 @@ pub(crate) fn enforce_limit<S: Segment>(
         segments,
         limit,
         || crate::store::sync_dir(parent(base)?),
-        unlink_segment,
+        |path| guarded_unlink(base, path),
     )
 }
 
-fn enforce_with<S: Segment>(
-    base: &Path,
+fn enforce_with<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &mut Vec<S>,
     limit: u64,
     mut sync: impl FnMut() -> Result<()>,
@@ -490,8 +613,8 @@ fn enforce_with<S: Segment>(
 }
 
 /// False means this segment disappeared as part of an expired oldest prefix.
-pub(crate) fn scan_segment<S: Segment>(
-    base: &Path,
+pub(crate) fn scan_segment<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
     segments: &[S],
     index: usize,
     visit: impl FnMut(&[u8]) -> Result<()>,
@@ -499,14 +622,14 @@ pub(crate) fn scan_segment<S: Segment>(
     let segment = segments
         .get(index)
         .ok_or_else(|| corrupt("invalid archive segment index"))?;
-    match open_optional(&segment_path(base, segment.number()))? {
+    match guarded_open(base, &segment_path(base, segment.number()))? {
         Some(file) => {
             scan_file_prefix(file, segment.bytes(), visit)?;
             Ok(true)
         }
         None => {
             for older in &segments[..index] {
-                if open_optional(&segment_path(base, older.number()))?.is_some() {
+                if guarded_open(base, &segment_path(base, older.number()))?.is_some() {
                     return Err(corrupt(
                         "archive has a missing segment after a retained segment",
                     ));
@@ -517,13 +640,17 @@ pub(crate) fn scan_segment<S: Segment>(
     }
 }
 
-pub(crate) fn remove_unlisted<S: Segment>(base: &Path, segments: &[S]) -> Result<Option<String>> {
+pub(crate) fn remove_unlisted<S: Segment, P: ArchiveLocation + ?Sized>(
+    base: &P,
+    segments: &[S],
+) -> Result<Option<String>> {
     let listed: std::collections::BTreeSet<_> = segments.iter().map(Segment::number).collect();
     let mut extra = std::collections::BTreeMap::new();
     for entry in fs::read_dir(parent(base)?).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         if let Some(number) = segment_number(base, &entry.file_name())
             && !listed.contains(&number)
+            && !base.protected(&entry.path())?
         {
             extra.insert(number, entry.path());
         }
@@ -532,7 +659,7 @@ pub(crate) fn remove_unlisted<S: Segment>(base: &Path, segments: &[S]) -> Result
         return Ok(Some(error.message));
     }
     for path in extra.values() {
-        if let Err(error) = unlink_segment(path)
+        if let Err(error) = guarded_unlink(base, path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Ok(Some(error.to_string()));
@@ -594,6 +721,94 @@ mod tests {
         ));
         let store = crate::store::Store::open_with_archive_limit(&dir, 64).unwrap();
         (store, dir.join("history.jsonl"))
+    }
+
+    #[test]
+    fn runtime_guard_covers_creation_rollover_expiry_heal_and_cleanup() {
+        let (store, _) = fixture();
+        let dir = store.home().join("archive/team");
+        fs::create_dir_all(&dir).unwrap();
+        let protected_path = dir.join("duties.2.jsonl");
+        let content = b"legacy Schedule that is not JSONL";
+        fs::write(&protected_path, content).unwrap();
+        let protected = [fs::canonicalize(&protected_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()]
+        .into_iter()
+        .collect();
+        let base = RuntimePath::new(&store, &protected, "team", "duties").unwrap();
+        fs::write(segment_path(&base, 1), b"1\n").unwrap();
+        let first = [SegmentRecord { n: 1, bytes: 2 }];
+        let mut next = 2;
+        assert_eq!(
+            append_segment(&base, &first, &mut next, 2, b"new\n")
+                .unwrap_err()
+                .reason,
+            Reason::Conflict
+        );
+        assert_eq!(next, 2);
+        assert_eq!(fs::read(segment_path(&base, 1)).unwrap(), b"1\n");
+        assert_eq!(
+            append_segment::<SegmentRecord, _>(&base, &[], &mut next, 2, b"new\n")
+                .unwrap_err()
+                .reason,
+            Reason::Conflict
+        );
+        let last = [SegmentRecord { n: 2, bytes: 2 }];
+        next = 3;
+        assert_eq!(
+            prepare_segments(&base, &last).unwrap_err().reason,
+            Reason::Conflict
+        );
+        assert_eq!(
+            precheck_heal(&base, &last).unwrap_err().reason,
+            Reason::Conflict
+        );
+        assert_eq!(
+            append_segment(&base, &last, &mut next, 1, b"roll\n")
+                .unwrap_err()
+                .reason,
+            Reason::Conflict
+        );
+        assert_eq!(fs::read(&protected_path).unwrap(), content);
+        // A protected lower segment behaves as a missing file during expiry.
+        fs::remove_file(segment_path(&base, 1)).unwrap();
+        fs::write(segment_path(&base, 3), b"3\n").unwrap();
+        let mut retained = vec![
+            SegmentRecord { n: 2, bytes: 2 },
+            SegmentRecord { n: 3, bytes: 2 },
+        ];
+        assert_eq!(
+            enforce_limit(&base, &mut retained, 2)
+                .unwrap()
+                .expired
+                .len(),
+            1
+        );
+        assert_eq!(retained[0].n, 3);
+        assert!(!scan_segment(&base, &last, 0, |_| panic!("must not read Schedule")).unwrap());
+        // A hole beyond the protected file removes only the runtime files below it.
+        fs::write(segment_path(&base, 1), b"1\n").unwrap();
+        fs::write(segment_path(&base, 5), b"5\n").unwrap();
+        let segments: Vec<_> = (1..=5).map(|n| SegmentRecord { n, bytes: 2 }).collect();
+        assert!(has_hole(&base, &segments).unwrap());
+        assert_eq!(precheck_heal(&base, &segments).unwrap(), 4);
+        let healed = heal_holes(&base, &segments).unwrap();
+        assert_eq!(healed.segments, vec![1, 3]);
+        assert!(!healed.hole_remaining);
+        assert!(!has_hole(&base, &segments).unwrap());
+        assert!(remove_unlisted(&base, &segments[4..]).unwrap().is_none());
+        base.remove_committed(2).unwrap();
+        assert_eq!(fs::read(&protected_path).unwrap(), content);
+        for (team, stream) in [
+            ("../outside", "duties"),
+            ("", "records"),
+            ("team", "../bad"),
+        ] {
+            assert!(RuntimePath::new(&store, &protected, team, stream).is_err());
+        }
+        fs::remove_dir_all(store.home()).unwrap();
     }
 
     #[test]

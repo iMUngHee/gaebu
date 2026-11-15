@@ -262,6 +262,9 @@ still has that token.
 
 ## Runtime history
 
+Normal compaction and healing remove unlisted runtime segments while skipping
+protected legacy Schedule paths; pending purge removal deletes only listed segments.
+
 `State.archives[team]` contains a `duties`, `escalations` and `records` stream,
 each shaped as `{"next":3,"segments":[{"n":2,"bytes":5120,"lo":310,"hi":480}]}`.
 Segment 1 uses `<stream>.jsonl`; subsequent segments use `<stream>.<n>.jsonl`.

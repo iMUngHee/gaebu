@@ -393,7 +393,14 @@ fn linked_duty_stays_hot_and_dispatch_retry_reuses_terminal_contract() {
         tool: Some(Tool::Codex),
         source: Source::PagerNative,
     };
-    let path = f.store.home().join("schedule.md");
+    let project = std::env::temp_dir().join(format!(
+        "gaebu-compact-project-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&project).unwrap();
+    let _project_cleanup = common::RemoveOnDrop(project.clone());
+    let path = project.join("schedule.md");
     gaebu::schedule::register(&f.store, &caller, &path, true).unwrap();
     let st = f.store.read_current().unwrap();
     let bu = &st.members[&f.root.member].bu;

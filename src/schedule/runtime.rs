@@ -309,7 +309,13 @@ pub fn transaction<T>(
 /// Explicit history maintenance follows the Schedule -> state lock order.
 pub fn compact(store: &Store, caller: &Caller, heal: bool) -> Result<Value> {
     let snapshot = store.read_current()?;
-    let actor = identity::actor(&snapshot, caller)?;
+    let actor = match identity::actor(&snapshot, caller) {
+        Ok(actor) => actor,
+        Err(error) if !heal && matches!(error.reason, Reason::NotMember | Reason::Cancelled) => {
+            return crate::compact::run(store, "", None);
+        }
+        Err(error) => return Err(error),
+    };
     let team = snapshot.members[&actor.member].team.clone();
     if heal
         && snapshot

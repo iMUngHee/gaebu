@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const DAY: Ms = 24 * 60 * 60 * 1000;
 const HOUR: Ms = 60 * 60 * 1000;
@@ -74,7 +74,11 @@ fn candidates(
                                 .is_some_and(|n| n > 0 && n < r.next_item)
                     })
                 });
-            if !cancelled && !retired_here {
+            let handed_off = st
+                .schedules
+                .get(&duty.team)
+                .is_none_or(|reg| reg.schedule_id != link.schedule_id);
+            if !cancelled && !retired_here && !handed_off {
                 continue;
             }
         }
@@ -160,9 +164,13 @@ pub fn needs_schedule(st: &State, team: &str) -> bool {
     };
     let batches = candidates(st, crate::model::now_ms(), team, Some(&possible));
     counts(&batches).iter().sum::<usize>() >= 64
-        && batches
-            .get(team)
-            .is_some_and(|batch| batch.duties.iter().any(|d| d.schedule_ref.is_some()))
+        && batches.get(team).is_some_and(|batch| {
+            batch.duties.iter().any(|d| {
+                d.schedule_ref
+                    .as_ref()
+                    .is_some_and(|link| link.schedule_id == registration.schedule_id)
+            })
+        })
 }
 
 fn compact(
@@ -174,18 +182,17 @@ fn compact(
 ) -> Result<Value> {
     let empty = || json!({"duties": 0, "escalations": 0, "records": 0});
     let explicit = threshold == 1;
-    if !explicit
-        && counts(&candidates(
-            &store.read_view()?,
-            crate::model::now_ms(),
-            team,
-            retired,
-        ))
-        .iter()
-        .sum::<usize>()
-            < threshold
-    {
-        return Ok(empty());
+    if !explicit {
+        let snapshot = store.read_view()?;
+        let now = crate::model::now_ms();
+        if !crate::purge::needed(&snapshot, now)
+            && counts(&candidates(&snapshot, now, team, retired))
+                .iter()
+                .sum::<usize>()
+                < threshold
+        {
+            return Ok(empty());
+        }
     }
     let mut healing: BTreeMap<&str, HealAttempt> = BTreeMap::new();
     let result = store.transact(store::CLI_DEADLINE, |st| {
@@ -200,26 +207,37 @@ fn compact(
                 ));
             }
             let archives = st.archives.get(team).cloned().unwrap_or_default();
-            let dir = team_dir(store, team)?;
             for (name, stream) in [
                 ("duties", &archives.duties),
                 ("escalations", &archives.escalations),
                 ("records", &archives.records),
             ] {
                 validate_stream(stream)?;
-                archive::precheck_heal(&dir.join(format!("{name}.jsonl")), &stream.segments)?;
+                let path = archive::RuntimePath::new(store, &st.home_schedules, team, name)?;
+                archive::precheck_heal(&path, &stream.segments)?;
             }
         }
-        let mut batches = candidates(st, crate::model::now_ms(), team, retired);
+        let now = crate::model::now_ms();
+        let purge_deferred = crate::purge::remove_pending(store, st);
+        let selected = crate::purge::selection(st, now);
+        let mut batches = if team.is_empty() { BTreeMap::new() } else { candidates(st, now, team, retired) };
+        batches.retain(|id, _| !selected.contains(id));
         let n = counts(&batches);
-        if !explicit && n.iter().sum::<usize>() < threshold {
-            return Ok(empty());
+        if !explicit && n.iter().sum::<usize>() < threshold && selected.is_empty() && purge_deferred.is_empty() {
+            return Ok(json!({"duties":0,"escalations":0,"records":0,"purged":[]}));
         }
-        if explicit {
+        let purged = crate::purge::retire(st, &selected);
+        if explicit && !team.is_empty() && !selected.contains(team) {
             batches.entry(team.to_owned()).or_default();
+        }
+        if batches.is_empty() {
+            let mut result = json!({"duties":0,"escalations":0,"records":0,"purged":purged});
+            if !purge_deferred.is_empty() { result["purge_deferred"] = json!(purge_deferred); }
+            return Ok(result);
         }
         let archive = store.home().join("archive");
         fs::create_dir_all(&archive).map_err(write_error)?;
+        let protected = st.home_schedules.clone();
         let mut lengths = st.archives.clone();
         let mut totals: [Maintenance; 3] = std::array::from_fn(|_| Maintenance::default());
         let mut over_limit = Vec::new();
@@ -262,7 +280,7 @@ fn compact(
                 if bytes.is_empty() && !(explicit && batch_team == team) {
                     continue;
                 }
-                let path = dir.join(format!("{name}.jsonl"));
+                let path = archive::RuntimePath::new(store, &protected, batch_team, name)?;
                 if heal_caller.is_some() && batch_team == team {
                     let healed = archive::heal_holes(&path, &stream.segments)?;
                     let stats = HealStats {
@@ -366,7 +384,9 @@ fn compact(
             if let Some(reason) = total.deferred { deferred.insert(name.into(), json!(reason)); }
         }
         let mut result = json!({"duties": archived[0], "escalations": archived[1], "records": archived[2],
-            "expired": expired, "retained_bytes": retained, "limit_bytes": store.archive_limit(), "over_limit": over_limit});
+            "expired": expired, "retained_bytes": retained, "limit_bytes": store.archive_limit(), "over_limit": over_limit,
+            "purged": purged});
+        if !purge_deferred.is_empty() { result["purge_deferred"] = json!(purge_deferred); }
         if !deferred.is_empty() {
             result["expiry_deferred"] = Value::Object(deferred);
         }
@@ -392,7 +412,7 @@ fn compact(
         }
         Ok(result)
     });
-    result.map_err(|mut error| {
+    let mut result = result.map_err(|mut error| {
         if healing
             .values()
             .any(|a| a.stats.segments + a.stats.unlisted_files > 0)
@@ -412,7 +432,31 @@ fn compact(
             }
         }
         error
-    })
+    })?;
+    if result["purged"].as_array().is_some_and(|p| !p.is_empty()) {
+        match store.transact(store::CLI_DEADLINE, |st| {
+            Ok(crate::purge::remove_pending(store, st))
+        }) {
+            Ok(deferred) => {
+                if deferred.is_empty() {
+                    result.as_object_mut().unwrap().remove("purge_deferred");
+                } else {
+                    result["purge_deferred"] = json!(deferred);
+                }
+            }
+            Err(error) => {
+                result["purge_deferred"] = json!(
+                    result["purged"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| json!({"team":p["team"],"reason":error.message}))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn team_dir(store: &Store, team: &str) -> Result<PathBuf> {
@@ -486,7 +530,7 @@ struct Maintenance {
 }
 
 fn maintain(
-    path: &Path,
+    path: &archive::RuntimePath<'_>,
     stream: &mut ArchiveStream,
     bytes: &[u8],
     bounds: Option<(u64, u64)>,

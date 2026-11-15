@@ -630,8 +630,10 @@ fn root_op(
                 "the current prompt changed while waiting; restate the instruction",
             ));
         }
+        ops::require_root_evidence(st, &ev)?;
         f(st, now, &ev)
     })?;
+    crate::compact::auto(store, "", None);
     print_outcome(json, &out);
     flush_outbox(store, pager);
     Ok(())
@@ -1003,16 +1005,26 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     "archived duties: {}, escalations: {}, records: {}",
                     result["duties"], result["escalations"], result["records"]
                 );
-                println!("expired history: {}", result["expired"]);
-                for field in ["healed", "heal_deferred", "hole_remaining"] {
+                if let Some(expired) = result.get("expired") {
+                    println!("expired history: {expired}");
+                }
+                for field in [
+                    "healed",
+                    "heal_deferred",
+                    "hole_remaining",
+                    "purged",
+                    "purge_deferred",
+                ] {
                     if let Some(value) = result.get(field) {
                         println!("{field}: {value}");
                     }
                 }
-                println!(
-                    "retained bytes: {} (limit per team/stream: {})",
-                    result["retained_bytes"], result["limit_bytes"]
-                );
+                if let Some(retained) = result.get("retained_bytes") {
+                    println!(
+                        "retained bytes: {retained} (limit per team/stream: {})",
+                        result["limit_bytes"]
+                    );
+                }
                 if let Some(deferred) = result.get("expiry_deferred") {
                     println!("expiry deferred: {deferred}");
                 }
