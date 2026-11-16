@@ -177,15 +177,27 @@ Run it as the user who owns the Gaebu home and the pager database, every few
 minutes. The interval only decides how soon a due report goes out; rounds
 are spaced by `--after`.
 
+A timer is registered once per machine and survives reboots and Gaebu
+reinstalls at the same path, because it only names the binary. It is not carried to
+another machine: register it again there.
+
 systemd (`~/.config/systemd/user/gaebu-stalled.service` and `.timer`):
 
 ```ini
+[Unit]
+Description=Report stalled gaebu seats and duties
+
 [Service]
 Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment="GAEBU_STALLED_NOTIFY=notify-send -a gaebu gaebu \"$GAEBU_STALLED_BODY\""
 ExecStart=%h/.local/bin/gaebu stalled --notify
 ```
 
 ```ini
+[Unit]
+Description=Run gaebu stalled --notify every five minutes
+
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=5min
@@ -194,11 +206,21 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 ```
 
-Give the service `GAEBU_STALLED_NOTIFY` through an `EnvironmentFile=`.
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now gaebu-stalled.timer
+```
+
+The service needs `PATH` to reach `pager`: a user unit does not inherit the
+login shell's `PATH`, and Gaebu runs `pager` by name. systemd leaves `$` in
+`Environment=` alone, so `sh` expands `$GAEBU_STALLED_BODY` when the command
+runs. Leave the second `Environment=` line out to get the human's lines in
+the journal instead (`journalctl --user -u gaebu-stalled.service`).
 
 launchd (`~/Library/LaunchAgents/dev.gaebu.stalled.plist`): a job whose
 `ProgramArguments` are `gaebu`, `stalled`, `--notify` with `StartInterval`
-set to `300`.
+set to `300`. Give it `PATH` through `EnvironmentVariables` for the same
+reason.
 
 Windows Task Scheduler:
 
@@ -206,8 +228,16 @@ Windows Task Scheduler:
 schtasks /Create /SC MINUTE /MO 5 /TN gaebu-stalled /TR "gaebu stalled --notify"
 ```
 
-These three entries are sketches: none of them has been installed and run.
-The command they run has.
+The systemd entry has been installed and run on Linux, with no finding to
+report at the time, so its `notify-send` line has not fired. The launchd and
+Task Scheduler entries are sketches that have not been installed.
+
+### Order on another machine
+
+1. Upgrade pager to 0.8.0 or later.
+2. Install Gaebu 0.9.0 or later.
+3. Restart every session that was running before step 1.
+4. Register the timer, if this machine should send reports.
 
 ### Moving to pager 0.8.0
 
