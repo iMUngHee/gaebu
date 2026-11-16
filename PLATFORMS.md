@@ -48,7 +48,7 @@ clippy and `cargo test --locked` (534 passed, 0 failed, 8 ignored helper and
 real-pager entry points) pass, covering the 0.4.0 to 0.9.0 archive, migration,
 repair, heal, handoff, purge and stall tests. `claude plugin test mod` passes
 26 of 26, and `real_pager_delivers_an_automation_report` passes against pager
-0.8.0 (`71e6749`) with a scratch `PAGER_DB`. Strict clippy for
+0.8.0 (`84ba3a4`) with a scratch `PAGER_DB`. Strict clippy for
 `x86_64-pc-windows-gnu` also runs here and caught a Unix-only test helper
 left unused on Windows.
 

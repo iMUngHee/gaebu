@@ -369,7 +369,7 @@ in code, without a physical power-loss test. See [platform checks](PLATFORMS.md)
   its session's next prompt. Only the seat is paged; its superior still reads
   the change on the next card. A session that appoints itself is paged too. A
   page still queued when the seat is confirmed or rebound again is dropped. See
-  [Notices](docs/model.md#notices). (4831ff3)
+  [Notices](docs/model.md#notices). (e850a9a)
 
 ### Upgrading
 
@@ -386,23 +386,23 @@ the page, not on its next prompt.
   duties. `schedule init`/`attach`, CLI/MCP item updates and commander or
   delegated-manager mode retain backlog, dependencies, ownership and explicit
   task-master review. PM references stay separate from PM lifecycle updates.
-  See [the Schedule guide](docs/schedules.md). (ff4e7fb)
+  See [the Schedule guide](docs/schedules.md). (a1e0033)
 - Immutable dispatch manifests, stable retry tokens, reconciliation and
   authoritative-absence abandonment prevent duplicate duties and stale-token
   replay. Schedule holds and cancellation are checked when accepting or
-  executing linked duties and taking or renewing leases. (ff4e7fb)
+  executing linked duties and taking or renewing leases. (a1e0033)
 - `bu form` and MCP `bu_form` atomically create a nested unit, move selected
   members and attenuate grants. Closing a clean unit returns seats to its
   parent for reuse while preserving historical duty origin. Parent-first
   Board output, full `duty show`/`duty_get` and role-specific summaries support
-  recovery after context loss. (ff4e7fb)
+  recovery after context loss. (a1e0033)
 
 ### Changed
 
 - The native mod is an operations desk: attention queue, selected inspector,
   nested organization and full contract reader. Wide panes split; narrow panes
   stack. Keyboard navigation, stale/unknown recovery, completed-duty detail,
-  Korean wrapping and the prompt band share the same CLI facts. (424b337)
+  Korean wrapping and the prompt band share the same CLI facts. (befaf37)
 
 ### Upgrading
 
@@ -410,7 +410,7 @@ Runtime schema is now 3. The first write keeps the exact legacy original in
 `state.v1.json` or `state.v2.json` and publishes schema 3 to current and previous
 generations. A 0.1/0.2 binary cannot read this state. Upgrade the binary and
 restart resident MCP processes before continuing coordinated work. Existing
-team and superior links remain; a separate scheduler is optional. (ff4e7fb)
+team and superior links remain; a separate scheduler is optional. (a1e0033)
 
 Unknown free-form Schedule files are refused without overwrite; there is no
 automatic conversion of an unseen legacy format. Cross-machine copies retain
@@ -428,18 +428,18 @@ terminal checks are listed in [PLATFORMS.md](PLATFORMS.md).
   card drops "가절월(추론)". The inferred quote stays in a team record.
   Inferred words still get the old `conflict`, so nothing is downgraded; a
   different `--team` is a conflict; an already explicit seat answers
-  "already appointed explicitly". (08d44de)
+  "already appointed explicitly". (cdec0e6)
 - Delegating `assign`, `amend`, `cancel` or `arbitrate` over no scope, through
   `bu open` without `--scope` or `grant`, is refused `invalid_argument` at
   once. Before, it succeeded and left a grant whose every later use was
   `out_of_scope`. `open` and `reassign`, which also work unscoped, still
-  delegate without a scope. (72b20d1)
+  delegate without a scope. (a9910fb)
 - `out_of_scope` names the verb, the requested patterns that fall outside,
   and what the grant or the accepted duties allow. It says when there is no
   accepted duty at all, and points to `src/**` when the allowed side is a
   bare `src`, which names one path. `invalid_scope` spells out the pattern
   grammar. A duty issued with no scope says that its assignee can take no
-  lease. (72b20d1)
+  lease. (a9910fb)
 
 ### Upgrading
 
@@ -452,24 +452,24 @@ apart from its version.
 
 - A quoted instruction shorter than six characters counts as evidence when it
   is the whole prompt ("멈춰"). Its stored text must still re-hash to the
-  recorded digest. (8db8844)
+  recorded digest. (d4f4167)
 - The hook shortens its card to one line only when the mod has stamped
   `gaebu session heartbeat --compose`, meaning its card section reached the
   system prompt. A live mod alone is no longer enough: where another plugin
   passes `prompt.compose` on past the mod, members got only the one-line card.
-  (e30bb1b)
-- The rule points plain-word team requests at `gaebu --help`. (3f82bd0)
+  (c8405ad)
+- The rule points plain-word team requests at `gaebu --help`. (e1e32c0)
 
 ### Added
 
 - The mod draws a band above the prompt: `⚑ <seat>  소임 N · 대기 W …`, or a
-  dim `⚑ 개부 자리 없음`. The name opens the `/gaebu` pane. (48df05e)
+  dim `⚑ 개부 자리 없음`. The name opens the `/gaebu` pane. (22f5898)
 
 ### Fixed
 
 - The writer-serialization tests allow 60 s instead of the CLI's 5 s deadline,
   which a slow Windows runner exceeded. Tests remove their temporary stores
-  even when they fail. (900147a, 7bf0824)
+  even when they fail. (3c514e2, 5d85784)
 
 ### Upgrading
 
@@ -508,7 +508,7 @@ keeps sending its own cards.
 ### Fixed
 
 - Review of 0.2: escalation askers must be live, notices keep their order,
-  and the board token excludes `rev`. (0e012b1)
+  and the board token excludes `rev`. (c7b03e5)
 
 ### Upgrading
 
