@@ -25,8 +25,8 @@ Archive fixture checks also pass with a symlinked `TMPDIR` on Linux. A Unix
 subprocess regression exercises the read counter and registration-move checks
 through that alias. Fixtures use canonical paths to match registration, and
 I/O failure tests use invalid paths rather than assuming an OS-specific error
-for a file used as a parent. The macOS and Windows CI rerun for this fixture
-correction remains pending.
+for a file used as a parent. CI passed on all three platforms with this
+fixture correction in run 43739085864 (2026-11-16).
 
 ## Windows
 
@@ -42,6 +42,15 @@ macOS 26.4 (arm64, APFS), Rust 1.95.0, 2026-11-11: `cargo fmt --check`,
 tests) pass, and `claude plugin test mod` passes 25 of 25. Clippy 1.95 rejects
 a negated `is_some_and` that newer toolchains accept; `src/identity.rs` uses
 `is_none_or` so both pass.
+
+macOS 26.4 (arm64, APFS), Rust 1.95.0, 2026-11-16, gaebu 0.9.0: fmt, strict
+clippy and `cargo test --locked` (534 passed, 0 failed, 8 ignored helper and
+real-pager entry points) pass, covering the 0.4.0 to 0.9.0 archive, migration,
+repair, heal, handoff, purge and stall tests. `claude plugin test mod` passes
+26 of 26, and `real_pager_delivers_an_automation_report` passes against pager
+0.8.0 (`71e6749`) with a scratch `PAGER_DB`. Strict clippy for
+`x86_64-pc-windows-gnu` also runs here and caught a Unix-only test helper
+left unused on Windows.
 
 `scripts/install.sh` replaces an installed binary by rename. Copying over it
 in place keeps the inode, and macOS then kills the upgraded binary with
@@ -81,22 +90,18 @@ physical power-loss persistence remains untested.
   explicitly with `gaebu compact --heal` or `gaebu schedule archive --heal`.
   A power loss can also bring back purged-team files after `purge_pending` was
   cleared; those files become unlisted leftovers that nothing reads.
-- macOS and Windows: run the 0.6.0 handoff, purge, legacy-path protection,
-  publication/removal failure and repair tests natively. Only Linux is exercised
-  locally; parent integration owns the three-platform CI gate.
-- macOS and Windows: run the 0.5.1 heal/pre-check/partial-failure tests natively.
-  Only Linux was executed locally; integration owns the three-platform CI gate.
-
-- macOS and Windows: run 0.5.0 segmented archives, lowered-limit maintenance,
-  delete-pending open retries, migration and repair on native filesystems. Only
-  Linux was executed locally; parent integration owns the three-platform CI gate.
-
-
-- macOS and Windows: run the 0.4.1 Schedule schema-2 commitment, pruning,
-  migration and held-snapshot truncation tests; only Linux was run locally.
-
-- macOS and Windows: run the 0.4.0 archive, migration, repair, locking and
-  native mod tests. Prior release checks below do not cover these changes.
+- Windows: run the 0.6.0 handoff, purge, legacy-path protection,
+  publication/removal failure and repair tests natively. Linux and macOS ran
+  them locally; parent integration owns the three-platform CI gate.
+- Windows: run the 0.5.1 heal/pre-check/partial-failure tests natively. Linux
+  and macOS ran them locally; integration owns the three-platform CI gate.
+- Windows: run 0.5.0 segmented archives, lowered-limit maintenance,
+  delete-pending open retries, migration and repair on a native filesystem.
+  Linux and macOS ran them locally; parent integration owns the CI gate.
+- Windows: run the 0.4.1 Schedule schema-2 commitment, pruning, migration and
+  held-snapshot truncation tests; Linux and macOS ran them locally.
+- Windows: run the 0.4.0 archive, migration, repair, locking and native mod
+  tests. Prior release checks below do not cover these changes.
 - Windows: directory fsync is unavailable through the portable standard-library
   path; storage retains file-sync/rename guarantees. Verify the new archive
   behavior on a native Windows filesystem.
