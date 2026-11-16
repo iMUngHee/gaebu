@@ -366,6 +366,27 @@ enum DutyCmd {
         #[arg(long, default_value = "")]
         reason: String,
     },
+    /// Record what an accepted duty waits on, so stall reports leave it alone
+    /// until the wait ends, or clear it.
+    #[command(group(clap::ArgGroup::new("on").required(true).args(["lease", "member", "clear"])))]
+    Wait {
+        duty: String,
+        /// A lease key inside this duty's scope, e.g. res:cargo.
+        #[arg(long)]
+        lease: Option<String>,
+        /// A member of the duty's team, by alias.
+        #[arg(long)]
+        member: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        /// Minutes (default 30, max 480).
+        #[arg(long, conflicts_with = "clear")]
+        ttl: Option<u64>,
+        #[arg(long, default_value = "", conflicts_with = "clear")]
+        note: String,
+        #[arg(long)]
+        version: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1024,8 +1045,8 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     print_json(&done);
                 } else {
                     println!(
-                        "[어사대] 보냄 {} · 대협에게 {} · 실패 {} · 미룸 {}",
-                        done.sent, done.human, done.failed, done.deferred
+                        "[어사대] 보냄 {} · 대협에게 {} · 실패 {} · 미룸 {} · 식힘 {}",
+                        done.sent, done.human, done.failed, done.deferred, done.cooling
                     );
                 }
                 return Ok(());
@@ -1154,6 +1175,25 @@ fn dispatch(cmd: Cmd, json: bool, pager: &dyn Pager) -> Result<()> {
                     }
                     DutyCmd::Cancel { duty, reason } => {
                         ops::duty_cancel(st, now, actor, &duty, &reason)
+                    }
+                    DutyCmd::Wait {
+                        duty,
+                        lease,
+                        member,
+                        clear: _,
+                        ttl,
+                        note,
+                        version,
+                    } => {
+                        let on = lease
+                            .map(ops::WaitFor::Lease)
+                            .or(member.map(ops::WaitFor::Member));
+                        let wait = on.map(|on| ops::WaitSpec {
+                            on,
+                            ttl_ms: ttl_ms(ttl),
+                            note,
+                        });
+                        ops::duty_wait(st, now, actor, &duty, wait, version)
                     }
                 }
             })

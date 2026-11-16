@@ -646,20 +646,23 @@ fn routing_and_key() {
     assert_eq!(first.key.len(), 16);
     assert_eq!(w.of(Kind::IdleAfterStop)[0].key, first.key);
 
-    // A seated manager hears it before the commander does.
+    // The duty's issuer hears it before a seated manager does.
     let clerk = w.id("clerk");
     w.schedule();
     w.tx(|st| {
         st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
         Ok(())
     });
-    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "clerk");
+    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "boss");
     // Whoever hears it stopping or starting does not make it a new finding.
     w.stops("clerk", 40);
     w.stops("boss", 40);
     assert_eq!(w.of(Kind::IdleAfterStop)[0].key, first.key);
 
-    // A manager whose host is gone cannot hear it; the commander can.
+    // An issuer whose host is gone cannot hear it; the manager can.
+    w.gone("boss");
+    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "clerk");
+    // A manager whose host is gone is passed over too.
     w.gone("clerk");
     assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "boss");
     // With both gone, only the human is left.
@@ -771,28 +774,44 @@ fn rest_counts_from_the_threshold_itself() {
 #[test]
 fn recipient_must_hold_a_confirmed_seat() {
     let w = World::new();
-    w.accepted("aide");
+    let duty = w.issued_by_clerk();
     w.stops("aide", 30);
     let clerk = w.id("clerk");
-    w.schedule();
     let set = |f: &dyn Fn(&mut Member)| {
         w.tx(|st| {
-            st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
             f(st.members.get_mut(&clerk).unwrap());
             Ok(())
         })
     };
-    set(&|_| {});
-    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "clerk");
-    // A manager whose seat awaits its session cannot be told.
+    let to = || alias_of(&w.about(&duty)[0].report_to).to_owned();
+    assert_eq!(to(), "clerk");
+    // An issuer whose seat awaits its session cannot be told.
     set(&|m| m.binding.state = BindingState::Pending);
-    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "boss");
+    assert_eq!(to(), "boss");
     // Nor one that was dismissed while its binding still reads bound.
     set(&|m| {
         m.binding.state = BindingState::Bound;
         m.status = MemberStatus::Dismissed;
     });
-    assert_eq!(alias_of(&w.of(Kind::IdleAfterStop)[0].report_to), "boss");
+    assert_eq!(to(), "boss");
+
+    // A manager, who hears of a ready item first, is held to the same.
+    let w = World::new();
+    w.schedule();
+    w.item("ready work");
+    let clerk = w.id("clerk");
+    w.tx(|st| {
+        st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
+        Ok(())
+    });
+    w.stops("boss", 30);
+    assert_eq!(alias_of(&w.of(Kind::ReadyButIdle)[0].report_to), "clerk");
+    w.tx(|st| {
+        st.members.get_mut(&clerk).unwrap().binding.state = BindingState::Pending;
+        Ok(())
+    });
+    // The commander is the one waited on, so only the human is left.
+    assert_eq!(w.of(Kind::ReadyButIdle)[0].report_to, Recipient::Human);
 }
 
 #[test]
@@ -1151,13 +1170,16 @@ fn notify_recurrence_and_recipient() {
     assert_eq!(w.notify_at(t + AFTER).sent, 1);
     assert_eq!(w.sends()[0].event, first.event.replace("-r1", "-r2"));
 
-    // Another member becomes the one to tell: that is a first report.
+    // Another member becomes the one to tell: that is a first report. The
+    // issuer comes first, so a manager hears it once the issuer cannot.
     let clerk = w.id("clerk");
     w.schedule();
     w.tx(|st| {
         st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
         Ok(())
     });
+    assert_eq!(w.notify_at(t + AFTER + 1).sent, 0);
+    w.gone("boss");
     assert_eq!(w.notify_at(t + AFTER + 1).sent, 1);
     let to_clerk = w.sends().remove(0);
     assert_eq!(to_clerk.target, "clerk");
@@ -1452,4 +1474,613 @@ fn notify_reads_what_a_person_or_an_older_release_left() {
     assert_eq!((run.sent, run.human), (0, 1));
     assert!(w.sends().is_empty());
     assert!(w.told()[0].ends_with("세 번 알린 뒤에도 그대로임"));
+}
+
+impl World {
+    /// `alias` records that `duty` waits on `on`.
+    fn waits(&self, alias: &str, duty: &str, on: ops::WaitFor) {
+        let actor = self.actor(alias);
+        let spec = ops::WaitSpec {
+            on,
+            ttl_ms: None,
+            note: String::new(),
+        };
+        self.tx(|st| ops::duty_wait(st, now_ms(), &actor, duty, Some(spec), None));
+    }
+    /// `alias` takes a lease on `key`.
+    fn leases(&self, alias: &str, key: &str, mode: LeaseMode) -> String {
+        let actor = self.actor(alias);
+        self.tx(|st| ops::lease_acquire(st, now_ms(), &actor, key, mode, None, "check"))
+            .ids[0]
+            .clone()
+    }
+    fn about(&self, duty: &str) -> Vec<Finding> {
+        self.findings()
+            .into_iter()
+            .filter(|f| f.subject == duty)
+            .collect()
+    }
+}
+
+#[test]
+fn duty_wait_on_a_lease() {
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.accepted("clerk");
+    let lease = w.leases("clerk", "src/a", LeaseMode::Exclusive);
+    w.waits("aide", &duty, ops::WaitFor::Lease("src/a".into()));
+    w.stops("aide", 30);
+    // Another member holds what the assignee waits for.
+    assert!(w.about(&duty).is_empty());
+
+    // A wait is for exclusive use: a shared lease also keeps it waiting.
+    let set = |lease: &str, change: fn(&mut Lease)| {
+        w.tx(|st| {
+            change(st.leases.get_mut(lease).unwrap());
+            Ok(())
+        })
+    };
+    set(&lease, |l| l.mode = LeaseMode::Shared);
+    assert!(w.about(&duty).is_empty());
+
+    // A lease that no longer binds ends the wait: one taken through a
+    // session its holder no longer has, or one past its expiry. The next
+    // write drops such a lease, so each case takes a new one.
+    set(&lease, |l| l.holder_session = "s-before".into());
+    assert_eq!(w.about(&duty)[0].kind, Kind::IdleAfterStop);
+    let lease = w.leases("clerk", "src/a", LeaseMode::Exclusive);
+    assert!(w.about(&duty).is_empty());
+    let now = w.now;
+    w.tx(|st| {
+        st.leases.get_mut(&lease).unwrap().expires_at = now;
+        Ok(())
+    });
+    assert_eq!(w.about(&duty)[0].kind, Kind::IdleAfterStop);
+
+    // So does the wait's own expiry.
+    let lease = w.leases("clerk", "src/a", LeaseMode::Exclusive);
+    let until = |at: Ms| {
+        w.tx(|st| {
+            st.duties
+                .get_mut(&duty)
+                .unwrap()
+                .wait
+                .as_mut()
+                .unwrap()
+                .until = at;
+            Ok(())
+        })
+    };
+    until(w.now);
+    let idle = w.about(&duty);
+    assert_eq!(idle.len(), 1);
+    assert_eq!(idle[0].kind, Kind::IdleAfterStop);
+    assert_eq!(waited(&idle[0]), "aide");
+    until(w.now + MINUTE);
+    assert!(w.about(&duty).is_empty());
+
+    // And the lease's release.
+    let clerk = w.actor("clerk");
+    w.tx(|st| ops::lease_release(st, now_ms(), &clerk, &lease));
+    assert_eq!(w.about(&duty)[0].kind, Kind::IdleAfterStop);
+}
+
+#[test]
+fn duty_wait_on_a_lease_counts_only_another_members_in_reach() {
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.waits("aide", &duty, ops::WaitFor::Lease("src/a".into()));
+    w.stops("aide", 30);
+
+    // The assignee's own lease is not something to wait for.
+    w.leases("aide", "src/a", LeaseMode::Exclusive);
+    assert_eq!(w.about(&duty)[0].kind, Kind::IdleAfterStop);
+    w.tx(|st| {
+        st.leases.clear();
+        Ok(())
+    });
+
+    // Nor is one held in a team of another project.
+    w.tx(|st| {
+        ops::dev_seed(
+            st,
+            w.now - 600 * MINUTE,
+            &SeedSpec {
+                team: "elsewhere".into(),
+                project: "other-project".into(),
+                commander_alias: "far".into(),
+                commander_session: Some("s-far".into()),
+                commander_tool: Some(Tool::Codex),
+                members: vec![],
+            },
+        )?;
+        let far = authz::member_for_session(st, "s-far").unwrap().clone();
+        st.leases.insert(
+            "l-far".into(),
+            Lease {
+                id: "l-far".into(),
+                team: far.team.clone(),
+                key: "src/a".into(),
+                mode: LeaseMode::Exclusive,
+                holder: far.id.clone(),
+                holder_session: "s-far".into(),
+                reason: "elsewhere".into(),
+                acquired_at: w.now,
+                expires_at: w.now + 60 * MINUTE,
+            },
+        );
+        Ok(())
+    });
+    w.prompts("far", 1);
+    assert_eq!(w.about(&duty)[0].kind, Kind::IdleAfterStop);
+}
+
+#[test]
+fn duty_wait_on_a_member() {
+    let w = World::new();
+    let duty = w.accepted("aide");
+    w.waits("aide", &duty, ops::WaitFor::Member("clerk".into()));
+    w.stops("aide", 30);
+    // The member waited on is working.
+    assert!(w.about(&duty).is_empty());
+
+    // It rests: the duty waits on it, and the issuer hears so.
+    w.stops("clerk", 20);
+    let waiting = w.about(&duty);
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].kind, Kind::CounterpartIdle);
+    assert_eq!(waited(&waiting[0]), "clerk");
+    assert_eq!(alias_of(&waiting[0].report_to), "boss");
+
+    // Without a seat it can be waited on no longer.
+    let clerk = w.id("clerk");
+    w.tx(|st| {
+        st.members.get_mut(&clerk).unwrap().binding.state = BindingState::Vacant;
+        Ok(())
+    });
+    let idle = w.about(&duty);
+    assert_eq!(idle.len(), 1);
+    assert_eq!(idle[0].kind, Kind::IdleAfterStop);
+    assert_eq!(waited(&idle[0]), "aide");
+}
+
+impl World {
+    /// clerk heads a bu with aide in it and issues aide a duty it accepts.
+    fn issued_by_clerk(&self) -> String {
+        let (boss, clerk, aide) = (self.actor("boss"), self.id("clerk"), self.id("aide"));
+        let scope = ["src/**".to_owned()];
+        let bu = self
+            .tx(|st| ops::bu_open(st, now_ms(), &boss, &clerk, None, &[Verb::Assign], &scope))
+            .ids[0]
+            .clone();
+        self.tx(|st| ops::member_move(st, now_ms(), &boss, &aide, &bu));
+        let issuer = self.actor("clerk");
+        let duty = self
+            .tx(|st| ops::duty_issue(st, now_ms(), &issuer, &aide, spec()))
+            .ids[0]
+            .clone();
+        let assignee = self.actor("aide");
+        self.tx(|st| ops::duty_respond(st, now_ms(), &assignee, &duty, None, true, None));
+        duty
+    }
+}
+
+#[test]
+fn routing_prefers_the_issuer() {
+    let w = World::new();
+    let duty = w.issued_by_clerk();
+    w.stops("aide", 30);
+    let to = || alias_of(&w.about(&duty)[0].report_to).to_owned();
+    // The issuer, though the commander could hear it.
+    assert_eq!(to(), "clerk");
+
+    // An issuer that cannot hear it is passed over: its host is gone, its
+    // unit is cancelled, or it sits in another team.
+    w.gone("clerk");
+    assert_eq!(to(), "boss");
+    *w.pager.hosts.borrow_mut() = Some(Hosts::all(HostStatus::Live));
+    assert_eq!(to(), "clerk");
+
+    let clerk = w.id("clerk");
+    let home = w.store.read().unwrap().members[&clerk].bu.clone();
+    w.tx(|st| {
+        let mut gone = st.bus[&home].clone();
+        gone.id = "b-gone".into();
+        gone.status = BuStatus::Cancelled;
+        st.bus.insert(gone.id.clone(), gone);
+        st.members.get_mut(&clerk).unwrap().bu = "b-gone".into();
+        Ok(())
+    });
+    assert_eq!(to(), "boss");
+    w.tx(|st| {
+        st.members.get_mut(&clerk).unwrap().bu = home.clone();
+        Ok(())
+    });
+    assert_eq!(to(), "clerk");
+
+    w.tx(|st| {
+        st.members.get_mut(&clerk).unwrap().team = "t-elsewhere".into();
+        Ok(())
+    });
+    assert_eq!(to(), "boss");
+}
+
+#[test]
+fn item_findings_still_go_to_the_manager_first() {
+    let w = World::new();
+    w.schedule();
+    let item = w.item("ready work");
+    let clerk = w.id("clerk");
+    w.tx(|st| {
+        st.schedules.values_mut().next().unwrap().manager = Some(clerk.clone());
+        Ok(())
+    });
+    w.stops("boss", 30);
+    let ready = w.of(Kind::ReadyButIdle);
+    assert_eq!(ready[0].subject, item);
+    assert_eq!(alias_of(&ready[0].report_to), "clerk");
+}
+
+impl World {
+    /// A Schedule item owned by `bu`.
+    fn item_of(&self, title: &str, bu: &str) -> String {
+        schedule::call(
+            &self.store,
+            &self.pager,
+            &self.caller(),
+            "schedule_add",
+            &json!({"title":title,"scope":["src/**"],"owner_bu":bu}),
+        )
+        .unwrap()["item"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    /// A bu headed by `head`, with `members` moved into it.
+    fn unit(&self, head: &str, members: &[&str]) -> String {
+        let boss = self.actor("boss");
+        let head = self.id(head);
+        let scope = ["src/**".to_owned()];
+        let bu = self
+            .tx(|st| ops::bu_open(st, now_ms(), &boss, &head, None, &[Verb::Assign], &scope))
+            .ids[0]
+            .clone();
+        for member in members {
+            let member = self.id(member);
+            self.tx(|st| ops::member_move(st, now_ms(), &boss, &member, &bu));
+        }
+        bu
+    }
+    /// More seated workers below boss, each mid-turn, as aide is.
+    fn hire(&self, aliases: &[&str]) {
+        let aide = self.id("aide");
+        self.tx(|st| {
+            for alias in aliases {
+                let mut member = st.members[&aide].clone();
+                member.id = format!("m-{alias}");
+                member.binding.alias = (*alias).to_owned();
+                member.binding.session_id = Some(format!("s-{alias}"));
+                st.members.insert(member.id.clone(), member);
+            }
+            Ok(())
+        });
+        for alias in aliases {
+            self.prompts(alias, 500);
+        }
+    }
+    fn done(&self, alias: &str, duty: &str) {
+        let actor = self.actor(alias);
+        self.tx(|st| ops::duty_progress(st, now_ms(), &actor, duty, DutyStatus::Done, Some("ok")));
+    }
+}
+
+#[test]
+fn ready_item_needs_a_free_leaf() {
+    let w = World::new();
+    w.schedule();
+    let first = w.item("first");
+    w.item("second");
+    w.stops("boss", 30);
+    // One report per master: the first ready item in Schedule order.
+    let ready = w.of(Kind::ReadyButIdle);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].subject, first);
+    assert_eq!(waited(&ready[0]), "boss");
+
+    // Nobody below is free: nothing to hand the work to.
+    let aide_duty = w.accepted("aide");
+    w.accepted("clerk");
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    // One worker finishes.
+    w.done("aide", &aide_duty);
+    let ready = w.of(Kind::ReadyButIdle);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].subject, first);
+}
+
+#[test]
+fn ready_items_of_two_masters_are_judged_apart() {
+    let w = World::new();
+    w.schedule();
+    let root = w.store.read().unwrap().members[&w.id("boss")].bu.clone();
+    let unit = w.unit("clerk", &["aide"]);
+    let mine = w.item_of("boss's", &root);
+    let theirs = w.item_of("clerk's", &unit);
+    w.stops("boss", 30);
+    w.stops("clerk", 30);
+    let mut ready: Vec<_> = w
+        .of(Kind::ReadyButIdle)
+        .into_iter()
+        .map(|f| (waited(&f).to_owned(), f.subject))
+        .collect();
+    ready.sort();
+    assert_eq!(ready, [("boss".into(), mine), ("clerk".into(), theirs)]);
+
+    // clerk heads a unit, so only aide, the leaf, counts as free; once aide
+    // is busy neither master has room.
+    w.accepted("aide");
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+}
+
+#[test]
+fn ready_item_for_a_solo_master() {
+    let w = World::new();
+    w.schedule();
+    let unit = w.unit("clerk", &[]);
+    let item = w.item_of("clerk's", &unit);
+    w.stops("clerk", 30);
+    // Nobody below: clerk does the work itself.
+    let ready = w.of(Kind::ReadyButIdle);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].subject, item);
+    assert_eq!(waited(&ready[0]), "clerk");
+    // Unless clerk holds an open duty, whose own finding covers the rest.
+    w.accepted("clerk");
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    assert_eq!(w.of(Kind::IdleAfterStop).len(), 1);
+}
+
+#[test]
+fn ready_item_waits_when_no_one_below_can_take_it() {
+    let w = World::new();
+    w.schedule();
+    w.item("work");
+    w.stops("boss", 30);
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+    let set = |alias: &str, state: BindingState| {
+        let id = w.id(alias);
+        w.tx(|st| {
+            st.members.get_mut(&id).unwrap().binding.state = state;
+            Ok(())
+        })
+    };
+    // Members below that hold no confirmed seat cannot take it, and boss is
+    // not counted as working alone while they are there.
+    let (aide, clerk) = (w.id("aide"), w.id("clerk"));
+    set("aide", BindingState::Pending);
+    set("clerk", BindingState::Pending);
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    w.tx(|st| {
+        st.members.get_mut(&aide).unwrap().binding.state = BindingState::Bound;
+        st.members.get_mut(&clerk).unwrap().binding.state = BindingState::Bound;
+        Ok(())
+    });
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+    // Nor can members whose host is gone.
+    *w.pager.hosts.borrow_mut() = Some(Hosts::from_rows(vec![
+        ("aide".into(), HostStatus::Gone),
+        ("clerk".into(), HostStatus::Gone),
+    ]));
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+}
+
+/// A live team's shape: seventeen ready items, four workers that all hold
+/// open duties, and a commander at rest.
+#[test]
+fn vm_feedback_busy_team_is_quiet() {
+    let w = World::new();
+    w.hire(&["fasa", "cazi"]);
+    w.schedule();
+    for n in 0..17 {
+        w.item(&format!("ready {n}"));
+    }
+    let fasa_duty = w.accepted("fasa");
+    for alias in ["aide", "clerk", "cazi"] {
+        w.accepted(alias);
+    }
+    w.stops("boss", 30);
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    let summary = w.notify_at(w.now);
+    assert_eq!((summary.sent, summary.human), (0, 0));
+
+    // fasa finishes: one report, not seventeen.
+    w.done("fasa", &fasa_duty);
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+    let summary = w.notify_at(w.now + 1);
+    assert_eq!(summary.sent + summary.human, 1);
+}
+
+impl World {
+    /// The Schedule's manager, `by`, reorders an item.
+    fn prioritize(&self, by: &str, item: &str, priority: u64) {
+        let caller = Caller {
+            session_id: format!("s-{by}"),
+            ..self.caller()
+        };
+        schedule::call(
+            &self.store,
+            &self.pager,
+            &caller,
+            "schedule_update",
+            &json!({"item":item,"priority":priority}),
+        )
+        .unwrap();
+    }
+    /// `alias` manages the Schedule, with the grant a delegated manager has.
+    fn manager(&self, alias: &str) {
+        let (boss, id) = (self.actor("boss"), self.id(alias));
+        let scope = ["src/**".to_owned()];
+        self.tx(|st| ops::grant(st, now_ms(), &boss, &id, &[Verb::Assign], &scope));
+        self.tx(|st| {
+            st.schedules.values_mut().next().unwrap().manager = Some(id.clone());
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn notify_cooldown_spans_new_keys() {
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).sent, 1);
+    w.sends();
+
+    // The assignee wakes and rests again: a new wait, under a new key, on a
+    // duty its issuer heard of a moment ago.
+    w.prompts("aide", 25);
+    w.stops("aide", 20);
+    let summary = w.notify_at(t + 1);
+    assert_eq!(summary.sent, 0);
+    assert!(summary.cooling >= 1);
+    assert_eq!(w.notify_at(t + 4 * AFTER - 1).sent, 0);
+    assert_eq!(w.notify_at(t + 4 * AFTER).sent, 1);
+}
+
+#[test]
+fn notify_cooldown_holds_for_a_master_whatever_item_leads() {
+    let w = World::new();
+    w.schedule();
+    let first = w.item("first");
+    let second = w.item("second");
+    w.manager("clerk");
+    w.stops("boss", 30);
+    let t = w.now;
+
+    // A report pager refused starts no cooldown.
+    w.pager.refuse.set(true);
+    assert_eq!(w.notify_at(t).failed, 1);
+    w.pager.refuse.set(false);
+    w.sends();
+    w.prioritize("clerk", &second, 1);
+    assert_eq!(w.notify_at(t + 1).sent, 1);
+    let report = w.sends().remove(0);
+    assert!(report.body.contains(&second));
+
+    // The first item leads again. Its report was never accepted, so its
+    // retry waits like any first report: the master was just reported.
+    w.prioritize("clerk", &first, 0);
+    let summary = w.notify_at(t + 2);
+    assert_eq!(summary.sent, 0);
+    assert!(summary.cooling >= 1);
+    assert_eq!(w.notify_at(t + 1 + 4 * AFTER).sent, 1);
+    assert!(w.sends().remove(0).body.contains(&first));
+}
+
+#[test]
+fn notify_cooldown_counts_only_accepted_reports() {
+    let w = World::new();
+    w.hire(&["fasa", "cazi", "wavi", "fibu"]);
+    for alias in ["aide", "clerk", "fasa", "cazi", "wavi", "fibu"] {
+        w.accepted(alias);
+        w.stops(alias, 30);
+    }
+    let t = w.now;
+    let summary = w.notify_at(t);
+    assert_eq!((summary.sent, summary.deferred), (5, 1));
+    // The one the per-recipient limit held back was never reported.
+    assert_eq!(w.notify_at(t + 1).sent, 1);
+}
+
+#[test]
+fn notify_cooldown_covers_reports_to_the_human() {
+    let w = World::new();
+    w.schedule();
+    w.item("work");
+    // boss is waited on and nobody else can be told.
+    w.stops("boss", 30);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).human, 1);
+    w.prompts("boss", 25);
+    w.stops("boss", 20);
+    let summary = w.notify_at(t + 1);
+    assert_eq!(summary.human, 0);
+    assert!(summary.cooling >= 1);
+    assert_eq!(w.notify_at(t + 4 * AFTER).human, 1);
+}
+
+#[test]
+fn ready_item_waits_while_its_leaves_are_held_or_cancelled() {
+    let w = World::new();
+    w.schedule();
+    w.item("work");
+    let unit = w.unit("clerk", &["aide"]);
+    w.stops("boss", 30);
+    // aide, the only leaf, is free.
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+
+    // A leaf under a human hold cannot take it.
+    w.tx(|st| ops::root_hold(st, now_ms(), &said(1), &unit, "a moment"));
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    w.tx(|st| ops::root_release(st, now_ms(), &said(2), &unit));
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+
+    // Nor can one whose unit was cancelled, though its seat stays bound.
+    let boss = w.actor("boss");
+    w.tx(|st| ops::bu_cancel(st, now_ms(), &boss, &unit, "stop"));
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+}
+
+#[test]
+fn ready_item_counts_proposed_and_blocked_duties_as_busy() {
+    let w = World::new();
+    w.schedule();
+    w.item("work");
+    w.accepted("clerk");
+    w.stops("boss", 30);
+    assert_eq!(w.of(Kind::ReadyButIdle).len(), 1);
+
+    let duty = w.proposes("aide");
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+    let aide = w.actor("aide");
+    w.tx(|st| ops::duty_respond(st, now_ms(), &aide, &duty, None, true, None));
+    w.tx(|st| {
+        ops::duty_progress(
+            st,
+            now_ms(),
+            &aide,
+            &duty,
+            DutyStatus::Blocked,
+            Some("stuck"),
+        )
+    });
+    assert!(w.of(Kind::ReadyButIdle).is_empty());
+}
+
+#[test]
+fn notify_cooldown_keeps_subjects_apart() {
+    // Another kind of finding on the same duty is other news.
+    let w = World::new();
+    w.accepted("aide");
+    w.stops("aide", 30);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).sent, 1);
+    w.gone("aide");
+    assert_eq!(w.of(Kind::HostGone).len(), 1);
+    assert_eq!(w.notify_at(t + 1).sent, 1);
+
+    // So is the same kind waiting on another member.
+    let w = World::new();
+    w.hire(&["fasa"]);
+    let duty = w.accepted("aide");
+    w.waits("aide", &duty, ops::WaitFor::Member("clerk".into()));
+    w.stops("aide", 30);
+    w.stops("clerk", 20);
+    let t = w.now;
+    assert_eq!(w.notify_at(t).sent, 1);
+    w.waits("aide", &duty, ops::WaitFor::Member("fasa".into()));
+    w.stops("fasa", 20);
+    assert_eq!(w.of(Kind::CounterpartIdle).len(), 1);
+    assert_eq!(w.notify_at(t + 1).sent, 1);
 }

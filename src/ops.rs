@@ -272,6 +272,7 @@ pub fn root_dismiss(st: &mut State, now: Ms, ev: &Evidence, alias: &str) -> Resu
         .filter(|d| affected.contains(&d.assignee) && duty_open(d.status))
     {
         d.status = DutyStatus::Cancelled;
+        d.wait = None;
         d.version += 1;
         d.updated_at = now;
     }
@@ -1172,6 +1173,7 @@ pub fn duty_issue(
             hold: None,
             source,
             schedule_ref: None,
+            wait: None,
         },
     );
     let message = format!("new duty {id} '{}' proposed", st.duties[&id].outcome);
@@ -1281,6 +1283,7 @@ pub fn duty_progress(
     authz::not_held(st, &d)?;
     let d = st.duties.get_mut(duty).unwrap();
     d.status = status;
+    d.wait = None;
     d.note = note.map(str::to_owned);
     d.version += 1;
     d.updated_at = now;
@@ -1340,6 +1343,7 @@ pub fn duty_amend(
     d.version += 1;
     d.updated_at = now;
     d.status = DutyStatus::Proposed;
+    d.wait = None;
     let assignee = d.assignee.clone();
     changed(
         st,
@@ -1375,6 +1379,7 @@ pub fn duty_cancel(
     }
     let d = st.duties.get_mut(duty).unwrap();
     d.status = DutyStatus::Cancelled;
+    d.wait = None;
     d.note = Some(reason.into());
     d.version += 1;
     d.updated_at = now;
@@ -1388,6 +1393,99 @@ pub fn duty_cancel(
         Notify::Act(NoticeKind::Release),
     );
     Ok(out("duty cancelled", vec![duty.into()]))
+}
+
+/// What a wait names, before it is resolved against the state.
+#[derive(Debug, Clone)]
+pub enum WaitFor {
+    /// A lease key inside the duty's own scope.
+    Lease(String),
+    /// A member of the duty's team, by alias, title or id.
+    Member(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct WaitSpec {
+    pub on: WaitFor,
+    /// 30 minutes when absent; capped at 8 hours, as a lease's is.
+    pub ttl_ms: Option<Ms>,
+    pub note: String,
+}
+
+/// The assignee records what an accepted duty waits on, or clears it with
+/// `None`. Stall detection leaves the duty alone while the wait holds, so
+/// waiting on purpose is not reported as resting.
+pub fn duty_wait(
+    st: &mut State,
+    now: Ms,
+    actor: &Actor,
+    duty: &str,
+    wait: Option<WaitSpec>,
+    version: Option<u64>,
+) -> Result<Outcome> {
+    let a = authz::check_actor(st, actor)?.clone();
+    let d = find_duty(st, duty)?.clone();
+    if d.assignee != a.id {
+        return refuse(Reason::NoGrant, "only assignee may record a wait");
+    }
+    if d.status == DutyStatus::Cancelled || authz::bu_cancelled(st, &d.bu) {
+        return refuse(Reason::Cancelled, "duty cancelled");
+    }
+    if version.is_some_and(|v| v != d.version) || d.status != DutyStatus::Accepted {
+        return refuse(Reason::Conflict, "duty version or status changed");
+    }
+    authz::not_held(st, &d)?;
+    let (wait, text) = match wait {
+        None if d.wait.is_none() => return refuse(Reason::Conflict, "duty has no wait"),
+        None => (None, format!("duty {duty} no longer waits")),
+        Some(spec) => {
+            let (on, named) = match spec.on {
+                WaitFor::Lease(raw) => {
+                    let key = scope::parse(&raw)?.as_string();
+                    // Another duty's scope would let a wide lease hide this one.
+                    if !scope::within(std::slice::from_ref(&key), &d.scope)? {
+                        return refuse(
+                            Reason::OutOfScope,
+                            format!("{key} lies outside the scope of duty {duty}"),
+                        );
+                    }
+                    (WaitOn::Lease { key: key.clone() }, key)
+                }
+                WaitFor::Member(raw) => {
+                    let id = authz::resolve_member(st, Some(&d.team), &raw)?;
+                    let m = &st.members[&id];
+                    if m.team != d.team || m.status != MemberStatus::Active {
+                        return refuse(
+                            Reason::NotMember,
+                            format!("{raw} is not an active member of the duty's team"),
+                        );
+                    }
+                    if id == a.id {
+                        return refuse(
+                            Reason::InvalidArgument,
+                            "a duty cannot wait on its assignee",
+                        );
+                    }
+                    let alias = m.binding.alias.clone();
+                    (WaitOn::Member { id }, alias)
+                }
+            };
+            let wait = Wait {
+                on,
+                note: spec.note,
+                at: now,
+                until: now.saturating_add(ttl(spec.ttl_ms)?),
+            };
+            (Some(wait), format!("duty {duty} waits on {named}"))
+        }
+    };
+    let d = st.duties.get_mut(duty).unwrap();
+    d.wait = wait;
+    d.version += 1;
+    d.updated_at = now;
+    let issuer = d.issuer.clone();
+    changed(st, now, &a.id, &[issuer], &text, Notify::Record);
+    Ok(out("duty wait recorded", vec![duty.into()]))
 }
 
 // ----- leases -----
@@ -1409,25 +1507,14 @@ pub fn lease_acquire(
     lease_scope(st, &a.id, &key_text, "lease requires accepted duty scope")?;
     let ttl = ttl(ttl_ms)?;
     expire_leases(st, now);
-    let project = &st.teams[&a.team].project;
-    for l in st.leases.values().filter(|l| {
-        l.team == a.team
-            || (!project.is_empty()
-                && st.teams.get(&l.team).is_some_and(|team| {
-                    team.status == TeamStatus::Active && team.project == *project
-                }))
-    }) {
-        if (mode == LeaseMode::Exclusive || l.mode == LeaseMode::Exclusive)
-            && scope::parse(&l.key)?.overlaps(&key)
-        {
-            return refuse(
-                Reason::LeasedBy,
-                format!(
-                    "{} holds {} ({}) in team {} ({})",
-                    l.holder, l.key, l.id, st.teams[&l.team].name, l.team,
-                ),
-            );
-        }
+    if let Some(l) = conflicting_leases(st, &a.team, &key, mode, now)?.first() {
+        return refuse(
+            Reason::LeasedBy,
+            format!(
+                "{} holds {} ({}) in team {} ({})",
+                l.holder, l.key, l.id, st.teams[&l.team].name, l.team,
+            ),
+        );
     }
     let id = st.mint("l");
     st.leases.insert(
@@ -1563,14 +1650,53 @@ pub fn lease_force_release(
 
 /// Drop expired leases (called at the start of every transaction).
 pub fn expire_leases(st: &mut State, now: Ms) {
-    st.leases.retain(|_, lease| {
-        lease.expires_at > now
-            && st.members.get(&lease.holder).is_some_and(|m| {
-                m.binding.state == crate::model::BindingState::Bound
-                    && m.binding.session_id.as_deref() == Some(&lease.holder_session)
-                    && m.status == crate::model::MemberStatus::Active
-            })
-    });
+    st.leases
+        .retain(|_, lease| lease_live(&st.members, lease, now));
+}
+
+/// Whether a lease still binds: unexpired, and held by an active member
+/// through the session that took it. `expire_leases` drops every other one;
+/// a reader that cannot write applies the same test instead.
+pub(crate) fn lease_live(
+    members: &std::collections::BTreeMap<String, Member>,
+    lease: &Lease,
+    now: Ms,
+) -> bool {
+    lease.expires_at > now
+        && members.get(&lease.holder).is_some_and(|m| {
+            m.binding.state == BindingState::Bound
+                && m.binding.session_id.as_deref() == Some(&lease.holder_session)
+                && m.status == MemberStatus::Active
+        })
+}
+
+/// The live leases that `key`, taken in `mode` by a member of `team`, would
+/// collide with: held in that team or in an active team of the same
+/// non-empty project, overlapping it, and exclusive on either side.
+pub(crate) fn conflicting_leases<'a>(
+    st: &'a State,
+    team: &str,
+    key: &scope::Pattern,
+    mode: LeaseMode,
+    now: Ms,
+) -> Result<Vec<&'a Lease>> {
+    let project = st.teams.get(team).map_or("", |team| team.project.as_str());
+    let mut hits = Vec::new();
+    for l in st.leases.values().filter(|l| {
+        lease_live(&st.members, l, now)
+            && (l.team == team
+                || (!project.is_empty()
+                    && st.teams.get(&l.team).is_some_and(|other| {
+                        other.status == TeamStatus::Active && other.project == project
+                    })))
+    }) {
+        if (mode == LeaseMode::Exclusive || l.mode == LeaseMode::Exclusive)
+            && scope::parse(&l.key)?.overlaps(key)
+        {
+            hits.push(l);
+        }
+    }
+    Ok(hits)
 }
 
 // ----- escalations and records -----
@@ -2180,6 +2306,7 @@ fn cancel_bu(st: &mut State, now: Ms, bu: &str) -> Vec<String> {
         .filter(|d| bus.contains(&d.bu) && duty_open(d.status))
     {
         d.status = DutyStatus::Cancelled;
+        d.wait = None;
         d.version += 1;
         d.updated_at = now;
     }

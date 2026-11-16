@@ -32,6 +32,11 @@ const PER_RECIPIENT: usize = 5;
 /// How long a finding no longer seen keeps its rounds. A hold or one failed
 /// read hides a finding without ending the wait behind it.
 const RETENTION: Ms = 7 * 24 * 60 * 60 * 1000;
+/// A wait not yet reported is held back while its subject was reported to
+/// the same recipient less than this many times `--after` ago. Every rest
+/// is a new wait, so a session that wakes and rests again would otherwise
+/// start its rounds over each time.
+const COOLDOWN: Ms = 4;
 const IO_DEADLINE: Duration = Duration::from_secs(5);
 /// The human's command may hang; the ledger lock must not hang with it.
 pub const HUMAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -127,6 +132,9 @@ struct Entry {
 #[serde(default)]
 struct Ledger {
     entries: BTreeMap<String, Entry>,
+    /// When a report about a subject to a recipient was last accepted, by
+    /// `lineage`.
+    lineages: BTreeMap<String, Ms>,
 }
 
 /// What one run did.
@@ -141,6 +149,9 @@ pub struct Summary {
     pub failed: usize,
     /// Findings held back by the per-recipient limit.
     pub deferred: usize,
+    /// First reports held back because their subject was reported to the
+    /// same recipient within the cooldown.
+    pub cooling: usize,
 }
 
 /// Find stalls and report each one that is due.
@@ -174,6 +185,11 @@ pub fn run(
         };
         let id = format!("{}:{to}", finding.key);
         present.push(id.clone());
+        let lineage = lineage(finding, to);
+        let cooled = ledger
+            .lineages
+            .get(&lineage)
+            .is_none_or(|at| now.saturating_sub(*at) >= after.saturating_mul(COOLDOWN));
         let entry = ledger.entries.entry(id).or_insert_with(|| Entry {
             first_seen: now,
             ..Entry::default()
@@ -182,10 +198,23 @@ pub fn run(
         match &finding.report_to {
             Recipient::Human => {
                 if entry.human.is_none() {
+                    if !cooled {
+                        summary.cooling += 1;
+                        continue;
+                    }
                     entry.human = Some(owed(finding, "보고받을 구성원이 없음"));
+                    // The owed line is retried until delivered or given up,
+                    // so recording it is what accepting it means here.
+                    ledger.lineages.insert(lineage, now);
                 }
             }
             Recipient::Member(party) if entry.human.is_none() => {
+                // Gate on an accepted report, not on the round: a first
+                // report pager refused keeps round 1 and must still wait.
+                if !entry.sent && entry.last_sent_at.is_none() && !cooled {
+                    summary.cooling += 1;
+                    continue;
+                }
                 let due = if entry.round == 0 || !entry.sent {
                     true
                 } else {
@@ -231,6 +260,7 @@ pub fn run(
                             entry.sent = true;
                             entry.failures = 0;
                             entry.last_sent_at = Some(now);
+                            ledger.lineages.insert(lineage, now);
                             summary.sent += 1;
                         }
                         Err(error) => {
@@ -259,6 +289,9 @@ pub fn run(
         let since = *entry.absent_since.get_or_insert(now);
         now.saturating_sub(since) < RETENTION
     });
+    ledger
+        .lineages
+        .retain(|_, at| now.saturating_sub(*at) < RETENTION);
 
     let owing: Vec<String> = ledger
         .entries
@@ -288,6 +321,23 @@ pub fn run(
     }
     save(&path, &ledger)?;
     Ok(summary)
+}
+
+/// What one recipient hears about: the finding's kind, team, subject and the
+/// member waited on. A task master's ready items count as one subject, so
+/// another item taking the lead is not news.
+fn lineage(finding: &Finding, to: &str) -> String {
+    let subject = if finding.kind == Kind::ReadyButIdle {
+        ""
+    } else {
+        finding.subject.as_str()
+    };
+    let waited = finding
+        .waiting_on
+        .as_ref()
+        .map_or("", |party| party.member.as_str());
+    let kind = super::kind_word(finding.kind);
+    format!("{kind}|{}|{subject}|{waited}|{to}", finding.team)
 }
 
 fn is_pending(owed: &ForHuman) -> bool {

@@ -9,6 +9,48 @@ Each entry says what changed for someone running Gaebu: commands, refusals,
 cards, state, the mod. It also says whether an older binary can still read
 the state, and anything to do after upgrading.
 
+## 0.10.0 — 2026-11-16
+
+### Added
+
+- `gaebu duty wait <duty> --lease <key> | --member <alias> [--ttl <minutes>]
+  [--note <text>] [--version <n>]` lets an accepted duty's assignee record
+  what it waits on, and `--clear` removes the record. While a live lease of
+  another member collides with the key, or while the named member works,
+  stall detection does not count the assignee's rest; a member who rests
+  makes the finding `counterpart_idle` on that member. A wait lasts 30
+  minutes by default and 8 hours at most, and any status change,
+  amendment, cancellation or Schedule handoff clears it. See
+  [waiting on purpose](docs/stalled.md#waiting-on-purpose).
+- `gaebu stalled --notify` reports `cooling` in its summary.
+
+### Changed
+
+- `ready_but_idle` names one item per task master, the first ready one in
+  Schedule order, and only when the master has room: nobody below it and no
+  open duty of its own, or a free leaf below it. A team whose workers all
+  hold open duties no longer gets one report per ready item. See
+  [ready items](docs/stalled.md#ready-items).
+- Duty findings (`idle_after_stop`, `counterpart_idle`, `host_gone`) go to
+  the duty's issuer first, then the Schedule manager, the commander and the
+  human. Every recipient must sit in the team and outside a cancelled unit.
+- A finding with no accepted report yet waits while the same subject was
+  reported to the same recipient less than four times `--after` ago, so a
+  session that wakes and rests again no longer starts its rounds over. A
+  task master's ready items count as one subject. Reports with nobody to
+  tell but the human wait the same way.
+
+### Compatibility
+
+- Runtime schema 6 and Schedule schema 3 are unchanged. A duty may carry a
+  `wait`; a 0.9.0 binary reads the state and drops every `wait` when it
+  writes it, after which those duties are reported again.
+- `stalled-notify.json` gains `lineages`. A 0.9.0 binary reads the ledger and
+  drops them, which only ends cooldowns early.
+- After upgrading, a duty finding that was being reported to the manager or
+  commander is reported once more, at round one, to its issuer: the ledger
+  keeps rounds per recipient.
+
 ## 0.9.0 — 2026-11-16
 
 ### Added

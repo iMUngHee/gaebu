@@ -1789,3 +1789,83 @@ fn refresh_calls_who_once() {
     assert_eq!(state_of("one"), BindingState::Bound);
     assert_eq!(state_of("three"), BindingState::Bound);
 }
+
+#[test]
+fn duty_wait_takes_exactly_one_target() {
+    use gaebu::model::{WaitOn, now_ms};
+    use gaebu::ops::{self, SeedSpec};
+    let (_guard, _dir, store) = setup();
+    let pager = FakePager::new(&[("s-boss", "boss"), ("s-worker", "worker")]);
+    store
+        .transact(std::time::Duration::from_secs(5), |st| {
+            ops::dev_seed(
+                st,
+                now_ms(),
+                &SeedSpec {
+                    team: "one".into(),
+                    project: "fixture".into(),
+                    commander_alias: "boss".into(),
+                    commander_session: Some("s-boss".into()),
+                    commander_tool: Some(Tool::Codex),
+                    members: vec![("worker".into(), Some("s-worker".into()), Some(Tool::Codex))],
+                },
+            )
+        })
+        .unwrap();
+    pager.as_session("s-boss");
+    let issue = [
+        "duty",
+        "issue",
+        "--to",
+        "worker",
+        "--outcome",
+        "change",
+        "--scope",
+        "src/**",
+        "--done",
+        "tests",
+    ];
+    assert_eq!(gaebu(&pager, &issue), 0);
+    let duty = store.read().unwrap().duties.keys().next().unwrap().clone();
+    pager.as_session("s-worker");
+    assert_eq!(gaebu(&pager, &["duty", "accept", &duty]), 0);
+
+    // One target, or a clear: anything else is a usage error.
+    assert_eq!(gaebu(&pager, &["duty", "wait", &duty]), 2);
+    let both = [
+        "duty", "wait", &duty, "--lease", "src/a", "--member", "boss",
+    ];
+    assert_eq!(gaebu(&pager, &both), 2);
+    let clear_with_ttl = ["duty", "wait", &duty, "--clear", "--ttl", "5"];
+    assert_eq!(gaebu(&pager, &clear_with_ttl), 2);
+
+    let lease = [
+        "duty", "wait", &duty, "--lease", "src/a", "--ttl", "20", "--note", "check",
+    ];
+    assert_eq!(gaebu(&pager, &lease), 0);
+    let wait = store.read().unwrap().duties[&duty].wait.clone().unwrap();
+    assert_eq!(
+        wait.on,
+        WaitOn::Lease {
+            key: "src/a".into()
+        }
+    );
+    assert_eq!(wait.until - wait.at, 20 * 60_000);
+    assert_eq!(wait.note, "check");
+
+    assert_eq!(
+        gaebu(&pager, &["duty", "wait", &duty, "--member", "boss"]),
+        0
+    );
+    let st = store.read().unwrap();
+    let boss = st.teams.values().next().unwrap().commander.clone();
+    assert_eq!(
+        st.duties[&duty].wait.as_ref().unwrap().on,
+        WaitOn::Member { id: boss }
+    );
+    drop(st);
+
+    assert_eq!(gaebu(&pager, &["duty", "wait", &duty, "--clear"]), 0);
+    assert_eq!(store.read().unwrap().duties[&duty].wait, None);
+    assert_eq!(gaebu(&pager, &["duty", "wait", &duty, "--clear"]), 1);
+}

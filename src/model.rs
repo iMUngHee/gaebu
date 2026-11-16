@@ -388,6 +388,34 @@ pub struct Duty {
     pub source: Option<Source>,
     #[serde(default)]
     pub schedule_ref: Option<ScheduleRef>,
+    /// What the assignee waits on while the duty stays accepted. Cleared
+    /// whenever the duty's status changes or it is amended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+/// A wait the assignee recorded on purpose, so stall detection does not
+/// count the rest that follows as a stall until `until`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Wait {
+    pub on: WaitOn,
+    pub note: String,
+    pub at: Ms,
+    /// After this the wait no longer hides the duty from stall detection.
+    pub until: Ms,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum WaitOn {
+    /// Exclusive use of a lease key: any live lease another member holds
+    /// over it keeps the assignee waiting.
+    Lease {
+        key: String,
+    },
+    Member {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

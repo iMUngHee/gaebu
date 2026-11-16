@@ -43,9 +43,9 @@ has not been verified on a Codex host.
 | --- | --- | --- |
 | `seat_pending` | A seat was designated at least `--after` ago and its session has not confirmed it | that seat |
 | `team_idle` | A team has no open duty and no live Schedule item, and its commander rests | the commander |
-| `idle_after_stop` | A duty is accepted, not held and not waiting on a question, and its assignee rests | the assignee |
-| `counterpart_idle` | A duty waits on someone else who rests: the member a question went to, the assignee of a proposed duty, or the issuer of a blocked one | that member |
-| `ready_but_idle` | A Schedule item is `ready` and its task master, the head of the item's unit, rests | the task master |
+| `idle_after_stop` | A duty is accepted, not held, not waiting on a question or on a [recorded wait](#waiting-on-purpose) that still holds, and its assignee rests | the assignee |
+| `counterpart_idle` | A duty waits on someone else who rests: the member a question went to, the assignee of a proposed duty, the issuer of a blocked one, or the member an accepted duty's recorded wait names | that member |
+| `ready_but_idle` | A Schedule item is `ready`, its task master, the head of the item's unit, rests, and the master [has room](#ready-items) for it | the task master |
 | `host_gone` | An open duty's assignee is bound to a session pager reports gone | the assignee, whose session is gone |
 | `unknown` | A session log, a Schedule or pager's roster could not be read | — |
 
@@ -63,12 +63,63 @@ Left out on purpose:
 stage a card shows. After two hours a card calls a resting seat quiet and its
 duty vacant; the finding stays.
 
+### Waiting on purpose
+
+An assignee told to hold off, until a shared check finishes for example,
+rests on an accepted duty without being stuck. It says so on the duty:
+
+```sh
+gaebu duty wait d-903 --lease res:cargo --note "until fasa's check ends"
+gaebu duty wait d-903 --member fasa
+gaebu duty wait d-903 --clear
+```
+
+- `--lease` names a key inside that duty's own scope. The wait holds while
+  another member keeps a live lease that a lease on the key for exclusive
+  use would collide with: in the team or in an active team of the same
+  project. The assignee's own leases do not count. Once no such lease is
+  left, the rest counts again as `idle_after_stop`.
+- `--member` names an active member of the duty's team. While that member
+  works the duty is not reported; when it rests the finding is
+  `counterpart_idle`, waiting on that member; when it holds no seat the
+  rest counts again as `idle_after_stop`.
+- A wait lasts `--ttl` minutes, 30 by default and 8 hours at most, as a
+  lease does, and then stops hiding the duty; record it again to keep
+  waiting. A turn that died midway looks like work, so a wait on a member
+  must run out by itself.
+- Only the assignee records or clears a wait, on an accepted duty that no
+  hold covers. It changes the duty's version and is recorded for the
+  issuer without a page. Any change of the duty's status, an amendment, a
+  cancellation or a Schedule handoff clears it.
+- A wait that names nothing in reach, a key nobody holds or a member with
+  no seat, hides nothing.
+
+### Ready items
+
+A task master is judged on its first ready item in Schedule order only: one
+report says there is work to hand out. It is reported only if it has room:
+
+- with nobody below it, when it holds no open duty itself (a duty it holds
+  is judged on its own);
+- with members below it, when one of them is a free leaf: seated, not in a
+  cancelled or held unit, its host not reported gone, with nobody below it
+  and no open duty.
+
+A master whose members below are all busy, unseated or gone is not
+reported; those members' own findings cover them. This estimates capacity
+and is not the rule for dispatch, which takes any member below the master,
+bound or not, busy or not.
+
 ## Who should hear of it
 
-Each finding carries `report_to`: the team's Schedule manager, else its
-commander, else the human. A member is skipped when it is the one waited on,
-holds no confirmed seat, or has a host pager reports gone. Without
-`--notify` the command only computes this and sends nothing.
+Each finding carries `report_to`. For a duty (`idle_after_stop`,
+`counterpart_idle`, `host_gone`) that is the duty's issuer, who knows whether
+the wait is expected, else the team's Schedule manager, else its commander,
+else the human. Every other finding skips the issuer and starts at the
+manager. A member is skipped when it is the one waited on, holds no
+confirmed seat, sits outside the team or in a cancelled unit, or has a host
+pager reports gone. Without `--notify` the command only computes this and
+sends nothing.
 
 ## Keys
 
@@ -137,6 +188,14 @@ later; an older pager refuses `--automation` and the send counts as failed.
   pager stored the message, not that anyone read it.
 - **Limit.** One member gets at most five reports from one run. The rest go
   out on later runs.
+- **Cooldown.** Every rest is a new wait under a new key, so a session that
+  wakes and rests again would start its rounds over each time. A finding
+  with no accepted report yet therefore waits while the same subject was
+  reported to the same recipient less than four times `--after` ago. The
+  subject is the finding's kind, team, duty or seat and the member waited
+  on; a task master's ready items are one subject, whichever item leads. A
+  first report pager refused starts no cooldown and does not escape one.
+  The run's summary counts the findings held back this way as `cooling`.
 - **A change of recipient** starts over at round one for the new recipient.
 - **A finding that goes away** keeps its rounds for seven days. If it comes
   back under the same key, as it does after a hold is lifted, the rounds
@@ -146,8 +205,11 @@ later; an older pager refuses `--automation` and the send counts as failed.
 ### To the human
 
 The human is told when a finding has nobody to report to, when three rounds
-changed nothing, and when a report could not be delivered. Set
-`GAEBU_STALLED_NOTIFY` to a command:
+changed nothing, and when a report could not be delivered. A finding with
+nobody to report to waits out the same cooldown a member's first report
+does; once its line is recorded the cooldown starts, since the line is then
+retried until it is delivered or given up. Set `GAEBU_STALLED_NOTIFY` to a
+command:
 
 ```sh
 export GAEBU_STALLED_NOTIFY='notify-send "개부" "$GAEBU_STALLED_BODY"'

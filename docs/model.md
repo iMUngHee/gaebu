@@ -92,6 +92,12 @@ unique among the team's active members.
   `source`: the user's words the duty answers (`session_id`, `prompt_seq`,
   `sha256`, `quote`, `at`), matched against a prompt the hook recorded in the
   issuer's own session. Amending without a source keeps the one recorded. A linked duty also has an optional `schedule_ref` containing Schedule/item identity, dispatch token and immutable manifest hash; manifest-changing amendment is refused.
+  An accepted duty may carry an optional `wait` its assignee recorded with
+  `gaebu duty wait`: `on` (`{"kind":"lease","key":…}` or
+  `{"kind":"member","id":…}`), `note`, `at` and `until`. Stall detection
+  leaves the duty alone while the wait holds; see
+  [waiting on purpose](stalled.md#waiting-on-purpose). Any status change,
+  amendment, cancellation or Schedule handoff clears it.
 - **Hold**: a human stop on a duty or a bu: `evidence` (the user's words that
   set it), `until` (the release condition, 1-120 characters on one line;
   whitespace and control characters collapse) and `at`. Only
@@ -162,7 +168,7 @@ interrupts them with a pager notice (Act); the rest wait for the next card
 
 | Act (pager notice) | Record (team record and card only) |
 | --- | --- |
-| duty issued, amended, cancelled (to the assignee) | duty accepted, unblocked |
+| duty issued, amended, cancelled (to the assignee) | duty accepted, unblocked, wait recorded or cleared |
 | duty declined, blocked, done, handed off (to the issuer) | grant delegated |
 | hold set or lifted (to the assignees it covers) | bu closed, title changed |
 | escalation raised, superseded, rerouted, withdrawn (to the recipient) | binding confirmed |

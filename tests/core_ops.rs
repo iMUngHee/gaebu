@@ -2197,7 +2197,7 @@ fn expected_notices(s: &State, r: &Record, act: bool) -> usize {
 /// root_release, confirm_binding, mark_vacant, bu_open, bu_close, bu_cancel,
 /// member_add, member_move, title_set, grant, revoke, duty_issue,
 /// duty_respond (accept, decline), duty_progress (unblock, blocked, done,
-/// handoff), duty_amend, duty_cancel, lease_acquire, lease_renew,
+/// handoff), duty_amend, duty_cancel, duty_wait (set, clear), lease_acquire, lease_renew,
 /// lease_release, lease_force_release, escalate (rerouted, raised and
 /// superseded), escalation_withdraw, reroute_escalations,
 /// escalation_answer, rebind (via member_rebind).
@@ -2477,6 +2477,28 @@ fn notice_classification_matrix() {
                 ops::duty_cancel(s, 40, a, d, "drop").unwrap();
             },
             true,
+        ),
+        (
+            "duty_wait",
+            duty,
+            |s, _, b, _, d| {
+                let on = ops::WaitFor::Member("other".into());
+                ops::duty_wait(s, 40, b, d, wait_spec(on), None).unwrap();
+            },
+            false,
+        ),
+        (
+            "duty_wait clear",
+            |s, a, b, _| {
+                let d = accept(s, a, b);
+                let on = ops::WaitFor::Lease("src/a".into());
+                ops::duty_wait(s, 22, b, &d, wait_spec(on), None).unwrap();
+                d
+            },
+            |s, _, b, _, d| {
+                ops::duty_wait(s, 40, b, d, None, None).unwrap();
+            },
+            false,
         ),
         (
             "lease_acquire",
@@ -2989,4 +3011,184 @@ fn stop_work_notices_are_marked_for_release() {
     assert_eq!(s.members[&c.member].status, MemberStatus::Dismissed);
     ops::root_cancel_team(&mut s, 27, &ev(27), "test").unwrap();
     assert_eq!(kind_of_last(&mut s), NoticeKind::Release);
+}
+
+fn wait_spec(on: ops::WaitFor) -> Option<ops::WaitSpec> {
+    Some(ops::WaitSpec {
+        on,
+        ttl_ms: None,
+        note: "check running".into(),
+    })
+}
+
+#[test]
+fn duty_wait_records_a_lease_or_member_wait() {
+    let (mut s, a, b, c) = setup();
+    let d = accept(&mut s, &a, &b);
+    assert_eq!(s.duties[&d].version, 2);
+
+    let on = ops::WaitFor::Lease("src/a".into());
+    ops::duty_wait(&mut s, 30, &b, &d, wait_spec(on), Some(2)).unwrap();
+    let duty = &s.duties[&d];
+    assert_eq!(duty.status, DutyStatus::Accepted);
+    assert_eq!(duty.version, 3);
+    assert_eq!(
+        duty.wait,
+        Some(Wait {
+            on: WaitOn::Lease {
+                key: "src/a".into()
+            },
+            note: "check running".into(),
+            at: 30,
+            until: 30 + 30 * 60_000,
+        })
+    );
+
+    // A member is named by alias; the TTL is capped as a lease's is.
+    let day = Some(24 * 60 * 60_000);
+    let spec = ops::WaitSpec {
+        on: ops::WaitFor::Member("other".into()),
+        ttl_ms: day,
+        note: String::new(),
+    };
+    ops::duty_wait(&mut s, 40, &b, &d, Some(spec), None).unwrap();
+    let wait = s.duties[&d].wait.clone().unwrap();
+    assert_eq!(
+        wait.on,
+        WaitOn::Member {
+            id: c.member.clone()
+        }
+    );
+    assert_eq!(wait.until, 40 + 8 * 60 * 60_000);
+
+    ops::duty_wait(&mut s, 50, &b, &d, None, Some(4)).unwrap();
+    assert_eq!(s.duties[&d].wait, None);
+    assert_eq!(s.duties[&d].version, 5);
+}
+
+#[test]
+fn duty_wait_refusals() {
+    let (mut s, a, b, c) = setup();
+    let lease = |key: &str| wait_spec(ops::WaitFor::Lease(key.into()));
+    let member = |who: &str| wait_spec(ops::WaitFor::Member(who.into()));
+    let reason = |r: gaebu::Result<ops::Outcome>| r.unwrap_err().reason;
+
+    let d = ops::duty_issue(&mut s, 20, &a, &b.member, spec())
+        .unwrap()
+        .ids[0]
+        .clone();
+    // A proposed duty waits on its assignee already.
+    let r = ops::duty_wait(&mut s, 30, &b, &d, lease("src/a"), None);
+    assert_eq!(reason(r), Reason::Conflict);
+    ops::duty_respond(&mut s, 21, &b, &d, None, true, None).unwrap();
+
+    // Only the assignee records a wait.
+    for other in [&a, &c] {
+        let r = ops::duty_wait(&mut s, 30, other, &d, lease("src/a"), None);
+        assert_eq!(reason(r), Reason::NoGrant);
+    }
+    let r = ops::duty_wait(&mut s, 30, &b, &d, lease("src/a"), Some(1));
+    assert_eq!(reason(r), Reason::Conflict, "stale version");
+
+    // The key lies in this duty's own scope, not merely in another accepted
+    // duty of the same assignee.
+    let docs = DutySpec {
+        scope: vec!["docs/**".into()],
+        ..spec()
+    };
+    let other = ops::duty_issue(&mut s, 22, &a, &b.member, docs)
+        .unwrap()
+        .ids[0]
+        .clone();
+    ops::duty_respond(&mut s, 23, &b, &other, None, true, None).unwrap();
+    let r = ops::duty_wait(&mut s, 30, &b, &d, lease("docs/a"), None);
+    assert_eq!(reason(r), Reason::OutOfScope);
+    assert!(ops::duty_wait(&mut s, 30, &b, &other, lease("docs/a"), None).is_ok());
+
+    let r = ops::duty_wait(&mut s, 30, &b, &d, member("child"), None);
+    assert_eq!(reason(r), Reason::InvalidArgument, "not on oneself");
+    let zero = ops::WaitSpec {
+        on: ops::WaitFor::Lease("src/a".into()),
+        ttl_ms: Some(0),
+        note: String::new(),
+    };
+    let r = ops::duty_wait(&mut s, 30, &b, &d, Some(zero), None);
+    assert_eq!(reason(r), Reason::InvalidArgument, "zero TTL");
+    let r = ops::duty_wait(&mut s, 30, &b, &d, None, None);
+    assert_eq!(reason(r), Reason::Conflict, "nothing to clear");
+
+    // A blocked duty already waits on its issuer.
+    ops::duty_progress(&mut s, 31, &b, &d, DutyStatus::Blocked, Some("stuck")).unwrap();
+    let r = ops::duty_wait(&mut s, 32, &b, &d, lease("src/a"), None);
+    assert_eq!(reason(r), Reason::Conflict);
+    ops::duty_progress(&mut s, 33, &b, &d, DutyStatus::Accepted, None).unwrap();
+
+    // Under a human hold the duty waits on nobody here.
+    ops::root_hold(&mut s, 34, &hev("root-session", 900), &d, "wait").unwrap();
+    let r = ops::duty_wait(&mut s, 35, &b, &d, lease("src/a"), None);
+    assert_eq!(reason(r), Reason::Held);
+}
+
+#[test]
+fn duty_wait_names_a_member_of_its_own_team() {
+    let (mut st, one, _, _, _) = cross_team_setup();
+    let d = st
+        .duties
+        .values()
+        .find(|d| d.assignee == one.member)
+        .unwrap()
+        .id
+        .clone();
+    let on = ops::WaitFor::Member("second-worker".into());
+    let error = ops::duty_wait(&mut st, 40, &one, &d, wait_spec(on), None).unwrap_err();
+    assert_eq!(error.reason, Reason::NotMember);
+}
+
+#[test]
+fn duty_wait_clears_when_the_duty_moves() {
+    type Move = fn(&mut State, &Actor, &Actor, &str);
+    let moves: Vec<(&str, Move)> = vec![
+        ("block", |s, _, b, d| {
+            ops::duty_progress(s, 40, b, d, DutyStatus::Blocked, Some("x")).unwrap();
+        }),
+        ("done", |s, _, b, d| {
+            ops::duty_progress(s, 40, b, d, DutyStatus::Done, Some("ok")).unwrap();
+        }),
+        ("handoff", |s, _, b, d| {
+            ops::duty_progress(s, 40, b, d, DutyStatus::HandedOff, Some("to c")).unwrap();
+        }),
+        ("amend", |s, a, _, d| {
+            let version = s.duties[d].version;
+            ops::duty_amend(s, 40, a, d, version, spec()).unwrap();
+        }),
+        ("cancel", |s, a, _, d| {
+            ops::duty_cancel(s, 40, a, d, "stop").unwrap();
+        }),
+        ("dismiss", |s, _, _, _| {
+            ops::root_dismiss(s, 40, &hev("root-session", 1_000), "child").unwrap();
+        }),
+        ("cancel team", |s, _, _, _| {
+            let team = s.teams.keys().next().unwrap().clone();
+            ops::root_cancel_team(s, 40, &hev("root-session", 1_000), &team).unwrap();
+        }),
+    ];
+    for (name, step) in moves {
+        let (mut s, a, b, _) = setup();
+        let d = accept(&mut s, &a, &b);
+        let on = ops::WaitFor::Lease("src/a".into());
+        ops::duty_wait(&mut s, 30, &b, &d, wait_spec(on), None).unwrap();
+        step(&mut s, &a, &b, &d);
+        assert_eq!(s.duties[&d].wait, None, "{name}");
+    }
+}
+
+#[test]
+fn duty_wait_refuses_a_dismissed_member() {
+    let (mut s, a, b, c) = setup();
+    let d = accept(&mut s, &a, &b);
+    // Named by id, a dismissed member still resolves; it cannot be waited on.
+    s.members.get_mut(&c.member).unwrap().status = MemberStatus::Dismissed;
+    let on = ops::WaitFor::Member(c.member.clone());
+    let error = ops::duty_wait(&mut s, 30, &b, &d, wait_spec(on), None).unwrap_err();
+    assert_eq!(error.reason, Reason::NotMember);
 }

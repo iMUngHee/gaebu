@@ -334,7 +334,13 @@ fn handoff_closes_source_duties() {
             LeaseMode::Exclusive,
             None,
             "working",
-        )
+        )?;
+        let wait = ops::WaitSpec {
+            on: ops::WaitFor::Lease("src/other.rs".into()),
+            ttl_ms: None,
+            note: "a check holds it".into(),
+        };
+        ops::duty_wait(st, now_ms(), actor, duty, Some(wait), None)
     })
     .unwrap();
     f.offer(1);
@@ -345,6 +351,8 @@ fn handoff_closes_source_duties() {
     let st = f.store.read_current().unwrap();
     assert_eq!(st.duties[duty].status, DutyStatus::HandedOff);
     assert_eq!(st.duties[duty].version, previous_version + 1);
+    // A handed-off duty waits on nothing here any more.
+    assert_eq!(st.duties[duty].wait, None);
     for team in &f.teams[..2] {
         assert_eq!(
             st.records

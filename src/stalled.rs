@@ -9,13 +9,14 @@
 
 pub mod notify;
 
-use crate::authz;
 use crate::error::Result;
 use crate::model::{
-    BindingState, DutyStatus, EscalationStatus, Member, MemberStatus, Ms, State, TeamStatus,
+    BindingState, Duty, DutyStatus, EscalationStatus, LeaseMode, Member, MemberStatus, Ms, State,
+    TeamStatus, WaitOn,
 };
 use crate::pager::{HostStatus, Hosts, Pager};
 use crate::store::{EventKind, GLOBAL_MARKERS, Store};
+use crate::{authz, ops};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -89,6 +90,15 @@ enum Seen {
     },
     Active,
     Unreadable(String),
+}
+
+/// What a recorded wait still holds an accepted duty on.
+enum Waiting<'a> {
+    /// A lease another member holds live.
+    OnLease,
+    /// A seated member of the duty's team.
+    OnMember(&'a str),
+    Not,
 }
 
 struct Scan<'a> {
@@ -201,22 +211,24 @@ impl<'a> Scan<'a> {
         }
     }
 
-    /// The team's Schedule manager, then its commander, skipping anyone who
-    /// is the party waited on, holds no confirmed seat, or whose host pager
-    /// reports gone; the state still shows such a seat bound, since nothing
-    /// here refreshes bindings.
-    fn recipient(&self, team: &str, waiting_on: Option<&str>) -> Recipient {
+    /// The duty's issuer when there is one, then the team's Schedule
+    /// manager, then its commander. Anyone is skipped who is the party
+    /// waited on, holds no confirmed seat, sits outside the team or in a
+    /// cancelled unit, or whose host pager reports gone; the state still
+    /// shows such a seat bound, since nothing here refreshes bindings.
+    fn recipient(&self, team: &str, issuer: Option<&str>, waiting_on: Option<&str>) -> Recipient {
         let manager = self
             .st
             .schedules
             .get(team)
             .and_then(|registration| registration.manager.as_deref());
         let commander = self.st.teams.get(team).map(|team| team.commander.as_str());
-        [manager, commander]
+        [issuer, manager, commander]
             .into_iter()
             .flatten()
             .filter(|id| Some(*id) != waiting_on)
             .filter_map(|id| self.seated(id))
+            .filter(|member| member.team == team && !authz::bu_cancelled(self.st, &member.bu))
             .find(|member| self.hosts.status(&member.binding.alias) != HostStatus::Gone)
             .map_or(Recipient::Human, |member| {
                 Recipient::Member(self.party(member))
@@ -238,7 +250,15 @@ impl<'a> Scan<'a> {
         detail: String,
     ) {
         let waiting = waiting_on.map(|member| self.party(member));
-        let report_to = self.recipient(team, waiting_on.map(|member| member.id.as_str()));
+        // Whoever issued a duty knows best whether its wait is expected.
+        let st: &'a State = self.st;
+        let issuer = matches!(
+            kind,
+            Kind::IdleAfterStop | Kind::CounterpartIdle | Kind::HostGone
+        )
+        .then(|| st.duties.get(subject).map(|duty| duty.issuer.as_str()))
+        .flatten();
+        let report_to = self.recipient(team, issuer, waiting_on.map(|member| member.id.as_str()));
         let waited = waiting.as_ref().map_or("", |party| party.member.as_str());
         let key = key(&[
             kind_word(kind),
@@ -378,7 +398,12 @@ impl<'a> Scan<'a> {
                 },
                 (None, DutyStatus::Proposed) => (Kind::CounterpartIdle, duty.assignee.as_str()),
                 (None, DutyStatus::Blocked) => (Kind::CounterpartIdle, duty.issuer.as_str()),
-                (None, _) => (Kind::IdleAfterStop, duty.assignee.as_str()),
+                (None, _) => match self.waiting(duty) {
+                    Waiting::OnLease => continue,
+                    // Silent while that member works, as any counterpart is.
+                    Waiting::OnMember(id) => (Kind::CounterpartIdle, id),
+                    Waiting::Not => (Kind::IdleAfterStop, duty.assignee.as_str()),
+                },
             };
             if let Some(member) = self.seated(owed_by) {
                 let anchor = duty.version.to_string();
@@ -386,6 +411,36 @@ impl<'a> Scan<'a> {
             }
         }
         open.len()
+    }
+
+    /// What an accepted duty's recorded wait still holds it on. A wait past
+    /// its `until`, on a lease nobody else holds live, or on a member who
+    /// lost its seat holds it on nothing, and the assignee's rest counts.
+    fn waiting(&self, duty: &'a Duty) -> Waiting<'a> {
+        let Some(wait) = duty.wait.as_ref().filter(|wait| wait.until > self.now) else {
+            return Waiting::Not;
+        };
+        match &wait.on {
+            WaitOn::Lease { key } => {
+                // A key, the wait's or a held lease's, that no longer parses
+                // holds nothing: the stall shows rather than hides.
+                let held = crate::scope::parse(key).ok().is_some_and(|key| {
+                    ops::conflicting_leases(
+                        self.st,
+                        &duty.team,
+                        &key,
+                        LeaseMode::Exclusive,
+                        self.now,
+                    )
+                    .is_ok_and(|leases| leases.iter().any(|l| l.holder != duty.assignee))
+                });
+                if held { Waiting::OnLease } else { Waiting::Not }
+            }
+            WaitOn::Member { id } => match self.seated(id) {
+                Some(member) if member.team == duty.team => Waiting::OnMember(id),
+                _ => Waiting::Not,
+            },
+        }
     }
 
     /// Judge the team's ready Schedule items; returns how many items are
@@ -411,6 +466,7 @@ impl<'a> Scan<'a> {
         };
         let items = view["items"].as_array().cloned().unwrap_or_default();
         let mut live = 0;
+        let mut judged = std::collections::BTreeSet::new();
         for item in &items {
             let stage = item["stage"].as_str().unwrap_or_default();
             if !matches!(stage, "complete" | "cancelled") {
@@ -422,16 +478,61 @@ impl<'a> Scan<'a> {
             let Some(id) = item["id"].as_str() else {
                 continue;
             };
-            // Dispatch belongs to the head of the item's own bu.
+            // Dispatch belongs to the head of the item's own bu. The view is
+            // in Schedule order, so a master is judged on its first ready
+            // item only: one report says there is work to hand out.
             if let Some(master) = item["master"]["member"]
                 .as_str()
                 .and_then(|member| self.seated(member))
                 .filter(|master| !self.held(&master.bu))
+                && judged.insert(master.id.clone())
+                && self.has_room(master)
             {
                 self.resting(Kind::ReadyButIdle, team, id, master, "");
             }
         }
         Some(live)
+    }
+
+    /// Whether a task master has someone to hand ready work to. One with
+    /// nobody below it does the work itself, unless it holds an open duty
+    /// already, which is judged on its own. One with members below needs a
+    /// free leaf: seated, reachable, outside cancelled and held units, with
+    /// nobody below it and no open duty. This estimates capacity; dispatch
+    /// itself checks none of it.
+    fn has_room(&self, master: &Member) -> bool {
+        let below = self.below(&master.id);
+        if below.is_empty() {
+            return !self.has_open_duty(&master.id);
+        }
+        below.into_iter().any(|m| {
+            self.seated(&m.id).is_some()
+                && !authz::bu_cancelled(self.st, &m.bu)
+                && !self.held(&m.bu)
+                && self.hosts.status(&m.binding.alias) != HostStatus::Gone
+                && self.below(&m.id).is_empty()
+                && !self.has_open_duty(&m.id)
+        })
+    }
+
+    /// Active members anywhere below `head` in the command tree.
+    fn below(&self, head: &str) -> Vec<&'a Member> {
+        let st: &'a State = self.st;
+        st.members
+            .values()
+            .filter(|m| m.status == MemberStatus::Active && authz::is_below(st, head, &m.id))
+            .collect()
+    }
+
+    fn has_open_duty(&self, member: &str) -> bool {
+        self.st.duties.values().any(|duty| {
+            duty.assignee == member
+                && matches!(
+                    duty.status,
+                    DutyStatus::Proposed | DutyStatus::Accepted | DutyStatus::Blocked
+                )
+                && !authz::bu_cancelled(self.st, &duty.bu)
+        })
     }
 
     fn idle_team(&mut self, team: &str) {

@@ -252,6 +252,7 @@ pub(super) fn adopt(store: &Store, caller: &Caller, args: &Input) -> Result<Valu
                     .checked_add(1)
                     .ok_or_else(|| invalid("duty version exhausted"))?;
                 duty.status = DutyStatus::HandedOff;
+                duty.wait = None;
                 duty.updated_at = at;
                 duty.note = Some(format!("schedule handed off to team {target}"));
                 if duty.hold.take().is_some() {

@@ -113,6 +113,7 @@ fn fixture() -> State {
             hold: None,
             source: None,
             schedule_ref: None,
+            wait: None,
         },
     );
     st.leases.insert(
