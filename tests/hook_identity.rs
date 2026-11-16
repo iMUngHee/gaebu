@@ -1,3 +1,5 @@
+// Only the Unix-only pager argv test uses it.
+#[cfg(unix)]
 mod common;
 
 use gaebu::identity::{self, Caller, Source};
